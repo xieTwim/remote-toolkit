@@ -21,12 +21,13 @@ README.md             User-facing documentation
 
 - **RT_HOME**: Root directory for config and state, defaults to `~/.config/remote-toolkit/`, overridable via env var.
 - **RT_SCRIPT_DIR**: Script's own directory.
-- **Profile system (host-grouped)**: `-p <host>/<profile>` selects a profile. `_init_profile` parses the slash:
-  - `RT_HOST_GROUP` and `RT_PROFILE_NAME` set from the two halves; bare `<name>` (no slash) → `default/<name>`.
+- **Profile system (host-grouped)**: `-p <host>/<profile>` selects a profile. Required — no bare-name fallback. Each segment must match `^[a-zA-Z0-9](-?[a-zA-Z0-9])*$` and be ≤32 chars (no `_`, no `.`, no `--`, no leading/trailing dash). The strict charset keeps segment encodings injective across the various derived identifiers.
+  - `_init_profile` builds paths from RT_PROFILE without validating; commands that operate on a specific profile call `_require_profile` (which `load_config` and `cmd_init` invoke). Commands like `status --all`, `check`, and `help` work without a profile.
   - `RT_HOST_CONF=$RT_HOME/<host>/host.conf` (host-shared vars; sourced first by `load_config`).
   - `RT_CONF=$RT_HOME/<host>/<profile>.conf` (profile vars; sourced second, overrides host).
   - `RT_STATE_DIR=$RT_HOME/.rt/<host>/<profile>` (two-level).
-  - `RT_SESSION_PREFIX=rt_<host>_<profile>_bg_` (tmux-safe, no slashes).
+  - `RT_SESSION_PREFIX=rt_<host>_<profile>_bg_` (tmux session prefix; `_` separator, segments forbid `_`).
+  - Mutagen session name `rt-<host>--<profile>` (`--` separator, segments forbid `--`). Mutagen rejects `_` in session names; double-dash is the closest injective separator using only allowed chars.
   - Local mount default: `~/Work/Remote/<host>/<profile>/`.
 - **Dispatch**: `main()` parses global flags then routes to `cmd_*` functions.
 

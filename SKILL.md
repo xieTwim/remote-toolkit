@@ -68,7 +68,7 @@ REMOTE_DIR="/home/user/scratch"
 # LOCAL_DIR defaults to ~/Work/Remote/fact-cluster/scratch — override only if needed
 ```
 
-Bare profile names (no slash) are treated as `default/<name>`. Prefer explicit `<host>/<profile>` for clarity.
+Profile names must be in `<host>/<profile>` form (no bare-name fallback). Each segment is alphanumeric with single dashes between alphanumerics (no leading/trailing dash, no `--`, no `_` or `.`), max 32 chars — keeps the name unambiguous when `--` separates segments in the Mutagen session name and `_` separates them in tmux session names.
 
 For non-default SSH_PORT or SSH_KEY, **also add a Host entry to `~/.ssh/config`** so Mutagen finds the right SSH parameters (Mutagen reads ssh config, not host.conf):
 ```

@@ -4,10 +4,14 @@ set -euo pipefail
 # ── Paths (defaults, may be overridden by profile) ────────────────
 RT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RT_HOME="${RT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-toolkit}"
-RT_PROFILE="default"
+RT_PROFILE=""
+RT_HOST_GROUP=""
+RT_PROFILE_NAME=""
+RT_HOST_CONF=""
 RT_CONF=""
 RT_STATE_DIR=""
 RT_SESSION_PREFIX=""
+RT_SAFE_ID=""
 
 # ── Colors & output helpers ────────────────────────────────────────
 _color() { [[ -t 2 ]] && printf '\e[%sm' "$1" >&2 || true; }
@@ -35,23 +39,51 @@ _install_hint() {
 }
 
 # ── Profile-aware paths ───────────────────────────────────────────
-# RT_PROFILE is in <host-group>/<profile-name> form. Bare <name> is
-# treated as default/<name>.
+# RT_PROFILE is in <host-group>/<profile-name> form, e.g. "fact-cluster/scratch".
+# Each segment: starts with alphanumeric, contains [a-zA-Z0-9-] only, no leading/
+# trailing dash, no consecutive dashes, ≤32 chars. The strict charset keeps
+# segment encodings injective: Mutagen session name uses '--' as separator,
+# tmux session prefix uses '_' as separator.
+
+_validate_segment() {
+  local seg="$1" name="$2"
+  [[ -n "$seg" ]] \
+    || die "Profile parse error: ${name} segment is empty (got '$RT_PROFILE')"
+  [[ "$seg" =~ ^[a-zA-Z0-9](-?[a-zA-Z0-9])*$ ]] \
+    || die "Profile parse error: ${name} segment '$seg' invalid (must be [a-zA-Z0-9]([a-zA-Z0-9]|-[a-zA-Z0-9])*, got '$RT_PROFILE')"
+  [[ ${#seg} -le 32 ]] \
+    || die "Profile parse error: ${name} segment '$seg' exceeds 32 chars"
+}
+
+# Build paths from RT_PROFILE without validating. Commands that don't need a
+# specific profile (status --all, check, help) tolerate empty profile state.
 _init_profile() {
-  if [[ "$RT_PROFILE" == */* ]]; then
+  if [[ "${RT_PROFILE:-}" == */* ]]; then
     RT_HOST_GROUP="${RT_PROFILE%%/*}"
     RT_PROFILE_NAME="${RT_PROFILE#*/}"
   else
-    RT_HOST_GROUP="default"
-    RT_PROFILE_NAME="$RT_PROFILE"
+    RT_HOST_GROUP=""
+    RT_PROFILE_NAME=""
   fi
   RT_HOST_CONF="${RT_HOME}/${RT_HOST_GROUP}/host.conf"
   RT_CONF="${RT_HOME}/${RT_HOST_GROUP}/${RT_PROFILE_NAME}.conf"
   RT_STATE_DIR="${RT_HOME}/.rt/${RT_HOST_GROUP}/${RT_PROFILE_NAME}"
-  # Shell-safe ID for tmux session prefix (no slashes)
   RT_SAFE_ID="${RT_HOST_GROUP}_${RT_PROFILE_NAME}"
   RT_SESSION_PREFIX="rt_${RT_SAFE_ID}_bg_"
-  # Canonical display form (used in messages and state)
+}
+
+# Validate that RT_PROFILE is usable. Called by load_config and cmd_init —
+# any command that operates on a specific profile.
+_require_profile() {
+  [[ -n "${RT_PROFILE:-}" ]] \
+    || die "Profile required. Use: rt -p <host>/<profile> <command> ..."
+  [[ "$RT_PROFILE" == */* ]] \
+    || die "Profile must be in <host>/<profile> form (got '$RT_PROFILE'). No bare-name fallback."
+  [[ "$RT_PROFILE_NAME" != */* ]] \
+    || die "Profile must have exactly one '/'. Got: '$RT_PROFILE'"
+  _validate_segment "$RT_HOST_GROUP"   "host-group"
+  _validate_segment "$RT_PROFILE_NAME" "profile-name"
+  # Canonical display form (post-validation).
   RT_PROFILE="${RT_HOST_GROUP}/${RT_PROFILE_NAME}"
 }
 
@@ -67,7 +99,9 @@ _mutagen_daemon_ensure() {
 }
 
 _sync_session_name() {
-  echo "rt-${RT_HOST_GROUP}-${RT_PROFILE_NAME}"
+  # '--' separator: Mutagen session names allow alphanumeric+'-' only.
+  # Segments forbid consecutive dashes, so '--' is unambiguous.
+  echo "rt-${RT_HOST_GROUP}--${RT_PROFILE_NAME}"
 }
 
 # Build a Mutagen label-selector for this profile.
@@ -154,6 +188,7 @@ _sync_create() {
 
 # ── Config ─────────────────────────────────────────────────────────
 load_config() {
+  _require_profile
   [[ -f "$RT_CONF" ]] || die "Config not found: $RT_CONF
   Run 'rt -p ${RT_HOST_GROUP}/${RT_PROFILE_NAME} init' to create from template, or create manually in ${RT_HOME}/${RT_HOST_GROUP}/"
 
@@ -248,6 +283,7 @@ cmd_check() {
 }
 
 cmd_init() {
+  _require_profile
   mkdir -p "${RT_HOME}/${RT_HOST_GROUP}"
 
   # Host-level config: REMOTE_HOST + SSH params shared by all profiles in this host group
@@ -808,12 +844,14 @@ cmd_help() {
 Remote Toolkit — Drive remote servers from Claude Code
 
 USAGE:
-  rt [-p HOST/PROFILE] <command> [options]
+  rt -p HOST/PROFILE <command> [options]
 
 GLOBAL FLAGS:
   -p, --profile HOST/PROFILE
                        Select a profile, in <host-group>/<profile-name> form.
-                       Bare <name> is treated as default/<name>.
+                       Required (no bare-name fallback).
+                       Each segment: alphanumeric + single dashes between alphanumerics
+                       (no leading/trailing dash, no '--', no '_' or '.'), max 32 chars.
                        Config: \$RT_HOME/<host>/host.conf + <host>/<profile>.conf
                        Local replica: ~/Work/Remote/<host>/<profile>/
 
@@ -899,7 +937,11 @@ main() {
   # Parse global --profile / -p flag before subcommand
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -p|--profile) RT_PROFILE="$2"; shift 2 ;;
+      -p|--profile)
+        [[ $# -ge 2 ]] || die "Missing argument for $1. Use: rt -p <host>/<profile> <command> ..."
+        RT_PROFILE="$2"
+        shift 2
+        ;;
       --profile=*)  RT_PROFILE="${1#--profile=}"; shift ;;
       *)            break ;;
     esac
