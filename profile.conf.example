@@ -1,0 +1,23 @@
+# Remote Toolkit — profile-level config template
+#
+# Copy to ~/.config/remote-toolkit/<host-group>/<profile>.conf and edit.
+# Sourced AFTER host.conf — values here override host-level ones.
+# Workspace-specific.
+
+# REQUIRED: Remote directory to sync
+REMOTE_DIR="/home/user/project"
+
+# Optional — local replica path
+#   default: ~/Work/Remote/<host-group>/<profile>/
+# LOCAL_DIR="$HOME/Work/Remote/<host>/<profile>"
+
+# Optional — Mutagen sync
+# MUTAGEN_SYNC_MODE="two-way-resolved"   # two-way-safe|two-way-resolved|one-way-safe|one-way-replica
+# MUTAGEN_IGNORE_VCS=1                   # 1 = pass --ignore-vcs (default), 0 = sync .git
+# MUTAGEN_IGNORE=(                       # bash array; appended to defaults
+#   "data/"
+#   "*.bin"
+# )
+
+# Optional — Slurm output dir override (host.conf typically sets SLURM_ENABLED)
+# SLURM_LOG_DIR="$REMOTE_DIR"            # where slurm-<jobid>.out lands

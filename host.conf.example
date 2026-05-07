@@ -1,0 +1,17 @@
+# Remote Toolkit — host-level config template
+#
+# Copy to ~/.config/remote-toolkit/<host-group>/host.conf and edit.
+# Sourced FIRST by `rt`, then overridden by <profile>.conf.
+# Shared across all profiles in the same host group.
+
+# REQUIRED: Remote host (user@hostname or ~/.ssh/config alias)
+REMOTE_HOST="user@example.com"
+
+# Optional — SSH
+# SSH_PORT=22
+# SSH_KEY="$HOME/.ssh/id_ed25519"
+# NOTE: For non-default port/key, also add a Host entry to ~/.ssh/config
+# so Mutagen sync uses the same SSH parameters as `rt exec`.
+
+# Optional — Slurm (set 1 for HPC clusters with login node + sbatch)
+# SLURM_ENABLED=0

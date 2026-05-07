@@ -5,16 +5,17 @@ This file is for **CC developing this tool**, not for using it. The usage guide 
 ## Project Structure
 
 ```
-rt                    Main script (Bash), all functionality
-rt.conf.example       Config template
-install.sh            Installer: symlink, config migration, CC SKILL install
-SKILL.md              Claude Code SKILL — frontmatter (name=remote, description) + full guide.
-                      install.sh symlinks the whole repo to ~/.claude/skills/remote/.
+rt                       Main script (Bash), all functionality
+host.conf.example        Reference template for <host-group>/host.conf
+profile.conf.example     Reference template for <host-group>/<profile>.conf
+install.sh               Installer: symlink, CC SKILL install
+SKILL.md                 Claude Code SKILL — frontmatter (name=remote, description) + full guide.
+                         install.sh symlinks the whole repo to ~/.claude/skills/remote/.
 commands/
-  remote.md           Slash-command shim. install.sh symlinks to ~/.claude/commands/remote.md.
-                      `/remote` invokes the SKILL.
-CLAUDE.md             This file (developer guide)
-README.md             User-facing documentation
+  remote.md              Slash-command shim. install.sh symlinks to ~/.claude/commands/remote.md.
+                         `/remote` invokes the SKILL.
+CLAUDE.md                This file (developer guide)
+README.md                User-facing documentation
 ```
 
 ## rt Script Architecture

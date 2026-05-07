@@ -50,25 +50,10 @@ chmod +x "$SCRIPT_DIR/rt"
 "$SCRIPT_DIR/rt" check || true
 printf '\n'
 
-# ── 2. Create config directory & migrate existing configs ─────────
+# ── 2. Create config directory ────────────────────────────────────
+# Configs live under $RT_HOME/<host>/{host,<profile>}.conf and are user-managed.
+# `rt -p <host>/<profile> init` seeds skeleton files when needed.
 mkdir -p "$RT_HOME"
-
-migrated=0
-for conf in "$SCRIPT_DIR"/rt.conf "$SCRIPT_DIR"/rt.conf.*; do
-  [[ -f "$conf" ]] || continue
-  base=$(basename "$conf")
-  [[ "$base" == "rt.conf.example" ]] && continue
-  if [[ ! -f "$RT_HOME/$base" ]]; then
-    cp "$conf" "$RT_HOME/$base"
-    info "Migrated $base → $RT_HOME/$base"
-    migrated=$((migrated + 1))
-  fi
-done
-
-if [[ $migrated -eq 0 ]]; then
-  # No configs to migrate; init if empty
-  "$SCRIPT_DIR/rt" init 2>&1
-fi
 
 # ── 3. Symlink to PATH ───────────────────────────────────────────
 mkdir -p "$BIN_DIR"
@@ -172,9 +157,11 @@ if [[ "$MODE" == "copy" ]]; then
 fi
 
 info "Next steps:"
-info "  1. Edit $RT_HOME/rt.conf with your server details (REMOTE_HOST, REMOTE_DIR)"
-info "  2. rt setup-key --password 'your-password'"
-info "  3. rt connect    # starts Mutagen sync"
+info "  1. rt -p <host>/<profile> init    # seeds host.conf + <profile>.conf skeletons"
+info "  2. Edit $RT_HOME/<host>/host.conf (REMOTE_HOST, SSH_PORT, SLURM_ENABLED)"
+info "  3. Edit $RT_HOME/<host>/<profile>.conf (REMOTE_DIR, optional LOCAL_DIR)"
+info "  4. rt -p <host>/<profile> setup-key --password 'your-password'"
+info "  5. rt -p <host>/<profile> connect"
 info ""
-info "For HPC/Slurm hosts, also set SLURM_ENABLED=1 in the profile config."
+info "Reference templates: $SCRIPT_DIR/host.conf.example, $SCRIPT_DIR/profile.conf.example"
 printf '\n'

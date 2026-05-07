@@ -1,4 +1,6 @@
-rt.conf
-rt.conf.*
-!rt.conf.example
+# User configs live under ~/.config/remote-toolkit/, not in this repo.
+# These rules guard against accidental commits if a user does drop one in.
+*.conf
+!host.conf.example
+!profile.conf.example
 .rt/
