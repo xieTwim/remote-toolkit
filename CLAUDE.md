@@ -19,23 +19,30 @@ README.md             User-facing documentation
 
 ## rt Script Architecture
 
-- **RT_HOME**: Root directory for config and state, defaults to `~/.config/remote-toolkit/`, overridable via env var
-- **RT_SCRIPT_DIR**: Script's own directory, only used by `init` command to find `rt.conf.example`
-- **Profile system**: `-p <name>` selects a profile, affecting config path (`rt.conf.<name>`), state dir (`.rt/<name>/`), mount point (`~/remote/<name>/`), and tmux session prefix
-- **Dispatch**: `main()` parses global flags then routes to `cmd_*` functions
+- **RT_HOME**: Root directory for config and state, defaults to `~/.config/remote-toolkit/`, overridable via env var.
+- **RT_SCRIPT_DIR**: Script's own directory.
+- **Profile system (host-grouped)**: `-p <host>/<profile>` selects a profile. `_init_profile` parses the slash:
+  - `RT_HOST_GROUP` and `RT_PROFILE_NAME` set from the two halves; bare `<name>` (no slash) → `default/<name>`.
+  - `RT_HOST_CONF=$RT_HOME/<host>/host.conf` (host-shared vars; sourced first by `load_config`).
+  - `RT_CONF=$RT_HOME/<host>/<profile>.conf` (profile vars; sourced second, overrides host).
+  - `RT_STATE_DIR=$RT_HOME/.rt/<host>/<profile>` (two-level).
+  - `RT_SESSION_PREFIX=rt_<host>_<profile>_bg_` (tmux-safe, no slashes).
+  - Local mount default: `~/Work/Remote/<host>/<profile>/`.
+- **Dispatch**: `main()` parses global flags then routes to `cmd_*` functions.
 
 Subcommands: `init` `check` `setup-key` `connect` `disconnect` `exec` `logs` `status` `sync` `slurm` `help`
 
 ## Mutagen Integration
 
-- `rt connect` ensures the Mutagen daemon is running (`mutagen daemon start`, idempotent), then creates a sync session named `rt-<profile>` with label `rt-profile=<profile>`.
-- All Mutagen queries (`_has_sync`, `_sync_status`, `_sync_flush`, `_sync_terminate`) use `--label-selector rt-profile=<p>` rather than session names — labels are robust across renames and let `_status_all` enumerate by label without mutating `RT_PROFILE`.
+- `rt connect` ensures the Mutagen daemon is running (`mutagen daemon start`, idempotent), then creates a sync session named `rt-<host>-<profile>` with two labels: `rt-host=<host>` and `rt-profile=<profile>`.
+- All Mutagen queries (`_has_sync`, `_sync_status`, `_sync_flush`, `_sync_terminate`) build a composite selector via `_sync_label_selector` (`rt-host=<h>,rt-profile=<p>`). Helpers default to globals; pass `(host, profile)` explicitly when iterating (e.g., from `_status_all`).
+- `_status_all` walks `$RT_HOME/.rt/*/` for host-group dirs, then `*/` for profiles within each, and renders `[host/profile]` rows.
 - Mutagen URL form is `[user@]host:path` and reads SSH parameters from `~/.ssh/config`. For non-default `SSH_PORT` or `SSH_KEY`, the user must add a matching Host entry to ssh config; `rt connect` warns when this is needed.
 
 ## Slurm Integration
 
-- Gated by per-profile `SLURM_ENABLED=1`. `cmd_slurm` calls `_slurm_require_enabled` first; non-Slurm hosts get a clear error.
-- `rt slurm submit` performs a mandatory `_sync_flush` before `sbatch` to prevent stale-code submissions, then parses sbatch output for the job ID and appends to `.rt/<profile>/slurm_jobs` (cap 50 entries).
+- Gated by `SLURM_ENABLED=1` set in `host.conf` (typical) or `<profile>.conf` (override). `cmd_slurm` calls `_slurm_require_enabled` first; non-Slurm hosts get a clear error.
+- `rt slurm submit` performs a mandatory `_sync_flush` before `sbatch` to prevent stale-code submissions, then parses sbatch output for the job ID and appends to `.rt/<host>/<profile>/slurm_jobs` (cap 50 entries).
 
 ## CC Integration: SKILL + slash command
 

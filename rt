@@ -35,14 +35,24 @@ _install_hint() {
 }
 
 # ── Profile-aware paths ───────────────────────────────────────────
+# RT_PROFILE is in <host-group>/<profile-name> form. Bare <name> is
+# treated as default/<name>.
 _init_profile() {
-  if [[ "$RT_PROFILE" == "default" ]]; then
-    RT_CONF="${RT_HOME}/rt.conf"
+  if [[ "$RT_PROFILE" == */* ]]; then
+    RT_HOST_GROUP="${RT_PROFILE%%/*}"
+    RT_PROFILE_NAME="${RT_PROFILE#*/}"
   else
-    RT_CONF="${RT_HOME}/rt.conf.${RT_PROFILE}"
+    RT_HOST_GROUP="default"
+    RT_PROFILE_NAME="$RT_PROFILE"
   fi
-  RT_STATE_DIR="${RT_HOME}/.rt/${RT_PROFILE}"
-  RT_SESSION_PREFIX="rt_${RT_PROFILE}_bg_"
+  RT_HOST_CONF="${RT_HOME}/${RT_HOST_GROUP}/host.conf"
+  RT_CONF="${RT_HOME}/${RT_HOST_GROUP}/${RT_PROFILE_NAME}.conf"
+  RT_STATE_DIR="${RT_HOME}/.rt/${RT_HOST_GROUP}/${RT_PROFILE_NAME}"
+  # Shell-safe ID for tmux session prefix (no slashes)
+  RT_SAFE_ID="${RT_HOST_GROUP}_${RT_PROFILE_NAME}"
+  RT_SESSION_PREFIX="rt_${RT_SAFE_ID}_bg_"
+  # Canonical display form (used in messages and state)
+  RT_PROFILE="${RT_HOST_GROUP}/${RT_PROFILE_NAME}"
 }
 
 # ── Mutagen helpers ────────────────────────────────────────────────
@@ -57,20 +67,29 @@ _mutagen_daemon_ensure() {
 }
 
 _sync_session_name() {
-  echo "rt-${RT_PROFILE}"
+  echo "rt-${RT_HOST_GROUP}-${RT_PROFILE_NAME}"
+}
+
+# Build a Mutagen label-selector for this profile.
+# Args: [host-group] [profile-name]; default to globals.
+_sync_label_selector() {
+  local h="${1:-$RT_HOST_GROUP}" p="${2:-$RT_PROFILE_NAME}"
+  echo "rt-host=${h},rt-profile=${p}"
 }
 
 _has_sync() {
-  local p="${1:-$RT_PROFILE}"
+  local sel
+  sel=$(_sync_label_selector "$@")
   local out
-  out=$(mutagen sync list --label-selector "rt-profile=${p}" 2>/dev/null) || true
+  out=$(mutagen sync list --label-selector "$sel" 2>/dev/null) || true
   grep -q '^Identifier:' <<< "$out"
 }
 
 _sync_status() {
-  local p="${1:-$RT_PROFILE}"
+  local sel
+  sel=$(_sync_label_selector "$@")
   local out
-  out=$(mutagen sync list --label-selector "rt-profile=${p}" 2>/dev/null) || { echo none; return; }
+  out=$(mutagen sync list --label-selector "$sel" 2>/dev/null) || { echo none; return; }
   if ! grep -q '^Identifier:' <<< "$out"; then
     echo none
     return
@@ -85,13 +104,15 @@ _sync_status() {
 }
 
 _sync_flush() {
-  local p="${1:-$RT_PROFILE}"
-  mutagen sync flush --label-selector "rt-profile=${p}" >/dev/null 2>&1
+  local sel
+  sel=$(_sync_label_selector "$@")
+  mutagen sync flush --label-selector "$sel" >/dev/null 2>&1
 }
 
 _sync_terminate() {
-  local p="${1:-$RT_PROFILE}"
-  mutagen sync terminate --label-selector "rt-profile=${p}" >/dev/null 2>&1 || true
+  local sel
+  sel=$(_sync_label_selector "$@")
+  mutagen sync terminate --label-selector "$sel" >/dev/null 2>&1 || true
 }
 
 _sync_create() {
@@ -103,7 +124,8 @@ _sync_create() {
 
   local args=(
     --name="${session_name}"
-    --label="rt-profile=${RT_PROFILE}"
+    --label="rt-host=${RT_HOST_GROUP}"
+    --label="rt-profile=${RT_PROFILE_NAME}"
     --mode="${sync_mode}"
   )
 
@@ -133,18 +155,22 @@ _sync_create() {
 # ── Config ─────────────────────────────────────────────────────────
 load_config() {
   [[ -f "$RT_CONF" ]] || die "Config not found: $RT_CONF
-  Run 'rt init' to create from template, or create manually in $RT_HOME/"
+  Run 'rt -p ${RT_HOST_GROUP}/${RT_PROFILE_NAME} init' to create from template, or create manually in ${RT_HOME}/${RT_HOST_GROUP}/"
+
+  # Source host-level config first (shared across profiles in this host group),
+  # then profile-specific config (its values override host-level).
+  if [[ -f "$RT_HOST_CONF" ]]; then
+    # shellcheck source=/dev/null
+    . "$RT_HOST_CONF"
+  fi
   # shellcheck source=/dev/null
   . "$RT_CONF"
-  [[ -n "${REMOTE_HOST:-}" ]] || die "REMOTE_HOST not set in $RT_CONF"
+
+  [[ -n "${REMOTE_HOST:-}" ]] || die "REMOTE_HOST not set in $RT_HOST_CONF or $RT_CONF"
   [[ -n "${REMOTE_DIR:-}" ]]  || die "REMOTE_DIR not set in $RT_CONF"
 
-  # Default local replica dir: ~/work for default profile, ~/work/<name> for named
-  if [[ "$RT_PROFILE" == "default" ]]; then
-    LOCAL_DIR="${LOCAL_DIR:-$HOME/work}"
-  else
-    LOCAL_DIR="${LOCAL_DIR:-$HOME/work/${RT_PROFILE}}"
-  fi
+  # Default local replica dir: ~/Work/Remote/<host-group>/<profile-name>/
+  LOCAL_DIR="${LOCAL_DIR:-$HOME/Work/Remote/${RT_HOST_GROUP}/${RT_PROFILE_NAME}}"
   SSH_PORT="${SSH_PORT:-22}"
   SSH_KEY="${SSH_KEY:-}"
   SLURM_ENABLED="${SLURM_ENABLED:-0}"
@@ -222,34 +248,40 @@ cmd_check() {
 }
 
 cmd_init() {
-  mkdir -p "$RT_HOME"
+  mkdir -p "${RT_HOME}/${RT_HOST_GROUP}"
 
-  if [[ -f "$RT_CONF" ]]; then
-    info "Config already exists: $RT_CONF"
-  else
-    if [[ -f "$RT_SCRIPT_DIR/rt.conf.example" ]]; then
-      cp "$RT_SCRIPT_DIR/rt.conf.example" "$RT_CONF"
-      info "Created $RT_CONF from template."
-    else
-      cat > "$RT_CONF" <<'TMPL'
+  # Host-level config: REMOTE_HOST + SSH params shared by all profiles in this host group
+  if [[ ! -f "$RT_HOST_CONF" ]]; then
+    cat > "$RT_HOST_CONF" <<'TMPL'
+# Host-level config (shared by all profiles in this host group)
 REMOTE_HOST="user@example.com"
-REMOTE_DIR="/home/user/project"
 # SSH_PORT=22
 # SSH_KEY="$HOME/.ssh/id_ed25519"
-# LOCAL_DIR="$HOME/work"
+# SLURM_ENABLED=0
+TMPL
+    info "Created $RT_HOST_CONF (host-level)."
+  else
+    info "Host config already exists: $RT_HOST_CONF"
+  fi
+
+  # Profile config: workspace-specific REMOTE_DIR + LOCAL_DIR
+  if [[ ! -f "$RT_CONF" ]]; then
+    cat > "$RT_CONF" <<'TMPL'
+# Profile config (workspace-specific; overrides host.conf)
+REMOTE_DIR="/home/user/project"
+# LOCAL_DIR="$HOME/Work/Remote/<host>/<profile>"
 # MUTAGEN_SYNC_MODE="two-way-resolved"
 # MUTAGEN_IGNORE_VCS=1
 # MUTAGEN_IGNORE=("data/")
-# SLURM_ENABLED=0
 # SLURM_LOG_DIR="$REMOTE_DIR"
 TMPL
-      info "Created $RT_CONF with defaults."
-    fi
-    info "Edit $RT_CONF with your server details."
+    info "Created $RT_CONF (profile)."
+  else
+    info "Profile config already exists: $RT_CONF"
   fi
 
-  info "Config directory: $RT_HOME"
-  info "Next: edit config, then run 'rt connect'"
+  info "Host-group dir: ${RT_HOME}/${RT_HOST_GROUP}/"
+  info "Next: edit configs, then run 'rt -p ${RT_HOST_GROUP}/${RT_PROFILE_NAME} connect'"
 }
 
 cmd_setup_key() {
@@ -571,20 +603,26 @@ _status_all() {
 
   printf '\n'
   if [[ -d "$state_base" ]]; then
-    for pdir in "$state_base"/*/; do
-      [[ -d "$pdir" ]] || continue
-      found=true
-      local pname
-      pname=$(basename "$pdir")
-      local host="" local_dir="" rdir=""
-      [[ -f "$pdir/host" ]]       && host=$(cat "$pdir/host")
-      [[ -f "$pdir/local_dir" ]]  && local_dir=$(cat "$pdir/local_dir")
-      [[ -f "$pdir/remote_dir" ]] && rdir=$(cat "$pdir/remote_dir")
+    # Two-level enumeration: state_base/<host-group>/<profile-name>/
+    for hdir in "$state_base"/*/; do
+      [[ -d "$hdir" ]] || continue
+      local hname
+      hname=$(basename "$hdir")
+      for pdir in "$hdir"*/; do
+        [[ -d "$pdir" ]] || continue
+        found=true
+        local pname
+        pname=$(basename "$pdir")
+        local host="" local_dir="" rdir=""
+        [[ -f "$pdir/host" ]]       && host=$(cat "$pdir/host")
+        [[ -f "$pdir/local_dir" ]]  && local_dir=$(cat "$pdir/local_dir")
+        [[ -f "$pdir/remote_dir" ]] && rdir=$(cat "$pdir/remote_dir")
 
-      local sync_state
-      sync_state=$(_sync_status "$pname")
+        local sync_state
+        sync_state=$(_sync_status "$hname" "$pname")
 
-      printf '  [%s] sync=%s — %s:%s ⇄ %s\n' "$pname" "$sync_state" "$host" "$rdir" "$local_dir"
+        printf '  [%s/%s] sync=%s — %s:%s ⇄ %s\n' "$hname" "$pname" "$sync_state" "$host" "$rdir" "$local_dir"
+      done
     done
   fi
 
@@ -615,7 +653,7 @@ cmd_sync() {
       ;;
     status)
       info "[$RT_PROFILE] Sync state: $(_sync_status)"
-      mutagen sync list --label-selector "rt-profile=${RT_PROFILE}" 2>&1 || true
+      mutagen sync list --label-selector "$(_sync_label_selector)" 2>&1 || true
       ;;
     "")
       die "Usage: rt sync <flush|status>"
@@ -770,13 +808,14 @@ cmd_help() {
 Remote Toolkit — Drive remote servers from Claude Code
 
 USAGE:
-  rt [--profile NAME] <command> [options]
-  rt [-p NAME] <command> [options]
+  rt [-p HOST/PROFILE] <command> [options]
 
 GLOBAL FLAGS:
-  -p, --profile NAME   Select a profile (default: "default")
-                        Config file: rt.conf (default) or rt.conf.<NAME>
-                        Local replica: ~/work (default) or ~/work/<NAME>
+  -p, --profile HOST/PROFILE
+                       Select a profile, in <host-group>/<profile-name> form.
+                       Bare <name> is treated as default/<name>.
+                       Config: \$RT_HOME/<host>/host.conf + <host>/<profile>.conf
+                       Local replica: ~/Work/Remote/<host>/<profile>/
 
 COMMANDS:
   init                 Create config directory and default config
@@ -808,46 +847,47 @@ COMMANDS:
   help                 Show this help
 
 EXAMPLES:
-  # First-time setup
-  rt init                                # Create config skeleton
-  # Edit \$RT_HOME/rt.conf with REMOTE_HOST, REMOTE_DIR
-  rt setup-key --password 'mypass'       # Push SSH key
-  rt connect                             # Start sync
-  rt exec "ls -la"
-  rt disconnect
+  # First-time setup for a new host group + profile
+  rt -p fact-cluster/scratch init        # Create host.conf + scratch.conf skeletons
+  # Edit \$RT_HOME/fact-cluster/host.conf (REMOTE_HOST, SSH_PORT, SLURM_ENABLED)
+  # Edit \$RT_HOME/fact-cluster/scratch.conf (REMOTE_DIR, optional LOCAL_DIR)
+  rt -p fact-cluster/scratch setup-key --password 'mypass'
+  rt -p fact-cluster/scratch connect
+  rt -p fact-cluster/scratch exec "ls -la"
+  rt -p fact-cluster/scratch disconnect
 
-  # Multiple servers via profiles
-  rt -p hpc setup-key --password 'pass'
-  rt -p hpc connect
-  rt -p hpc exec "nvidia-smi"
+  # Adding another profile under the same host group reuses host.conf
+  # Edit \$RT_HOME/fact-cluster/ako.conf (just REMOTE_DIR/LOCAL_DIR)
+  rt -p fact-cluster/ako connect
   rt status --all
 
-  # HPC / Slurm workflow (set SLURM_ENABLED=1 in rt.conf.<profile>)
-  rt -p hpc slurm submit train.sbatch
-  rt -p hpc slurm queue
-  rt -p hpc slurm logs <jobid> -f
-  rt -p hpc slurm cancel <jobid>
+  # HPC / Slurm workflow (SLURM_ENABLED=1 in host.conf or profile.conf)
+  rt -p fact-cluster/scratch slurm submit train.sbatch
+  rt -p fact-cluster/scratch slurm queue
+  rt -p fact-cluster/scratch slurm logs <jobid> -f
+  rt -p fact-cluster/scratch slurm cancel <jobid>
 
 ENVIRONMENT:
-  RT_HOME              Config & state directory (default: $RT_HOME)
+  RT_HOME              Config & state directory (default: ~/.config/remote-toolkit)
 
-CONFIG FILES (in \$RT_HOME):
-  rt.conf              Default profile config
-  rt.conf.<NAME>       Named profile config (e.g., rt.conf.hpc)
+CONFIG LAYOUT (in \$RT_HOME):
+  <host>/host.conf        Host-level config (shared by all profiles in the group)
+  <host>/<profile>.conf   Profile-specific config
 
-  Required:
-    REMOTE_HOST        user@hostname (or ~/.ssh/config alias)
-    REMOTE_DIR         /path/on/remote
+  Host-level (host.conf):
+    REMOTE_HOST          user@hostname (or ~/.ssh/config alias) — required
+    SSH_PORT             default: 22
+    SSH_KEY              default: agent
+    SLURM_ENABLED        1 enables 'rt slurm *' (default 0)
 
-  Optional:
-    LOCAL_DIR          local replica (default: ~/work or ~/work/<NAME>)
-    SSH_KEY            SSH key path (default: agent)
-    SSH_PORT           SSH port (default: 22)
-    MUTAGEN_SYNC_MODE  default: two-way-resolved
-    MUTAGEN_IGNORE_VCS 1 = pass --ignore-vcs (default), 0 = sync .git
-    MUTAGEN_IGNORE     bash array of extra ignore patterns
-    SLURM_ENABLED      1 enables \`rt slurm *\` (default 0)
-    SLURM_LOG_DIR      where slurm-<id>.out lands (default: \$REMOTE_DIR)
+  Profile-level (<profile>.conf):
+    REMOTE_DIR           /path/on/remote — required
+    LOCAL_DIR            local replica (default: ~/Work/Remote/<host>/<profile>)
+    MUTAGEN_SYNC_MODE    default: two-way-resolved
+    MUTAGEN_IGNORE_VCS   1 = pass --ignore-vcs (default), 0 = sync .git
+    MUTAGEN_IGNORE       bash array of extra ignore patterns
+    SLURM_LOG_DIR        where slurm-<id>.out lands (default: \$REMOTE_DIR)
+    (any host-level var here overrides the host.conf value)
 
 NOTE: For non-default SSH_PORT or SSH_KEY, also add a Host entry to
 ~/.ssh/config so Mutagen sync uses the same parameters.

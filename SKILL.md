@@ -41,28 +41,36 @@ When the user provides server info (e.g., `ssh user@host -p PORT`, password `xxx
 rt check
 ```
 
-### 2. Create config file
+### 2. Create config
 
-Use Write to create config at `~/.config/remote-toolkit/`. Default profile uses `rt.conf`; named profiles use `rt.conf.<name>`.
+Profiles are namespaced under host groups: `<host-group>/<profile>` (e.g., `fact-cluster/scratch`). Each host group has one shared `host.conf` (login info) plus one `<profile>.conf` per workspace.
 
-Default profile:
+Layout under `~/.config/remote-toolkit/`:
 ```
-File: ~/.config/remote-toolkit/rt.conf
-REMOTE_HOST="user@host"
-REMOTE_DIR="/home/user/project"
-SSH_PORT=22
+fact-cluster/
+  host.conf       Host-level (REMOTE_HOST, SSH_PORT, SLURM_ENABLED)
+  scratch.conf    Profile-level (REMOTE_DIR, optional LOCAL_DIR)
+  ako.conf        Another profile under the same host
 ```
 
-Named profile (multiple servers / HPC):
+Use Write to create them. Example for a new HPC host:
+
+`~/.config/remote-toolkit/fact-cluster/host.conf`:
 ```
-File: ~/.config/remote-toolkit/rt.conf.hpc
 REMOTE_HOST="user@login.cluster"
-REMOTE_DIR="/home/user/project"
 SSH_PORT=22
 SLURM_ENABLED=1
 ```
 
-For non-default SSH_PORT or SSH_KEY, **also add a Host entry to `~/.ssh/config`** so Mutagen finds the right SSH parameters (Mutagen reads ssh config, not rt.conf):
+`~/.config/remote-toolkit/fact-cluster/scratch.conf`:
+```
+REMOTE_DIR="/home/user/scratch"
+# LOCAL_DIR defaults to ~/Work/Remote/fact-cluster/scratch — override only if needed
+```
+
+Bare profile names (no slash) are treated as `default/<name>`. Prefer explicit `<host>/<profile>` for clarity.
+
+For non-default SSH_PORT or SSH_KEY, **also add a Host entry to `~/.ssh/config`** so Mutagen finds the right SSH parameters (Mutagen reads ssh config, not host.conf):
 ```
 Host login.cluster
     Port 2222
@@ -71,17 +79,16 @@ Host login.cluster
 
 ### 3. Push SSH key (one-time)
 ```bash
-rt setup-key --password 'password'
-rt -p hpc setup-key --password 'password'
+rt -p fact-cluster/scratch setup-key --password 'password'
 ```
+(Once pushed for one profile in a host group, all profiles in that group share the key.)
 
 ### 4. Connect
 ```bash
-rt connect
-rt -p hpc connect
+rt -p fact-cluster/scratch connect
 ```
 
-`connect` starts the Mutagen daemon (if needed) and creates a sync session named `rt-<profile>`. Initial scan happens in the background; `rt status` shows progress.
+`connect` starts the Mutagen daemon (if needed) and creates a sync session named `rt-<host>-<profile>` (e.g., `rt-fact-cluster-scratch`). Initial scan happens in the background; `rt status` shows progress.
 
 ## Daily Usage
 
@@ -96,13 +103,11 @@ rt disconnect          # Terminates sync; preserves local files
 
 ### File Operations
 
-The local replica directory:
-- Default profile → `~/work/`
-- Named profile → `~/work/<name>/` (e.g., `~/work/hpc/`)
+The local replica directory defaults to `~/Work/Remote/<host>/<profile>/` (override via `LOCAL_DIR` in the profile config). Above that, host-group dirs `~/Work/Remote/<host>/` may carry a git-tracked `CLAUDE.md` and shared `templates/` (selectively un-ignored in `.gitignore`).
 
 These are **regular local directories**, not network mounts. Read / Edit / Write at full local-disk speed:
-- `Read ~/work/src/main.py`
-- `Edit ~/work/hpc/train.py`
+- `Read ~/Work/Remote/fact-cluster/scratch/src/main.py`
+- `Edit ~/Work/Remote/fact-cluster/ako/train.py`
 
 Mutagen syncs changes to and from the remote in the background (typically < 1s for small files). Use `rt sync flush` to force reconciliation; `rt sync status` for diagnostics.
 
@@ -110,43 +115,43 @@ Mutagen syncs changes to and from the remote in the background (typically < 1s f
 
 Short commands (< 30 seconds) — auto-flushes sync first:
 ```bash
-rt exec "pwd"
-rt -p hpc exec "nvidia-smi"
-rt exec --no-flush "ls"           # skip flush for fast iteration
+rt -p fact-cluster/scratch exec "pwd"
+rt -p fact-cluster/scratch exec "nvidia-smi"
+rt -p fact-cluster/scratch exec --no-flush "ls"   # skip flush for fast iteration
 ```
 
 Long commands (builds, training daemons, services):
 ```bash
-rt exec --bg --name build "make all"
-rt -p hpc exec --bg --name train "python3 train.py"
+rt -p fact-cluster/scratch exec --bg --name build "make all"
+rt -p fact-cluster/ako exec --bg --name train "python3 train.py"
 ```
 
 Check background tasks:
 ```bash
-rt logs                              # List background jobs for current profile
-rt -p hpc logs rt_hpc_bg_train       # Show specific output
-rt -p hpc logs rt_hpc_bg_train -f    # Follow (tail -f)
+rt -p fact-cluster/scratch logs                                   # list bg jobs for this profile
+rt -p fact-cluster/ako logs rt_fact-cluster_ako_bg_train          # show specific output
+rt -p fact-cluster/ako logs rt_fact-cluster_ako_bg_train -f       # follow (tail -f)
 ```
 
-The working directory for `rt exec` is REMOTE_DIR, which mirrors the local `~/work/<profile>/` replica.
+The working directory for `rt exec` is `REMOTE_DIR`, which mirrors the local `~/Work/Remote/<host>/<profile>/` replica.
 
 ## Slurm (HPC) Workflows
 
-Available when the profile has `SLURM_ENABLED=1`. Sync flush is automatic before submit.
+Available when `SLURM_ENABLED=1` is set in `host.conf` or the profile config. Sync flush is automatic before submit.
 
 ```bash
-rt -p hpc slurm submit train.sbatch                       # cd && sbatch train.sbatch
-rt -p hpc slurm submit train.sbatch -- --time=04:00:00    # extra args after `--`
-rt -p hpc slurm queue                                      # squeue -u $USER
-rt -p hpc slurm queue --all                                # squeue (whole cluster)
-rt -p hpc slurm logs                                       # list recent submissions
-rt -p hpc slurm logs 12345                                 # cat slurm-12345.out
-rt -p hpc slurm logs 12345 -f                              # tail -f
-rt -p hpc slurm logs 12345 --err                           # show .err instead
-rt -p hpc slurm cancel 12345                               # scancel 12345
+rt -p fact-cluster/scratch slurm submit train.sbatch                       # cd && sbatch train.sbatch
+rt -p fact-cluster/scratch slurm submit train.sbatch -- --time=04:00:00    # extra args after `--`
+rt -p fact-cluster/scratch slurm queue                                      # squeue -u $USER
+rt -p fact-cluster/scratch slurm queue --all                                # squeue (whole cluster)
+rt -p fact-cluster/scratch slurm logs                                       # list recent submissions
+rt -p fact-cluster/scratch slurm logs 12345                                 # cat slurm-12345.out
+rt -p fact-cluster/scratch slurm logs 12345 -f                              # tail -f
+rt -p fact-cluster/scratch slurm logs 12345 --err                           # show .err instead
+rt -p fact-cluster/scratch slurm cancel 12345                               # scancel 12345
 ```
 
-`rt` does not generate sbatch scripts — write your own `*.sbatch` in `~/work/hpc/` and submit by path.
+`rt` does not generate sbatch scripts — write your own `*.sbatch` under the profile's local replica and submit by path.
 
 ## Important Rules
 
