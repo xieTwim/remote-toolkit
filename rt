@@ -171,6 +171,14 @@ _sync_create() {
     "__pycache__/" "*.pyc" ".venv/" "venv/" "node_modules/"
     "wandb/" "outputs/" "checkpoints/" ".ipynb_checkpoints/"
     ".DS_Store" "*.swp"
+    # Personal / Claude Code harness artifacts. These are LOCAL reasoning aids,
+    # never project deliverables, and must not mirror onto the (often SHARED,
+    # e.g. fact-cluster's haoyu account) remotes — nor leak into repos that get
+    # `gh push`-ed from the box. Bare names match at any depth; trailing slash
+    # = directory. Bench scaffolding (bench.py/bench_runner/conftest/bench.sh)
+    # is deliberately NOT here — it must run on the remote GPU.
+    ".claude/" "CLAUDE.md" "HANDOFF.md" "HINTS.md" "ITERATIONS.md"
+    ".local/" "*.local.md"
   )
   local pat
   for pat in "${default_ignores[@]}"; do
