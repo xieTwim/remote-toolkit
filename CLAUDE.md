@@ -38,6 +38,7 @@ Subcommands: `init` `check` `setup-key` `connect` `disconnect` `exec` `logs` `st
 
 - `rt connect` ensures the Mutagen daemon is running (`mutagen daemon start`, idempotent), then creates a sync session named `rt-<host>-<profile>` with two labels: `rt-host=<host>` and `rt-profile=<profile>`.
 - All Mutagen queries (`_has_sync`, `_sync_status`, `_sync_flush`, `_sync_terminate`) build a composite selector via `_sync_label_selector` (`rt-host=<h>,rt-profile=<p>`). Helpers default to globals; pass `(host, profile)` explicitly when iterating (e.g., from `_status_all`).
+- **`_sync_flush` is time-bounded** (`RT_FLUSH_TIMEOUT`, default 30s): `mutagen sync flush` blocks until a full sync cycle completes, and since `cmd_exec`/`cmd_slurm` auto-flush first, an unbounded flush on a large/backlogged session wedged *every* command. It now runs the flush in the background and kills it past the cap (returning non-zero so the caller warns); the daemon keeps syncing regardless. A profile whose flush routinely times out is missing `MUTAGEN_IGNORE` entries for a heavy dir.
 - `_status_all` walks `$RT_HOME/.rt/*/` for host-group dirs, then `*/` for profiles within each, and renders `[host/profile]` rows.
 - Mutagen URL form is `[user@]host:path` and reads SSH parameters from `~/.ssh/config`. For non-default `SSH_PORT` or `SSH_KEY`, the user must add a matching Host entry to ssh config; `rt connect` warns when this is needed.
 

@@ -159,7 +159,10 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
 
 2. **Long-running commands** — use `rt exec --bg` (any host) or `rt slurm submit` (Slurm hosts). SSH timeouts will kill foreground commands over a few minutes.
 
-3. **Sync timing** — Mutagen syncs in the background. `rt exec` auto-flushes before executing, so the remote sees the latest edits. If skipping flush (`--no-flush`), beware of stale code.
+3. **Sync timing & the flush wedge** — Mutagen syncs in the background. `rt exec` (and `slurm submit`) auto-flush FIRST so the remote sees the latest edits. That flush is **bounded by `RT_FLUSH_TIMEOUT` (default 30s)**: without the cap, a large or backlogged sync blocks until a full cycle completes, which **wedges every command — even `echo` hangs for minutes**. If exec is slow or wedging:
+   - `--no-flush` skips the flush entirely (fast, but beware stale code).
+   - The real cause is usually a **bloated sync set** — a heavy dir missing from the profile's `MUTAGEN_IGNORE`. Check `mutagen sync list`; a multi-GB working set is the tell. Add the dir to `MUTAGEN_IGNORE` and recreate the session (`rt disconnect && rt connect` — ignores only apply at create time).
+   - When the sync itself is wedged, a **direct `ssh <host>` bypasses `rt` entirely** (and skips the flush) — the fastest escape for read-only/inspection work.
 
 4. **Connection issues** — If `rt status` shows `sync=offline`, check network. `rt sync flush` to retry. `rt disconnect && rt connect` to recreate the session.
 

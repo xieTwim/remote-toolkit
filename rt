@@ -140,7 +140,28 @@ _sync_status() {
 _sync_flush() {
   local sel
   sel=$(_sync_label_selector "$@")
-  mutagen sync flush --label-selector "$sel" >/dev/null 2>&1
+  # Bound the wait. `mutagen sync flush` blocks until the daemon finishes one
+  # full sync cycle, which on a large or backlogged session takes minutes — and
+  # since `rt exec` (and `slurm submit`) auto-flush FIRST, an unbounded flush
+  # wedges EVERY command (even `echo` hangs). Cap it; the daemon keeps syncing
+  # in the background regardless, so we lose at most the "remote sees newest
+  # edits" guarantee (caller warns on non-zero). Tune via RT_FLUSH_TIMEOUT
+  # (seconds). A flush that routinely times out usually means the profile is
+  # missing MUTAGEN_IGNORE entries for a heavy dir (bloated sync set).
+  local limit="${RT_FLUSH_TIMEOUT:-30}"
+  mutagen sync flush --label-selector "$sel" >/dev/null 2>&1 &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= limit )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
 }
 
 _sync_terminate() {
@@ -170,7 +191,7 @@ _sync_create() {
   local default_ignores=(
     "__pycache__/" "*.pyc" ".venv/" "venv/" "node_modules/"
     "wandb/" "outputs/" "checkpoints/" ".ipynb_checkpoints/"
-    ".DS_Store" "*.swp"
+    ".triton_cache/" ".DS_Store" "*.swp"
     # Personal / Claude Code harness artifacts. These are LOCAL reasoning aids,
     # never project deliverables, and must not mirror onto the (often SHARED,
     # e.g. fact-cluster's haoyu account) remotes — nor leak into repos that get
