@@ -18,6 +18,14 @@ REMOTE_DIR="/home/user/project"
 #   "data/"
 #   "*.bin"
 # )
+# MUTAGEN_MAX_ENTRY_COUNT=50000         # circuit breaker: HALT this session if it exceeds
+#                                       # N filesystem entries (default 50000). Stops a runaway
+#                                       # sync (heavy dir missing from IGNORE) from saturating
+#                                       # the shared Mutagen daemon and wedging every other
+#                                       # profile's `rt exec`. Raise for a legitimately larger
+#                                       # project; set empty to disable. Slow ceph-fuse hosts:
+#                                       # set lower in host.conf (e.g. 15000).
+# MUTAGEN_MAX_STAGING_FILE_SIZE="2GB"   # opt-in: cap individual staged file size
 
 # Optional — Slurm output dir override (host.conf typically sets SLURM_ENABLED)
 # SLURM_LOG_DIR="$REMOTE_DIR"            # where slurm-<jobid>.out lands

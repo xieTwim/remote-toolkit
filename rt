@@ -212,6 +212,20 @@ _sync_create() {
     done
   fi
 
+  # Circuit breaker (blast-radius cap). All profiles share ONE Mutagen daemon and
+  # (per host) one filesystem mount, so a single profile syncing a runaway tree — a
+  # heavy dir missing from MUTAGEN_IGNORE — can saturate the daemon's scan/reconcile
+  # loop and wedge EVERY other profile's auto-flush (even `echo` hangs). A
+  # --max-entry-count makes such a session HALT ITSELF (loud + local) instead of
+  # taking the shared daemon down with it. It BACKSTOPS MUTAGEN_IGNORE hygiene, it
+  # does not replace it: on slow ceph-fuse remotes even a few-thousand-file dir hurts
+  # well below this cap, so tighten per host via MUTAGEN_MAX_ENTRY_COUNT in host.conf.
+  # Raise it for a profile that legitimately manages more; set it empty to disable.
+  # --max-staging-file-size (opt-in) caps individual staged files.
+  local max_entries="${MUTAGEN_MAX_ENTRY_COUNT-50000}"
+  [[ -n "$max_entries" ]] && args+=(--max-entry-count="$max_entries")
+  [[ -n "${MUTAGEN_MAX_STAGING_FILE_SIZE:-}" ]] && args+=(--max-staging-file-size="$MUTAGEN_MAX_STAGING_FILE_SIZE")
+
   mutagen sync create "${args[@]}" "${LOCAL_DIR}" "${mutagen_url}"
 }
 
