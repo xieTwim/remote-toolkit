@@ -88,7 +88,7 @@ rt -p fact-cluster/scratch setup-key --password 'password'
 rt -p fact-cluster/scratch connect
 ```
 
-`connect` starts the Mutagen daemon (if needed) and creates a sync session named `rt-<host>-<profile>` (e.g., `rt-fact-cluster-scratch`). Initial scan happens in the background; `rt status` shows progress.
+`connect` starts the Mutagen daemon (if needed) and creates a sync session named `rt-<host>--<profile>` (e.g., `rt-fact-cluster--scratch`). Initial scan happens in the background; `rt status` shows progress.
 
 ## Daily Usage
 
@@ -97,7 +97,7 @@ rt -p fact-cluster/scratch connect
 ```bash
 rt status              # Sync + SSH state for current profile
 rt status --all        # All profiles
-rt connect             # Idempotent — flushes if already connected
+rt connect             # Idempotent — resumes if paused, flushes if already connected
 rt disconnect          # Terminates sync; preserves local files
 ```
 
@@ -139,6 +139,8 @@ The working directory for `rt exec` is `REMOTE_DIR`, which mirrors the local `~/
 
 Available when `SLURM_ENABLED=1` is set in `host.conf` or the profile config. Sync flush is automatic before submit.
 
+`SLURM_SBATCH_ARGS` (host.conf for cluster-wide policy, profile config to override) injects standing sbatch args before every submit — e.g. fact-cluster carries `"--no-requeue --exclude=ultimate-law,einstein"`. The submit line echoes the merged args, and explicit `-- ...` args come after the defaults, so they override (sbatch last-wins).
+
 ```bash
 rt -p fact-cluster/scratch slurm submit train.sbatch                       # cd && sbatch train.sbatch
 rt -p fact-cluster/scratch slurm submit train.sbatch -- --time=04:00:00    # extra args after `--`
@@ -165,7 +167,7 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
    - **The wedge is cross-project.** All profiles share ONE Mutagen daemon (and, per host, one mount), so a runaway sync in *one* profile stalls *every* profile's flush, not just its own. `rt` now caps each session with `--max-entry-count` (default 50000, override `MUTAGEN_MAX_ENTRY_COUNT`, empty disables) so a runaway **halts itself** instead of taking the daemon down — a *halted* session with a huge entry count in `mutagen sync list` is the tell; fix its `MUTAGEN_IGNORE` and recreate. The cap backstops ignore hygiene, it doesn't replace it (on ceph-fuse even a few-thousand-file dir hurts below the cap).
    - When the sync itself is wedged, a **direct `ssh <host>` bypasses `rt` entirely** (and skips the flush) — the fastest escape for read-only/inspection work.
 
-4. **Connection issues** — If `rt status` shows `sync=offline`, check network. `rt sync flush` to retry. `rt disconnect && rt connect` to recreate the session.
+4. **Connection issues** — If `rt status` shows `sync=offline`, check network. `rt sync flush` to retry. If it shows `sync=paused` (manual pause or the entry-count circuit breaker halting the session), flushes fail fast with a warning — `exec` proceeds on possibly-stale code, `slurm submit` aborts — until **`rt connect` resumes it**. A breaker-halted session records its error in `rt sync status`; fix `MUTAGEN_IGNORE` first or it halts again. `rt disconnect && rt connect` to recreate the session.
 
 5. **Missing dependencies** — If `rt check` reports "not found", **do not attempt to sudo install**. Tell the user to run the install commands.
 

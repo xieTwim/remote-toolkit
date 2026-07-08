@@ -15,3 +15,10 @@ REMOTE_HOST="user@example.com"
 
 # Optional — Slurm (set 1 for HPC clusters with login node + sbatch)
 # SLURM_ENABLED=0
+# SLURM_SBATCH_ARGS=""     # sbatch args injected before every `rt slurm submit`
+#                          # — the place to encode standing cluster policy, e.g.
+#                          # "--no-requeue --exclude=bad-node1,bad-node2".
+#                          # Explicit '-- ...' submit args come after these and
+#                          # override (sbatch last-wins). Avoid a default
+#                          # partition here: CLI args override in-script
+#                          # '#SBATCH -p' directives.

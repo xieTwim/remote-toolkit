@@ -29,3 +29,7 @@ REMOTE_DIR="/home/user/project"
 
 # Optional — Slurm output dir override (host.conf typically sets SLURM_ENABLED)
 # SLURM_LOG_DIR="$REMOTE_DIR"            # where slurm-<jobid>.out lands
+# SLURM_SBATCH_ARGS=""                   # REPLACES the host.conf value entirely
+#                                        # (plain var override, not appended);
+#                                        # set "" to drop host defaults for this
+#                                        # profile only

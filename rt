@@ -137,19 +137,13 @@ _sync_status() {
   fi
 }
 
-_sync_flush() {
-  local sel
-  sel=$(_sync_label_selector "$@")
-  # Bound the wait. `mutagen sync flush` blocks until the daemon finishes one
-  # full sync cycle, which on a large or backlogged session takes minutes — and
-  # since `rt exec` (and `slurm submit`) auto-flush FIRST, an unbounded flush
-  # wedges EVERY command (even `echo` hangs). Cap it; the daemon keeps syncing
-  # in the background regardless, so we lose at most the "remote sees newest
-  # edits" guarantee (caller warns on non-zero). Tune via RT_FLUSH_TIMEOUT
-  # (seconds). A flush that routinely times out usually means the profile is
-  # missing MUTAGEN_IGNORE entries for a heavy dir (bloated sync set).
-  local limit="${RT_FLUSH_TIMEOUT:-30}"
-  mutagen sync flush --label-selector "$sel" >/dev/null 2>&1 &
+# Run a command with a wall-clock bound: kill it past $1 seconds and return 1.
+# Mutagen daemon calls (flush, resume) can block indefinitely; every caller of
+# this helper sits on the hot path of `rt exec`/`slurm submit`, so an unbounded
+# call wedges EVERY command (even `echo` hangs).
+_run_bounded() {
+  local limit="$1"; shift
+  "$@" >/dev/null 2>&1 &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
@@ -162,6 +156,34 @@ _sync_flush() {
     waited=$((waited + 1))
   done
   wait "$pid"
+}
+
+_sync_flush() {
+  local sel
+  sel=$(_sync_label_selector "$@")
+  # A paused session never completes a sync cycle, so flushing it would burn
+  # the full timeout on every command (and before the timeout existed, hang
+  # forever). Fail fast and name the fix instead.
+  if [[ "$(_sync_status "$@")" == "paused" ]]; then
+    warn "Sync session is PAUSED — flush skipped. 'rt -p ${RT_PROFILE} connect' resumes it."
+    return 1
+  fi
+  # Bound the wait. `mutagen sync flush` blocks until the daemon finishes one
+  # full sync cycle, which on a large or backlogged session takes minutes.
+  # The daemon keeps syncing in the background regardless, so past the cap we
+  # lose at most the "remote sees newest edits" guarantee (caller warns on
+  # non-zero). Tune via RT_FLUSH_TIMEOUT (seconds). A flush that routinely
+  # times out usually means the profile is missing MUTAGEN_IGNORE entries for
+  # a heavy dir (bloated sync set).
+  _run_bounded "${RT_FLUSH_TIMEOUT:-30}" mutagen sync flush --label-selector "$sel"
+}
+
+# Resume a paused session. Bounded like flush; resume re-establishes the SSH
+# transport, so the default cap is wider (RT_RESUME_TIMEOUT, seconds).
+_sync_resume() {
+  local sel
+  sel=$(_sync_label_selector "$@")
+  _run_bounded "${RT_RESUME_TIMEOUT:-60}" mutagen sync resume --label-selector "$sel"
 }
 
 _sync_terminate() {
@@ -253,6 +275,7 @@ load_config() {
   SSH_KEY="${SSH_KEY:-}"
   SLURM_ENABLED="${SLURM_ENABLED:-0}"
   SLURM_LOG_DIR="${SLURM_LOG_DIR:-$REMOTE_DIR}"
+  SLURM_SBATCH_ARGS="${SLURM_SBATCH_ARGS:-}"
 
   # Build shared SSH options array (used by direct _ssh calls; Mutagen uses ~/.ssh/config)
   SSH_OPTS=(
@@ -415,8 +438,12 @@ cmd_connect() {
   _mutagen_check
   _mutagen_daemon_ensure
 
-  # Idempotent: sync session already exists → just flush and exit
+  # Idempotent: sync session already exists → resume if paused, flush, exit
   if _has_sync; then
+    if [[ "$(_sync_status)" == "paused" ]]; then
+      info "[$RT_PROFILE] Sync session is paused — resuming ..."
+      _sync_resume || die "Resume failed. Diagnose with 'rt -p $RT_PROFILE sync status' — a session halted by the entry-count circuit breaker records the error there; fix MUTAGEN_IGNORE (or raise MUTAGEN_MAX_ENTRY_COUNT) before retrying."
+    fi
     info "[$RT_PROFILE] Already connected to $REMOTE_HOST (flushing pending changes)"
     _sync_flush || warn "Sync flush had issues; check 'rt status' / 'mutagen sync list'."
     cmd_status
@@ -769,6 +796,12 @@ _slurm_require_enabled() {
 _slurm_submit() {
   local script=""
   local sbatch_args=()
+  # Per-profile default sbatch args (SLURM_SBATCH_ARGS in host.conf/profile.conf)
+  # seed the list FIRST, so explicit '-- ...' args land after them and win
+  # (sbatch: last occurrence of a flag takes effect).
+  if [[ -n "${SLURM_SBATCH_ARGS:-}" ]]; then
+    read -r -a sbatch_args <<< "$SLURM_SBATCH_ARGS"
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --) shift; sbatch_args+=("$@"); break ;;
@@ -904,7 +937,7 @@ COMMANDS:
   setup-key            Copy SSH key to remote (one-time, password auth)
   setup-key --password PASS
                        Non-interactive key push (requires sshpass)
-  connect              Start Mutagen sync; ensures daemon is running
+  connect              Start Mutagen sync; resumes a paused session; ensures daemon is running
   disconnect           Terminate sync; preserves local replica files
   exec <command>       Run a command on the remote (auto-flushes sync)
   exec --no-flush <cmd>
@@ -960,6 +993,9 @@ CONFIG LAYOUT (in \$RT_HOME):
     SSH_PORT             default: 22
     SSH_KEY              default: agent
     SLURM_ENABLED        1 enables 'rt slurm *' (default 0)
+    SLURM_SBATCH_ARGS    sbatch args injected before every 'slurm submit'
+                         (default: none; explicit '-- ...' args come after
+                         these, so they override — sbatch last-wins)
 
   Profile-level (<profile>.conf):
     REMOTE_DIR           /path/on/remote — required
