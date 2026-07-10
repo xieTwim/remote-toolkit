@@ -174,8 +174,9 @@ _sync_flush() {
   # lose at most the "remote sees newest edits" guarantee (caller warns on
   # non-zero). Tune via RT_FLUSH_TIMEOUT (seconds). A flush that routinely
   # times out usually means the profile is missing MUTAGEN_IGNORE entries for
-  # a heavy dir (bloated sync set).
-  _run_bounded "${RT_FLUSH_TIMEOUT:-30}" mutagen sync flush --label-selector "$sel"
+  # a heavy dir (bloated sync set). For read-only monitoring (no local edits to
+  # push — e.g. a CVM grep/stat/cat) prefer 'rt exec --no-flush' to skip it.
+  _run_bounded "${RT_FLUSH_TIMEOUT:-10}" mutagen sync flush --label-selector "$sel"
 }
 
 # Resume a paused session. Bounded like flush; resume re-establishes the SSH
