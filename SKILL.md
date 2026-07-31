@@ -70,6 +70,22 @@ REMOTE_DIR="/home/user/scratch"
 
 Profile names must be in `<host>/<profile>` form (no bare-name fallback). Each segment is alphanumeric with single dashes between alphanumerics (no leading/trailing dash, no `--`, no `_` or `.`), max 32 chars — keeps the name unambiguous when `--` separates segments in the Mutagen session name and `_` separates them in tmux session names.
 
+#### One host, several storage backends
+
+A host group is a *login*, not a filesystem. If the same host mounts more than one storage backend (two network filesystems, a fast scratch tier plus bulk storage, two regions of the same cluster), give each backend **its own profile** — one profile is one `REMOTE_DIR`, and that is the whole mechanism. Suggested naming: `<project>` for the default backend and `<project>-<backend>` for the other, e.g.
+
+```
+wxg-cvm/myproj        REMOTE_DIR="/mnt/fsA/user/myproj"
+wxg-cvm/myproj-alt    REMOTE_DIR="/mnt/fsB/user/myproj"
+```
+
+Two non-obvious rules when a project moves between backends:
+
+- **Editing `REMOTE_DIR` does NOT retarget a live profile.** `connect` is idempotent: it finds the existing session and resumes/flushes it, so the edit silently has no effect and you keep syncing to the old root. Moving = create the new profile, verify it round-trips, then retire the old one (`disconnect`, archive its `.conf`). This also makes the move reversible.
+- **Never point two profiles at one `LOCAL_DIR`.** `LOCAL_DIR` is derived from the profile name, so distinct names are safe automatically — do not override it to "share" one replica between two backends. Two sessions reconciling the same directory will fight, and a delete on one side propagates through both.
+
+Which backend a project belongs on is a data-locality question, not a tidiness one: measure it. Bulk sequential reads are what differ between backends; small-file/metadata work often does not. If a run reads only a few hundred MB, moving it buys nothing.
+
 For non-default SSH_PORT or SSH_KEY, **also add a Host entry to `~/.ssh/config`** so Mutagen finds the right SSH parameters (Mutagen reads ssh config, not host.conf):
 ```
 Host login.cluster
