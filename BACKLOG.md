@@ -18,3 +18,7 @@ Seeded 2026-08-01 from the second migration lane.
 - [open] 2026-08-01 reason-select: a courier bucket degrades silently as finished handoffs accumulate, and the tool's only lever makes it worse. Measured: 10,292 files / 2.6 GB in the tree put a flush in `Scanning files` for 20+ minutes — a 9 KB push took ~40 minutes and a 2.7 MB pull had not arrived after 25 — while the same bucket at 232 files / 41 MB flushes in 7 seconds. Everything in it was FINISHED pulls nobody cleared
   repro: let a sync bucket accumulate completed handoffs; measure flush latency against file count
   fix shape: warn on file count / tree size at flush time, before latency becomes the symptom. The standing lesson is that **a courier bucket needs PRUNING, not a growing ignore list — a growing ignore list is the tell that the bucket is being used as storage**; note also that ignores only apply at session-create time, so adding one does not take effect until the session is recreated, which is itself worth surfacing
+
+- [open] 2026-08-01 grpo-speed: bounded reads through `exec` fail on macOS with "command not found: timeout" — the GNU binary is not present on darwin, and the wrapper assumes it
+  repro: any `rt … exec` path that bounds a remote read with `timeout`
+  fix shape: detect and use `gtimeout` where present, or implement the bound in the wrapper rather than in the remote shell; failing that, say so where the bounded-read path is documented
