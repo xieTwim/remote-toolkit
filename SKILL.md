@@ -114,7 +114,8 @@ rt -p fact-cluster/scratch connect
 rt status              # Sync + SSH state for current profile
 rt status --all        # All profiles
 rt connect             # Idempotent — resumes if paused, flushes if already connected
-rt disconnect          # Terminates sync; preserves local files
+rt disconnect          # Terminates sync; preserves local files AND leaves background jobs running
+rt disconnect --kill-jobs   # ... and stop them too (flushes first, so their output comes back)
 ```
 
 ### File Operations
@@ -177,14 +178,16 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
 
 2. **Long-running commands** — use `rt exec --bg` (any host) or `rt slurm submit` (Slurm hosts). SSH timeouts will kill foreground commands over a few minutes.
 
-3. **Sync timing & the flush wedge** — Mutagen syncs in the background. `rt exec` (and `slurm submit`) auto-flush FIRST so the remote sees the latest edits. That flush is **bounded by `RT_FLUSH_TIMEOUT` (default 10s)**: without the cap, a large or backlogged sync blocks until a full cycle completes, which **wedges every command — even `echo` hangs for minutes**. If exec is slow or wedging:
+3. **A failed flush is two different states, and the callers differ on purpose.** `_sync_flush` returns **2** (paused session or a mutagen error — *nothing* was synchronised) or **3** (the `RT_FLUSH_TIMEOUT` bound elapsed; the daemon keeps syncing). `rt exec` REFUSES on 2 and continues with a warning on 3 — refusing on a routine timeout would just make `--no-flush` habitual. `rt slurm submit` refuses on BOTH, because a queued job outlives the shell that queued it, and it also refuses when there is **no sync session at all** (`--assume-staged` if the script was placed there by other means). `rt sync flush` exits non-zero when it could not flush.
+
+4. **Sync timing & the flush wedge** — Mutagen syncs in the background. `rt exec` (and `slurm submit`) auto-flush FIRST so the remote sees the latest edits. That flush is **bounded by `RT_FLUSH_TIMEOUT` (default 10s)**: without the cap, a large or backlogged sync blocks until a full cycle completes, which **wedges every command — even `echo` hangs for minutes**. If exec is slow or wedging:
    - `--no-flush` skips the flush entirely (fast, but beware stale code).
    - The real cause is usually a **bloated sync set** — a heavy dir missing from the profile's `MUTAGEN_IGNORE`. Check `mutagen sync list`; a multi-GB or many-thousand-file working set is the tell. Add the dir to `MUTAGEN_IGNORE` and recreate the session (`rt disconnect && rt connect` — ignores only apply at create time).
    - **The wedge is cross-project.** All profiles share ONE Mutagen daemon (and, per host, one mount), so a runaway sync in *one* profile stalls *every* profile's flush, not just its own. `rt` now caps each session with `--max-entry-count` (default 50000, override `MUTAGEN_MAX_ENTRY_COUNT`, empty disables) so a runaway **halts itself** instead of taking the daemon down — a *halted* session with a huge entry count in `mutagen sync list` is the tell; fix its `MUTAGEN_IGNORE` and recreate. The cap backstops ignore hygiene, it doesn't replace it (on ceph-fuse even a few-thousand-file dir hurts below the cap).
    - When the sync itself is wedged, a **direct `ssh <host>` bypasses `rt` entirely** (and skips the flush) — the fastest escape for read-only/inspection work.
 
-4. **Connection issues** — If `rt status` shows `sync=offline`, check network. `rt sync flush` to retry. If it shows `sync=paused` (manual pause or the entry-count circuit breaker halting the session), flushes fail fast with a warning — `exec` proceeds on possibly-stale code, `slurm submit` aborts — until **`rt connect` resumes it**. A breaker-halted session records its error in `rt sync status`; fix `MUTAGEN_IGNORE` first or it halts again. `rt disconnect && rt connect` to recreate the session.
+5. **Connection issues** — If `rt status` shows `sync=offline`, check network. `rt sync flush` to retry. If it shows `sync=paused` (manual pause or the entry-count circuit breaker halting the session), flushes fail fast with a warning — `exec` proceeds on possibly-stale code, `slurm submit` aborts — until **`rt connect` resumes it**. A breaker-halted session records its error in `rt sync status`; fix `MUTAGEN_IGNORE` first or it halts again. `rt disconnect && rt connect` to recreate the session.
 
-5. **Missing dependencies** — If `rt check` reports "not found", **do not attempt to sudo install**. Tell the user to run the install commands.
+6. **Missing dependencies** — If `rt check` reports "not found", **do not attempt to sudo install**. Tell the user to run the install commands.
 
-6. **Help** — `rt help` for command reference.
+7. **Help** — `rt help` for command reference.
