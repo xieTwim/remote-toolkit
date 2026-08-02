@@ -150,7 +150,10 @@ _run_bounded() {
     if (( waited >= limit )); then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
-      return 1
+      # 124, the conventional timeout(1) code, so callers can tell "did not finish in the
+      # bound" from "the command itself failed". Those two need opposite handling: the first
+      # means the daemon is still working, the second means nothing happened.
+      return 124
     fi
     sleep 1
     waited=$((waited + 1))
@@ -158,6 +161,19 @@ _run_bounded() {
   wait "$pid"
 }
 
+# EXIT CODES, because "flush failed" was one word for two states that need OPPOSITE handling:
+#
+#   0  flushed — the remote has the local edits.
+#   2  COULD NOT FLUSH. The session is paused, or mutagen itself errored. Nothing was
+#      synchronised and nothing is going to be. A command run now sees whatever is there.
+#   3  TIMED OUT at RT_FLUSH_TIMEOUT (default 10s). The daemon keeps syncing in the background,
+#      so the edits are probably arriving; this call simply did not wait long enough.
+#
+# The distinction is load-bearing and was measured 2026-08-02: collapsing them meant every caller
+# had to pick one policy for both, and the tool picked opposite ones — `exec` ran anyway, `slurm
+# submit` aborted. Treating a 10s timeout on a big repo as fatal would make refusal so common
+# that `--no-flush` becomes muscle memory, which turns the protection off entirely; treating a
+# paused session as benign is how a GPU job runs yesterday's code.
 _sync_flush() {
   local sel
   sel=$(_sync_label_selector "$@")
@@ -166,7 +182,7 @@ _sync_flush() {
   # forever). Fail fast and name the fix instead.
   if [[ "$(_sync_status "$@")" == "paused" ]]; then
     warn "Sync session is PAUSED — flush skipped. 'rt -p ${RT_PROFILE} connect' resumes it."
-    return 1
+    return 2
   fi
   # Bound the wait. `mutagen sync flush` blocks until the daemon finishes one
   # full sync cycle, which on a large or backlogged session takes minutes.
@@ -176,7 +192,13 @@ _sync_flush() {
   # times out usually means the profile is missing MUTAGEN_IGNORE entries for
   # a heavy dir (bloated sync set). For read-only monitoring (no local edits to
   # push — e.g. a CVM grep/stat/cat) prefer 'rt exec --no-flush' to skip it.
-  _run_bounded "${RT_FLUSH_TIMEOUT:-10}" mutagen sync flush --label-selector "$sel"
+  local rc=0
+  _run_bounded "${RT_FLUSH_TIMEOUT:-10}" mutagen sync flush --label-selector "$sel" || rc=$?
+  case "$rc" in
+    0)   return 0 ;;
+    124) return 3 ;;   # the bound, not a failure of the sync itself
+    *)   return 2 ;;   # mutagen said no
+  esac
 }
 
 # Resume a paused session. Bounded like flush; resume re-establishes the SSH
@@ -300,7 +322,21 @@ save_state() {
 }
 
 clear_state() {
+  # Slurm submission history is the only LOCAL record of what was queued, and it has nothing to
+  # do with whether a sync session exists — deleting it on disconnect destroyed the one artifact
+  # you would go looking for afterwards. It is preserved; everything else (connection state) is
+  # rebuilt by the next `rt connect`.
+  local keep=""
+  if [[ -e "$RT_STATE_DIR/slurm_jobs" ]]; then
+    keep=$(mktemp -d)
+    cp -R "$RT_STATE_DIR/slurm_jobs" "$keep/" 2>/dev/null || keep=""
+  fi
   rm -rf "$RT_STATE_DIR"
+  if [[ -n "$keep" && -e "$keep/slurm_jobs" ]]; then
+    mkdir -p "$RT_STATE_DIR"
+    cp -R "$keep/slurm_jobs" "$RT_STATE_DIR/" 2>/dev/null || true
+    rm -rf "$keep"
+  fi
 }
 
 _ssh() {
@@ -446,7 +482,12 @@ cmd_connect() {
       _sync_resume || die "Resume failed. Diagnose with 'rt -p $RT_PROFILE sync status' — a session halted by the entry-count circuit breaker records the error there; fix MUTAGEN_IGNORE (or raise MUTAGEN_MAX_ENTRY_COUNT) before retrying."
     fi
     info "[$RT_PROFILE] Already connected to $REMOTE_HOST (flushing pending changes)"
-    _sync_flush || warn "Sync flush had issues; check 'rt status' / 'mutagen sync list'."
+    _crc=0
+    _sync_flush || _crc=$?
+    case "$_crc" in
+      2) warn "[$RT_PROFILE] Could NOT flush (paused session or a mutagen error) — the remote does not have your latest edits. 'rt sync status' says why." ;;
+      3) warn "[$RT_PROFILE] Flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s; the daemon is still syncing." ;;
+    esac
     cmd_status
     return 0
   fi
@@ -492,14 +533,43 @@ cmd_connect() {
 cmd_disconnect() {
   load_config
 
-  # Best-effort: kill remote background sessions for this profile (only if SSH reachable)
-  if _ssh_test; then
-    info "[$RT_PROFILE] Cleaning up remote background jobs ..."
-    _ssh \
-      "tmux list-sessions -F '#{session_name}' 2>/dev/null \
-       | grep '^${RT_SESSION_PREFIX}' \
-       | xargs -I{} tmux kill-session -t {} 2>/dev/null" \
-      2>/dev/null || true
+  local kill_jobs=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --kill-jobs) kill_jobs=true; shift ;;
+      *) die "Usage: rt disconnect [--kill-jobs]" ;;
+    esac
+  done
+
+  # DISCONNECTING THE SYNC AND KILLING YOUR JOBS ARE TWO DIFFERENT INTENTIONS, and this used to
+  # do both under the name of the first. README and SKILL.md both said disconnect terminates
+  # sync and preserves work; the code killed every tmux session matching the profile prefix,
+  # with no flush before or after, so a running training job was interrupted and its last
+  # buffered output could never reach local. Found 2026-08-02 by this tool's first audit.
+  #
+  # Default is now the documented behaviour. `--kill-jobs` is the deliberate "I am done, clean
+  # up" form, and it FLUSHES FIRST so that whatever the jobs have already written comes back
+  # before they are killed.
+  if [[ "$kill_jobs" == true ]]; then
+    if _ssh_test; then
+      if _has_sync; then
+        info "[$RT_PROFILE] Flushing before killing jobs (their output would otherwise be lost) ..."
+        _sync_flush || warn "[$RT_PROFILE] Could not flush before killing jobs — output written since the last sync may be lost."
+      fi
+      info "[$RT_PROFILE] Killing remote background jobs ..."
+      _ssh \
+        "tmux list-sessions -F '#{session_name}' 2>/dev/null \
+         | grep '^${RT_SESSION_PREFIX}' \
+         | xargs -I{} tmux kill-session -t {} 2>/dev/null" \
+        2>/dev/null || true
+    fi
+  elif _ssh_test; then
+    # Say what is being LEFT RUNNING. Silence here reads as "nothing was running".
+    local _left
+    _left=$(_ssh "tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -c '^${RT_SESSION_PREFIX}'" 2>/dev/null | tr -d '[:space:]') || _left=""
+    if [[ -n "$_left" && "$_left" != "0" ]]; then
+      info "[$RT_PROFILE] Leaving ${_left} background job(s) RUNNING on $REMOTE_HOST (they no longer sync back). 'rt disconnect --kill-jobs' stops them; 'rt connect' resumes syncing."
+    fi
   fi
 
   if _has_sync; then
@@ -541,7 +611,17 @@ cmd_exec() {
 
   # Auto-flush sync so the remote sees latest edits before exec
   if [[ "$no_flush" == false ]] && _has_sync; then
-    _sync_flush || warn "Sync flush had issues; continuing anyway. Use --no-flush to suppress."
+    # 2 = nothing synchronised. Running now would execute whatever code happens to be on the
+    # remote, and the caller — usually a script or an agent branching on $? — would be told the
+    # command succeeded. That is how a GPU job silently runs yesterday's code. 3 = the 10s bound
+    # elapsed while the daemon kept working; the edits are probably arriving, so it continues,
+    # but it says WHAT it could not establish rather than "had issues".
+    local _frc=0
+    _sync_flush || _frc=$?
+    case "$_frc" in
+      2) die "[$RT_PROFILE] Sync could NOT be flushed (paused session or a mutagen error), so the remote may not have your latest edits and this command would run against unknown code. Fix with 'rt -p $RT_PROFILE connect', or pass --no-flush if you intend to run against the remote as it stands." ;;
+      3) warn "[$RT_PROFILE] Flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s — the daemon is still syncing, so this command may see slightly older files. Raise RT_FLUSH_TIMEOUT, or add the heavy dir to MUTAGEN_IGNORE." ;;
+    esac
   fi
 
   local command="${cmd_args[*]}"
@@ -785,11 +865,15 @@ cmd_sync() {
       if ! _has_sync; then
         die "[$RT_PROFILE] No active sync session. Run 'rt connect' first."
       fi
-      if _sync_flush; then
-        info "[$RT_PROFILE] Sync flushed."
-      else
-        warn "[$RT_PROFILE] Flush had issues. Check 'rt sync status'."
-      fi
+      # This command's ONLY job is to flush, so its exit code must say whether it did. It
+      # previously returned the warn's status, i.e. 0, so a caller could not tell.
+      local _frc=0
+      _sync_flush || _frc=$?
+      case "$_frc" in
+        0) info "[$RT_PROFILE] Sync flushed." ;;
+        3) warn "[$RT_PROFILE] Flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s; the daemon is still syncing. Re-run, or raise RT_FLUSH_TIMEOUT."; return 3 ;;
+        *) warn "[$RT_PROFILE] Could NOT flush (paused session or a mutagen error) — nothing was synchronised. Check 'rt sync status'."; return 2 ;;
+      esac
       ;;
     status)
       info "[$RT_PROFILE] Sync state: $(_sync_status)"
@@ -829,6 +913,7 @@ _slurm_require_enabled() {
 
 _slurm_submit() {
   local script=""
+  local assume_staged=false
   local sbatch_args=()
   # Per-profile default sbatch args (SLURM_SBATCH_ARGS in host.conf/profile.conf)
   # seed the list FIRST, so explicit '-- ...' args land after them and win
@@ -839,6 +924,7 @@ _slurm_submit() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --) shift; sbatch_args+=("$@"); break ;;
+      --assume-staged) assume_staged=true; shift ;;
       -*) die "Use '-- ...' to pass flags to sbatch. Got: $1" ;;
       *)  if [[ -z "$script" ]]; then script="$1"; else sbatch_args+=("$1"); fi; shift ;;
     esac
@@ -850,9 +936,22 @@ _slurm_submit() {
   # Mandatory flush — script must be on remote before sbatch
   if _has_sync; then
     info "[$RT_PROFILE] Flushing sync before submit ..."
-    _sync_flush || die "Sync flush failed; aborting submit to avoid stale code."
+    # A submitted job outlives the shell that submitted it, so this is the one caller for which
+    # even the TIMEOUT is not acceptable: there is no chance to notice and re-run.
+    local _frc=0
+    _sync_flush || _frc=$?
+    case "$_frc" in
+      2) die "Sync could NOT be flushed (paused session or a mutagen error); aborting submit to avoid queueing a job against unknown code." ;;
+      3) die "Sync flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s, so it is not established that the remote has your latest script; aborting rather than queueing a job that outlives this shell. Re-run once sync settles, or raise RT_FLUSH_TIMEOUT." ;;
+    esac
   else
-    warn "[$RT_PROFILE] No active sync session. Submitting anyway — assuming script is already on remote."
+    # NO SESSION AT ALL is stronger than a failed flush, and this warned and submitted anyway —
+    # more permissive for the more dangerous state. Nothing here has any idea what is on the
+    # remote. --assume-staged is the deliberate escape for a script placed by other means.
+    if [[ "${assume_staged:-false}" != true ]]; then
+      die "[$RT_PROFILE] No active sync session, so nothing establishes that '${script}' on the remote is the script you are looking at. Run 'rt -p $RT_PROFILE connect' first, or pass --assume-staged if it was placed there by other means."
+    fi
+    warn "[$RT_PROFILE] No active sync session; --assume-staged given, submitting '${script}' as it stands on the remote."
   fi
 
   info "[$RT_PROFILE] sbatch ${sbatch_args[*]:-} ${script}"

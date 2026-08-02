@@ -40,10 +40,16 @@ REMOTE_DIR=/remote/proj
 EOF
 
 # shellcheck disable=SC1090
+# `rt` sets `-euo pipefail` at its top, and sourcing applies that to THIS shell. `-e` must go
+# back off: half these checks call a function expecting a NON-ZERO return, and under `-e` the
+# first one would kill the runner silently — which it did, taking blocks 4-6 with it.
 set +e
 source "$RT" 2>/dev/null
-set -e
+set +e
 RT_PROFILE="h/p"; RT_SESSION_PREFIX="rt_h_p_bg_"; REMOTE_DIR="$SCRATCH/proj"
+# `rt` keeps `set -u`, and several checks stub load_config away, so the globals it
+# would have set have to exist here or an unrelated unbound-variable error kills the run.
+REMOTE_HOST="example-host"; REMOTE_USER="nobody"; LOCAL_DIR="$SCRATCH/local"
 mkdir -p "$REMOTE_DIR"
 
 CAPTURED=""
@@ -122,6 +128,96 @@ chk "2 a missing exit marker is named, not rendered as an empty [EXITED: ]" "$?"
 
 # ── 3. the source guard ──────────────────────────────────────────────────────
 chk "3 sourcing rt does not execute main (this file depends on it)" 0
+
+# ── 4. "flush failed" is two states, and they need opposite handling ─────────
+#
+# `_sync_flush` used to return 1 for both "the session is paused / mutagen errored" (nothing
+# synced, and nothing is going to) and "the 10s bound elapsed" (the daemon is still working).
+# Collapsing them forced every caller to pick one policy for both, and the tool picked OPPOSITE
+# ones: `exec` warned and ran anyway, `slurm submit` aborted. Codes: 0 flushed, 2 could not, 3
+# timed out.
+_sync_status() { echo "${FAKE_STATUS:-active}"; }
+_run_bounded()  { return "${FAKE_BOUNDED_RC:-0}"; }
+
+FAKE_STATUS=paused; _sync_flush >/dev/null 2>&1; rc=$?
+chk "4 a PAUSED session -> 2 (nothing synchronised)" "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+
+FAKE_STATUS=active; FAKE_BOUNDED_RC=124; _sync_flush >/dev/null 2>&1; rc=$?
+chk "4b the time bound elapsing -> 3, NOT the same as a failure" \
+    "$([ "$rc" = 3 ] && echo 0 || echo 1)" "got $rc"
+
+FAKE_BOUNDED_RC=1; _sync_flush >/dev/null 2>&1; rc=$?
+chk "4c mutagen itself failing -> 2" "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+
+FAKE_BOUNDED_RC=0; _sync_flush >/dev/null 2>&1; rc=$?
+chk "4d a real flush -> 0" "$([ "$rc" = 0 ] && echo 0 || echo 1)" "got $rc"
+
+# ── 5. the callers act on the distinction ────────────────────────────────────
+# `rt exec` must REFUSE when nothing synced (its caller is usually a script branching on $?,
+# which was being told success while the command ran against unknown code) and must CONTINUE on
+# a bound elapsing, or refusal becomes so common that --no-flush turns the protection off.
+_has_sync() { return 0; }
+_ssh_test()  { return 0; }
+_exec_sync() { echo "RAN_THE_COMMAND"; }
+_exec_bg()   { echo "RAN_THE_COMMAND"; }
+load_config() { :; }
+
+out=$( FAKE_STATUS=paused; cmd_exec "echo hi" 2>&1 ); rc=$?
+chk "5 exec REFUSES when nothing was synchronised" \
+    "$([ "$rc" != 0 ] && ! grep -q RAN_THE_COMMAND <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 120 <<< "$out")"
+
+out=$( FAKE_STATUS=active; FAKE_BOUNDED_RC=124; cmd_exec "echo hi" 2>&1 ); rc=$?
+chk "5b exec CONTINUES when only the time bound elapsed, and says so" \
+    "$(grep -q RAN_THE_COMMAND <<< "$out" && grep -qi "did not finish" <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 160 <<< "$out")"
+
+# `slurm submit` is the one caller for which even a timeout is unacceptable: the job outlives
+# the shell, so there is no chance to notice and re-run. And NO SESSION AT ALL is stronger than
+# a failed flush — it used to warn and submit anyway, i.e. most permissive for the most
+# dangerous state.
+_slurm_enabled_check() { :; }
+_ssh() { echo "Submitted batch job 1"; }
+out=$( FAKE_STATUS=active; FAKE_BOUNDED_RC=124; _slurm_submit run.sbatch 2>&1 ); rc=$?
+chk "5c slurm submit REFUSES even on a bare timeout (the job outlives this shell)" \
+    "$([ "$rc" != 0 ] && ! grep -q "Submitted batch" <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 140 <<< "$out")"
+
+_has_sync() { return 1; }
+out=$( _slurm_submit run.sbatch 2>&1 ); rc=$?
+chk "5d slurm submit REFUSES with NO sync session (was: warn and submit anyway)" \
+    "$([ "$rc" != 0 ] && ! grep -q "Submitted batch" <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 140 <<< "$out")"
+
+out=$( _slurm_submit --assume-staged run.sbatch 2>&1 ); rc=$?
+chk "5e ... unless --assume-staged says the script was placed by other means" \
+    "$(grep -q "Submitted batch" <<< "$out" && echo 0 || echo 1)" "rc=$rc out=$(head -c 140 <<< "$out")"
+
+# ── 6. disconnect leaves jobs running unless told otherwise ──────────────────
+# README and SKILL both said disconnect terminates sync and preserves work; it killed every
+# background job, with no flush before or after. Two different intentions under one name.
+_has_sync() { return 1; }
+KILLED=""
+_ssh() {
+  case "$*" in
+    *kill-session*) KILLED=yes; echo "" ;;
+    *"grep -c"*)    echo 2 ;;
+    *)              echo "" ;;
+  esac
+}
+_sync_terminate() { :; }
+clear_state() { :; }
+KILLED=""; cmd_disconnect >/dev/null 2>&1
+chk "6 disconnect does NOT kill background jobs by default" \
+    "$([ -z "$KILLED" ] && echo 0 || echo 1)" "KILLED=$KILLED"
+# `info` is stubbed to silence at the top of this file, so restore it just here — this
+# check is ABOUT what the operator is told.
+info() { printf ':: %s\n' "$*" >&2; }
+KILLED=""; out=$(cmd_disconnect 2>&1)
+chk "6b ... and SAYS what it is leaving running" \
+    "$(grep -qi "RUNNING" <<< "$out" && echo 0 || echo 1)" "$(head -c 140 <<< "$out")"
+KILLED=""; cmd_disconnect --kill-jobs >/dev/null 2>&1
+chk "6c --kill-jobs still kills them" "$([ -n "$KILLED" ] && echo 0 || echo 1)" "KILLED=$KILLED"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
