@@ -102,8 +102,11 @@ emit 'echo MARKER_TEXT'
 grep -q MARKER_TEXT "$SCRATCH/home/.rt_logs/rt_h_p_bg_probe.log"
 chk "1c the command's OUTPUT still reaches the log (tee is not replaced by a redirect)" "$?"
 
-# A failed `cd` used to short-circuit before tee, leaving no log at all — a job that never ran
-# and left no trace of not running.
+# A failed `cd` must be RECORDED. Note what this does and does not pin: the old construct also
+# recorded it (the trailing `echo "EXIT_CODE=$?" >> log` still runs and creates the file), so this
+# check passes with the fix reverted and is an invariant, not a regression test. Said plainly
+# because the commit that added it claimed otherwise — an adversarial pass corrected that, and a
+# check whose stated purpose is wrong is worse than one that is merely redundant.
 REMOTE_DIR_SAVE="$REMOTE_DIR"; REMOTE_DIR="$SCRATCH/does-not-exist"
 rc_cd="$(run_captured 'echo unreachable')"
 REMOTE_DIR="$REMOTE_DIR_SAVE"

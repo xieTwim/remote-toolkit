@@ -597,6 +597,13 @@ _exec_bg() {
   # written and the status is lost — measured: `exit 7` recorded nothing, while `false`,
   # `sh -c 'exit 7'` and a failing binary all recorded correctly. The explicit subshell contains
   # the `exit` and records all four.
+  #
+  # CORRECTION to this commit's own first claim, from an adversarial pass: the OLD construct did
+  # NOT leave "no log at all" after a failed `cd`. `cd X && { … } | tee log` short-circuits before
+  # tee, but the trailing `echo "EXIT_CODE=$?" >> log` still runs and CREATES the file with the
+  # cd's status. So a failed cd was the ONE case the old form recorded correctly. Moving `cd`
+  # inside the group is still right — it keeps one path for every failure instead of two — but it
+  # fixes a uniformity problem, not a lost-log one.
   local log_file="~/.rt_logs/${session}.log"
   _ssh \
     "tmux new-session -d -s '${session}' -x 200 -y 50 \
