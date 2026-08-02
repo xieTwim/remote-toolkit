@@ -577,11 +577,31 @@ _exec_bg() {
   # Create remote log directory
   _ssh "mkdir -p ~/.rt_logs"
 
-  # Start tmux session on remote
+  # Start tmux session on remote.
+  #
+  # The status is captured from the COMMAND, in its own marker file, not from `$?` after the
+  # pipeline. `{ cmd; } | tee log; echo "EXIT_CODE=$?"` records TEE's status — and tee
+  # essentially always succeeds — so every background job, including one that died on its first
+  # line, was recorded as EXIT_CODE=0 and listed by `rt logs` as [DONE]. A caller reading that
+  # list to decide whether a training run finished was told yes for every run that ever started.
+  # Reproduced 2026-08-02: `{ false; } | tee f; echo $?` -> 0.
+  #
+  # `${PIPESTATUS[0]}` would be the short fix and is bash-only; tmux starts the remote login
+  # shell, so on a dash/ash host it would expand to nothing and fail silently — which is the
+  # class of defect being fixed. The marker file is POSIX, and it keeps `tee`, so the tmux pane
+  # still shows live output. The `cd` is inside the group as well: a failed `cd` used to
+  # short-circuit before `tee`, leaving no log at all rather than a recorded failure.
+  #
+  # The command runs in a SUBSHELL `( … )`, not a group `{ …; }`. A pipeline's group is already
+  # a subshell, so a command that is literally `exit N` terminates it before the marker is
+  # written and the status is lost — measured: `exit 7` recorded nothing, while `false`,
+  # `sh -c 'exit 7'` and a failing binary all recorded correctly. The explicit subshell contains
+  # the `exit` and records all four.
   local log_file="~/.rt_logs/${session}.log"
   _ssh \
     "tmux new-session -d -s '${session}' -x 200 -y 50 \
-      \"cd '${REMOTE_DIR}' && { ${command}; } 2>&1 | tee ${log_file}; echo \\\"EXIT_CODE=\\\$?\\\" >> ${log_file}\""
+      \"{ cd '${REMOTE_DIR}' && ( ${command} ); echo \\\$? > ${log_file}.rc; } 2>&1 | tee ${log_file}; \
+        echo \\\"EXIT_CODE=\\\$(cat ${log_file}.rc 2>/dev/null || echo unknown)\\\" >> ${log_file}\""
 
   info "[$RT_PROFILE] Background job started: $session"
   info "  Check output: rt -p $RT_PROFILE logs $session"
@@ -642,9 +662,15 @@ _logs_list() {
     if ! echo "$running" | grep -qx "$s"; then
       local exit_code
       exit_code=$(_ssh \
-        "tail -1 ~/.rt_logs/${s}.log 2>/dev/null | sed -n 's/.*EXIT_CODE=\([0-9][0-9]*\).*/\1/p'" 2>/dev/null) || exit_code="?"
+        "tail -1 ~/.rt_logs/${s}.log 2>/dev/null | sed -n 's/.*EXIT_CODE=\([0-9][0-9]*\).*/\1/p'" 2>/dev/null) || exit_code=""
+      # No marker at all is NOT a completed job. The session is gone and nothing recorded a
+      # status, which is what a killed job, a `rt disconnect`, or a host reboot looks like — and
+      # it used to render as `[EXITED: ]`, an empty field a reader parses as "finished, no
+      # detail". Say which of the three states this is.
       if [[ "$exit_code" == "0" ]]; then
         printf '  %-40s  [DONE]\n' "$s"
+      elif [[ -z "$exit_code" ]]; then
+        printf '  %-40s  [NO STATUS — session gone, nothing recorded an exit code]\n' "$s"
       else
         printf '  %-40s  [EXITED: %s]\n' "$s" "$exit_code"
       fi
@@ -1048,4 +1074,9 @@ main() {
   esac
 }
 
-main "$@"
+# Run only when EXECUTED, not when sourced. `test/canary_rt.sh` sources this file to stub `_ssh`
+# and assert on the command strings rt sends to the remote — the only way to check them without
+# a live host, and this script had no tests at all before 2026-08-02.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

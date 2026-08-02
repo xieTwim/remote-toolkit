@@ -9,6 +9,17 @@ reporting project's own `ISSUES.md`.
 
 Seeded 2026-08-01 from the second migration lane.
 
+Extended 2026-08-02 by this tool's FIRST audit — a de-correlated read of `rt`, `SKILL.md`,
+`CLAUDE.md` and `README.md` against three questions (*where is a state reported without being
+established* · *where can data be lost* · *which documented claims are enforced nowhere*), with
+every finding reproduced against real Mutagen 0.18.1 on local-only endpoints or a stubbed SSH.
+The entries below are that audit's, not a project's; each says whether it was CONFIRMED offline
+or still needs a live host.
+
+**The lane has one shape.** `rt`'s callers are usually AGENTS, and almost every path that could
+say "I could not establish this" instead returns 0. A human notices an odd line; a bash guard
+branching on `$?` does not.
+
 ---
 
 - [open] 2026-08-01 dllm-reasoning: nothing tells a caller when a staged file has actually ARRIVED, so callers wait a fixed sleep and then install a stale copy. Measured: a patched launcher script was staged, waited on for ten seconds, and the still-stale remote copy was copied into place — `bash -n` passed because the OLD file is valid shell, so the run started and died instantly on an unknown case, holding 8 GPUs idle for ~25 minutes
@@ -22,3 +33,49 @@ Seeded 2026-08-01 from the second migration lane.
 - [open] 2026-08-01 grpo-speed: bounded reads through `exec` fail on macOS with "command not found: timeout" — the GNU binary is not present on darwin, and the wrapper assumes it
   repro: any `rt … exec` path that bounds a remote read with `timeout`
   fix shape: detect and use `gtimeout` where present, or implement the bound in the wrapper rather than in the remote shell; failing that, say so where the bounded-read path is documented
+
+## From the 2026-08-02 first audit
+
+- [fixed remote-toolkit@PENDING] 2026-08-02 a background job's recorded exit status was `tee`'s, not the command's. `{ cmd; } 2>&1 | tee log; echo "EXIT_CODE=$?"` records the LAST element of the pipeline, and `tee` essentially always succeeds — so every job that ever started was recorded `EXIT_CODE=0` and listed by `rt logs` as `[DONE]`, including one that died on its first line. A caller reading that list to decide whether a run finished was told yes, always. Fixed with a POSIX marker file (`${PIPESTATUS[0]}` is bash-only and tmux starts the remote LOGIN shell, so on a dash host it would expand to nothing — the same class of silent failure). The command runs in an explicit subshell so that a literal `exit N` cannot terminate the pipeline's own subshell before the marker is written. `rt` got its first tests with this: `test/canary_rt.sh` sources `rt`, stubs `_ssh`, and RUNS the captured remote command locally, so the four failure shapes are pinned by behaviour rather than by wording
+
+- [open] 2026-08-02 audit: **a failed flush is converted into a successful CLI call.** `rt exec` warns and runs the command anyway; `rt sync flush` returns the warning's status, which is 0; an existing-session `rt connect` warns and returns 0. Only `slurm submit` aborts, and it is the one that gets this right. CONFIRMED against a stubbed flush failure
+  repro: force `_sync_flush` to fail; observe `cmd_sync_flush_rc=0` and `cmd_exec_rc` equal to the remote command's status
+  fix shape: the caller must be able to tell "flushed" from "could not flush". Exit non-zero from `rt sync flush`, and give `exec` an explicit `--allow-stale` rather than making stale the silent default. This is a BEHAVIOUR change to a shared tool — a human decides whether `exec` should refuse
+
+- [open] 2026-08-02 audit: **"flushed" does not mean the endpoints are equal, and nothing in `rt` establishes that they are.** Mutagen's flush forces a synchronization CYCLE; it does not prove byte-for-byte equality. CONFIRMED with the real engine: `two-way-safe` with an unresolved conflict, and an ignored path, both flush with exit 0 while the endpoints differ. This is the root cause under the 2026-08-01 arrival-assertion entry above, and the general form of it
+  repro: create a conflict under `two-way-safe`, flush, compare endpoint hashes
+  fix shape: an arrival assertion the caller can wait on — hash the launch set locally, require the remote to echo the same digest — rather than treating a returned flush as a barrier. See the design note at the bottom of this section
+
+- [open] 2026-08-02 audit: **an unhealthy sync session is classified `active`.** The parser treats anything carrying `Identifier:` that is not recognised as paused and does not match `Connected: No` as active. CONFIRMED with real Mutagen 0.18.1: an entry-count breaker halt reports `Last error: … exceeded allowed entry count` / `Status: Waiting 5 seconds for rescan` and classifies as `active` — a halted session reported as healthy. `rt connect` resumes only the exact `paused` classification, so the documented "connect resumes it" recovery does not fire for this case, which is the case that actually happens
+  repro: create a session with `--max-entry-count=1`; read the classification
+  fix shape: classify on `Last error:` and on the status verb, not on the absence of two strings; and either resume or say plainly that it cannot
+
+- [open] 2026-08-02 audit: **`disconnect` reports success when termination failed, and deletes the local record either way.** `mutagen sync terminate … || true` discards every failure, then the state directory (including `slurm_jobs`) is removed and `Disconnected` is printed. The session may still be running and propagating deletions with its local tracking gone. CONFIRMED with a stubbed terminate failure
+  repro: stub `mutagen sync terminate` to fail; observe `state_cleared=yes`, `Disconnected`, rc 0
+
+- [open] 2026-08-02 audit: **`disconnect` also KILLS every background job, which its own documentation denies.** README and SKILL both say disconnect terminates sync and preserves work; it runs `tmux kill-session` over every session matching the profile prefix, does not flush before or after, and then deletes recent Slurm submission history. A running job is interrupted and its last buffered output may never reach local. CONFIRMED by tracing; the tmux half needs a live host to demonstrate end-to-end
+  fix shape: either stop killing jobs, or document that it does and final-flush before it does. Which one is a POLICY call for a human — the current behaviour may be intended and only the docs wrong
+
+- [open] 2026-08-02 audit: **agent-supplied values reach the remote shell unquoted.** `slurm cancel` interpolates its arguments straight into `scancel $*`, so `rt slurm cancel "123; <command>"` constructs a remote compound command; `--name` and a log ID likewise enter unquoted positions, and a `REMOTE_DIR` or script path containing an apostrophe breaks the ad-hoc single quoting. CONFIRMED by constructing the strings; not executed against a host. The boundary that matters is agent/user-supplied ids and names — config files are sourced bash and are already trusted
+  fix shape: validate ids against `^[0-9_]+$`-shaped patterns at the boundary, and quote every interpolation; a job id is never a shell fragment
+
+- [open] 2026-08-02 audit: **`status --all` enumerates state directories, not configured profiles**, so a configured-but-disconnected profile is invisible — exactly when you would run it to find out what exists. CONFIRMED on this machine: 11 profile config files, 4 shown. The `remote` SKILL's first instruction is to run this command to enumerate profiles, so the one documented use is the one it does not serve
+  fix shape: walk `*.conf`, and mark each as connected / configured-only
+
+- [open] 2026-08-02 audit: **documented sync scope is materially wider than the implementation.** The defaults ignore `outputs/`, `checkpoints/`, `wandb/` and others; the docs say files sync to and from the remote and never enumerate the exclusions. A result written to any of those directories never becomes part of the local replica, and ignores apply only at session-CREATE time, so editing the list does nothing to a live session. CONFIRMED with the real engine
+  fix shape: enumerate the default ignore set in the docs, and have `status` print the live session's effective ignore list rather than the profile's current text
+
+### The design note this lane produced
+
+The standing claim in the harness register — *"Mutagen is being used as a job-control protocol:
+eventual bidirectional sync decides which code a GPU job launches and which result is
+authoritative"* — was put to the de-correlated reader as a question, and came back **TRUE with one
+qualification**: ignored result paths are remote-only rather than bidirectionally authoritative,
+and under the default mode the LOCAL side wins every conflict, so a local edit can overwrite a
+remote result regardless of which was written later.
+
+Its recommended smallest incision, recorded here rather than acted on: a per-run staging wrapper
+around `exec --bg` and `slurm submit` — copy a deterministic input snapshot to a unique remote run
+directory, verify its manifest digest, launch THERE, write outputs there, and fetch them with a
+verified manifest. Mutagen stays a browsing convenience and stops being the correctness boundary.
+That is a design change to a shared tool and belongs to a human.
