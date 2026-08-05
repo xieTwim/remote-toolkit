@@ -662,6 +662,118 @@ chk "12j the warning is reached THROUGH _sync_flush, not merely defined" \
     "$(grep -q 'LARGE' <<< "$out" && echo 0 || echo 1)" "$(head -c 160 <<< "$out")"
 unset -f mutagen
 
+# ── 13. agent-supplied values are DATA, not remote shell ─────────────────────
+#
+# `_ssh` hands a STRING to a remote login shell, so anything interpolated into it is shell
+# source unless something makes it data. `slurm cancel` built `scancel $*`, so
+# `rt slurm cancel '123; some-command'` constructed a remote compound command; log ids reached
+# `tail -f ~/.rt_logs/<id>.log` unquoted the same way.
+#
+# These checks RUN the captured string against stub binaries, so they pin what the remote shell
+# would actually do rather than what the source looks like.
+set +e; source "$RT" 2>/dev/null; set +e
+# `_init_profile` rather than assigning the globals by hand. Sourcing `rt` never runs it (main
+# is guarded), so RT_CONF stays EMPTY — and a `load_config` in this block would then die with
+# "Config not found" before reaching anything under test. That is a false pass: check 13e was
+# passing for exactly that reason until a mutation run exposed it.
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="example-host"; LOCAL_DIR="$SCRATCH/local"; REMOTE_DIR="$SCRATCH/proj"
+info() { :; }; warn() { :; }
+
+mkdir -p "$SCRATCH/bin"
+cat > "$SCRATCH/bin/scancel" <<'EOF'
+#!/bin/sh
+for a in "$@"; do printf 'ARG[%s]\n' "$a"; done
+EOF
+chmod +x "$SCRATCH/bin/scancel"
+
+# _shq must survive every metacharacter, under /bin/sh as well as bash — the remote runs a
+# LOGIN shell, which is not necessarily bash.
+shq_bad=""
+for v in "plain" "it's" "a'b'c" '$(id)' '`id`' '; echo x' 'a b' '*' '\' '"q"'; do
+  got=$(/bin/sh -c "printf '%s' $(_shq "$v")" 2>/dev/null)
+  [ "$got" = "$v" ] || shq_bad="$shq_bad [$v->$got]"
+done
+chk "13 _shq round-trips every metacharacter through /bin/sh" \
+    "$([ -z "$shq_bad" ] && echo 0 || echo 1)" "$shq_bad"
+
+# A job id reaches scancel as ONE argv element, whatever it contains.
+# The capture goes to a FILE as well as a variable: `_slurm_submit` calls `_ssh` inside a
+# command substitution, so a variable assignment there dies with the subshell and the check
+# would read an empty string as "nothing was sent" — a false pass.
+CAPTURED=""; _ssh() { CAPTURED="$*"; printf '%s' "$*" > "$SCRATCH/captured"; }
+_ssh_test() { return 0; }
+rm -f "$SCRATCH/captured"
+_slurm_cancel 123 456_7 >/dev/null 2>&1
+argv="$(cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$CAPTURED" 2>/dev/null | tr '\n' ' ')"
+chk "13b two job ids arrive as exactly two arguments" \
+    "$([ "$argv" = "ARG[123] ARG[456_7] " ] && echo 0 || echo 1)" "argv='$argv' cmd='$CAPTURED'"
+
+# The recorded attack: `rt slurm cancel '123; <command>'`. It must be refused BEFORE any ssh.
+rm -f "$SCRATCH/PWNED"
+CAPTURED="NOTHING_SENT"
+( _slurm_cancel "123; touch $SCRATCH/PWNED" ) >/dev/null 2>&1; rc=$?
+chk "13c an id carrying a command separator is REFUSED, and nothing is sent" \
+    "$([ "$rc" != 0 ] && [ "$CAPTURED" = "NOTHING_SENT" ] && echo 0 || echo 1)" "rc=$rc captured='$CAPTURED'"
+( cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$CAPTURED" ) >/dev/null 2>&1
+chk "13d ... and no injected command ran" \
+    "$([ ! -e "$SCRATCH/PWNED" ] && echo 0 || echo 1)" "PWNED exists"
+
+# Same boundary, other entry points.
+rm -f "$SCRATCH/PWNED"
+( cmd_logs "x; touch $SCRATCH/PWNED" ) >/dev/null 2>&1; rc=$?
+chk "13e a log id carrying a command separator is refused" \
+    "$([ "$rc" != 0 ] && [ ! -e "$SCRATCH/PWNED" ] && echo 0 || echo 1)" "rc=$rc"
+( _slurm_logs "1; touch $SCRATCH/PWNED" ) >/dev/null 2>&1; rc=$?
+chk "13f a slurm log id carrying a command separator is refused" \
+    "$([ "$rc" != 0 ] && [ ! -e "$SCRATCH/PWNED" ] && echo 0 || echo 1)" "rc=$rc"
+( _require_jobname "x;touch /tmp/x" ) >/dev/null 2>&1
+chk "13g an --bg job NAME carrying shell text is refused by the grammar" \
+    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+( _require_jobname "build-2" ) >/dev/null 2>&1
+chk "13h ... while an ordinary name is still accepted" "$([ $? -eq 0 ] && echo 0 || echo 1)"
+
+# The submit SCRIPT PATH is user-supplied and is the one value here that ONLY quoting protects
+# — it has no grammar and no config-time check. An apostrophe is the payload that matters: the
+# old `'${script}'` form is already inert against `$(…)` and backticks, so a check built around
+# those would pass with the fix reverted. (That is not hypothetical — the first version of this
+# check did exactly that, and a mutation run caught it.)
+cat > "$SCRATCH/bin/sbatch" <<'EOF'
+#!/bin/sh
+for a in "$@"; do printf 'ARG[%s]\n' "$a"; done
+echo "Submitted batch job 1"
+EOF
+chmod +x "$SCRATCH/bin/sbatch"
+rm -f "$SCRATCH/PWNED"
+RT_STATE_DIR="$SCRATCH/state13"; SLURM_ENABLED=1; SLURM_LOG_DIR="$SCRATCH"; SLURM_SBATCH_ARGS=""
+_has_sync() { return 1; }
+rm -f "$SCRATCH/captured"
+EVIL="don't; touch $SCRATCH/PWNED.sbatch"
+_slurm_submit --assume-staged "$EVIL" >/dev/null 2>&1
+sent="$(cat "$SCRATCH/captured" 2>/dev/null)"
+argv="$(cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$sent" 2>/dev/null | grep '^ARG\[')"
+chk "13i an apostrophe + separator in a script path stays ONE argument" \
+    "$([ "$argv" = "ARG[$EVIL]" ] && echo 0 || echo 1)" "argv='$argv' sent='$sent'"
+chk "13j ... and the injected command did not run" \
+    "$([ ! -e "$SCRATCH/PWNED.sbatch" ] && echo 0 || echo 1)" "sent='$sent'"
+
+# An apostrophe in REMOTE_DIR used to break the ad-hoc single quoting SILENTLY. It cannot be
+# carried through the three quoting levels of the --bg payload, so it is refused with a clear
+# message instead of building a malformed remote command.
+mkdir -p "$RT_HOME/q"
+printf 'REMOTE_HOST=h\n' > "$RT_HOME/q/host.conf"
+# A VALID bash assignment whose VALUE contains an apostrophe. Writing `REMOTE_DIR=/tmp/it's`
+# instead would be an unterminated quote — the config would fail to source and the check would
+# pass for the wrong reason.
+printf 'REMOTE_DIR="/tmp/it%ss"\n' "'" > "$RT_HOME/q/r.conf"
+( RT_PROFILE="q/r"; _init_profile; load_config ) >/dev/null 2>&1
+chk "13l a REMOTE_DIR containing an apostrophe fails loudly, not silently" \
+    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+# ... and the ordinary case still loads, so 13j is not passing because load_config is broken.
+printf 'REMOTE_DIR="/tmp/ordinary"\n' > "$RT_HOME/q/r.conf"
+( RT_PROFILE="q/r"; _init_profile; load_config ) >/dev/null 2>&1
+chk "13m ... while an ordinary REMOTE_DIR still loads" "$([ $? -eq 0 ] && echo 0 || echo 1)"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

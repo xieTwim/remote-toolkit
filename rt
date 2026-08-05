@@ -509,6 +509,12 @@ load_config() {
 
   [[ -n "${REMOTE_HOST:-}" ]] || die "REMOTE_HOST not set in $RT_HOST_CONF or $RT_CONF"
   [[ -n "${REMOTE_DIR:-}" ]]  || die "REMOTE_DIR not set in $RT_CONF"
+  # Most REMOTE_DIR interpolations are single-quote encoded, but `exec --bg` embeds it three
+  # quoting levels deep inside a tmux argument, where an apostrophe cannot be carried safely.
+  # Refusing it here turns what used to be a silently malformed remote command into a clear
+  # local error.
+  [[ "$REMOTE_DIR" != *"'"* ]] \
+    || die "REMOTE_DIR contains a single quote, which cannot be carried safely into the background-exec payload: $REMOTE_DIR"
 
   # Default local replica dir: ~/Work/Remote/<host-group>/<profile-name>/
   LOCAL_DIR="${LOCAL_DIR:-$HOME/Work/Remote/${RT_HOST_GROUP}/${RT_PROFILE_NAME}}"
@@ -555,6 +561,46 @@ clear_state() {
     cp -R "$keep/slurm_jobs" "$RT_STATE_DIR/" 2>/dev/null || true
     rm -rf "$keep"
   fi
+}
+
+# ── The remote-shell trust boundary ────────────────────────────────────────────
+#
+# `_ssh` hands a STRING to a remote login shell, so every value interpolated into that string is
+# shell source unless something makes it data. Agent-supplied ids and names are the boundary that
+# matters — config files are sourced bash and are already trusted — and the failure was that
+# `slurm cancel` interpolated its arguments straight into `scancel $*`, so
+# `rt slurm cancel '123; some-command'` built a remote compound command. Log ids reached
+# `tail -f ~/.rt_logs/<id>.log` unquoted for the same reason.
+#
+# Two controls, because one does not cover every site:
+#   _shq            POSIX single-quote encoding, for the sites where a quoted word is enough.
+#   _require_*      a grammar, for values that also flow into places quoting cannot reach —
+#                   notably the `exec --bg` payload, which nests three levels of quoting inside
+#                   a tmux argument inside an ssh argument.
+
+# Encode $1 as a single POSIX shell word. `'` becomes `'\''`; everything else is inert inside
+# single quotes, including $, `, ;, newline and backslash. Verified to round-trip under dash as
+# well as bash — the remote runs a LOGIN shell, which is not necessarily bash.
+_shq() {
+  local s="$1"
+  s=${s//"'"/"'\\''"}
+  printf "'%s'" "$s"
+}
+
+# A Slurm job id is never a shell fragment. Accepts 12345, an array task 12345_7, and an array
+# range 12345_[1-9] — the forms scancel/sacct actually take — and nothing else.
+_require_jobid() {
+  [[ "$1" =~ ^[0-9]+(_([0-9]+|\[[0-9]+(-[0-9]+)?\]))?$ ]] \
+    || die "Not a Slurm job id: '$1'. Expected 12345, 12345_7 or 12345_[1-9]. Job ids are data, not shell."
+}
+
+# Background-job names, and the session ids derived from them. This one is a GRAMMAR rather than
+# a quoting rule because the value is interpolated into the `exec --bg` payload, where it sits
+# inside a tmux argument inside an ssh argument and correct quoting through all three layers is
+# far more fragile than refusing the characters outright.
+_require_jobname() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] \
+    || die "Invalid job name '$1'. Use letters, digits, '.', '_' and '-', starting with a letter or digit."
 }
 
 _ssh() {
@@ -741,7 +787,7 @@ cmd_connect() {
   fi
 
   # Verify remote directory exists
-  if ! _ssh "test -d '$REMOTE_DIR'"; then
+  if ! _ssh "test -d $(_shq "$REMOTE_DIR")"; then
     die "Remote directory does not exist: $REMOTE_DIR"
   fi
 
@@ -913,7 +959,8 @@ cmd_exec() {
 
 _exec_sync() {
   local command="$1"
-  _ssh "cd '${REMOTE_DIR}' && ${command}"
+  # $command is deliberately shell text — that is what `rt exec` is for. REMOTE_DIR is not.
+  _ssh "cd $(_shq "$REMOTE_DIR") && ${command}"
 }
 
 _exec_bg() {
@@ -925,9 +972,16 @@ _exec_bg() {
     die "tmux not found on remote server. Install tmux on $REMOTE_HOST for background execution."
   fi
 
-  # Generate session name
+  # Generate session name.
+  #
+  # `--name` is agent-supplied and lands in the payload below, where it sits inside a tmux
+  # argument inside an ssh argument, next to two further layers of quoting. Quoting it correctly
+  # through all three is far more fragile than refusing the characters, so this site is
+  # protected by a GRAMMAR: after this check the name cannot contain a quote, a space, or any
+  # shell metacharacter, which is also what makes `${log_file}` safe unquoted below.
   local session
   if [[ -n "$name" ]]; then
+    _require_jobname "$name"
     session="${RT_SESSION_PREFIX}${name}"
   else
     session="${RT_SESSION_PREFIX}$(date +%s)_$$"
@@ -982,10 +1036,15 @@ cmd_logs() {
   local follow=false
   [[ "${2:-}" == "--follow" || "${2:-}" == "-f" ]] && follow=true
 
+  # The id names a tmux session / log file and reaches a remote `tail`/`cat`. Both call sites
+  # quote it, but validating here means an obviously-wrong id fails locally with a clear message
+  # instead of as a remote "no such file".
+  [[ -n "$job_id" ]] && _require_jobname "$job_id"
+
   if [[ -z "$job_id" ]]; then
     _logs_list
   elif [[ "$follow" == true ]]; then
-    _ssh "tail -f ~/.rt_logs/${job_id}.log" 2>/dev/null \
+    _ssh "tail -f ~/.rt_logs/$(_shq "${job_id}.log")" 2>/dev/null \
       || die "Log not found: $job_id"
   else
     _logs_show "$job_id"
@@ -1028,7 +1087,7 @@ _logs_list() {
     if ! echo "$running" | grep -qx "$s"; then
       local exit_code
       exit_code=$(_ssh \
-        "tail -1 ~/.rt_logs/${s}.log 2>/dev/null | sed -n 's/.*EXIT_CODE=\([0-9][0-9]*\).*/\1/p'" 2>/dev/null) || exit_code=""
+        "tail -1 ~/.rt_logs/$(_shq "${s}.log") 2>/dev/null | sed -n 's/.*EXIT_CODE=\([0-9][0-9]*\).*/\1/p'" 2>/dev/null) || exit_code=""
       # No marker at all is NOT a completed job. The session is gone and nothing recorded a
       # status, which is what a killed job, a `rt disconnect`, or a host reboot looks like — and
       # it used to render as `[EXITED: ]`, an empty field a reader parses as "finished, no
@@ -1046,7 +1105,7 @@ _logs_list() {
 
 _logs_show() {
   local job_id="$1"
-  _ssh "cat ~/.rt_logs/${job_id}.log" 2>/dev/null \
+  _ssh "cat ~/.rt_logs/$(_shq "${job_id}.log")" 2>/dev/null \
     || die "Log not found: $job_id"
 }
 
@@ -1354,7 +1413,9 @@ _slurm_submit() {
 
   info "[$RT_PROFILE] sbatch ${sbatch_args[*]:-} ${script}"
   local output
-  if ! output=$(_ssh "cd '${REMOTE_DIR}' && sbatch ${sbatch_args[*]:-} '${script}'" 2>&1); then
+  # sbatch_args stay unquoted on purpose: they are operator-supplied FLAGS and must word-split.
+  # The script path is data.
+  if ! output=$(_ssh "cd $(_shq "$REMOTE_DIR") && sbatch ${sbatch_args[*]:-} $(_shq "$script")" 2>&1); then
     printf '%s\n' "$output" >&2
     die "sbatch failed."
   fi
@@ -1386,7 +1447,12 @@ _slurm_queue() {
 _slurm_cancel() {
   [[ $# -gt 0 ]] || die "Usage: rt slurm cancel <jobid> [<jobid>...]"
   _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
-  _ssh "scancel $*"
+  local id qids=""
+  for id in "$@"; do
+    _require_jobid "$id"
+    qids="${qids} $(_shq "$id")"
+  done
+  _ssh "scancel${qids}"
 }
 
 _slurm_logs() {
@@ -1423,6 +1489,7 @@ _slurm_logs() {
     return 0
   fi
 
+  _require_jobid "$jobid"
   _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
 
   local ext=".out"
@@ -1431,18 +1498,18 @@ _slurm_logs() {
   local fallback="${REMOTE_DIR}/slurm-${jobid}${ext}"
   local path=""
 
-  if _ssh "test -f '${primary}'"; then
+  if _ssh "test -f $(_shq "$primary")"; then
     path="$primary"
-  elif [[ "$primary" != "$fallback" ]] && _ssh "test -f '${fallback}'"; then
+  elif [[ "$primary" != "$fallback" ]] && _ssh "test -f $(_shq "$fallback")"; then
     path="$fallback"
   else
     die "Log not found: ${primary}$([[ "$primary" != "$fallback" ]] && echo " (also tried ${fallback})")"
   fi
 
   if $follow; then
-    _ssh "tail -f '${path}'"
+    _ssh "tail -f $(_shq "$path")"
   else
-    _ssh "cat '${path}'"
+    _ssh "cat $(_shq "$path")"
   fi
 }
 
