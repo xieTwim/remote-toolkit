@@ -920,39 +920,105 @@ cmd_status() {
   printf '\n'
 }
 
+# Read a profile's identity WITHOUT polluting this shell. Config files are sourced bash, so
+# reading eleven of them in a loop would leak each one's variables into the next — a profile
+# that does not set REMOTE_DIR would silently inherit the previous profile's. The subshell is
+# the whole mechanism.
+_profile_identity() {   # <host> <profile> -> "host<TAB>remote_dir<TAB>local_dir"
+  local h="$1" p="$2"
+  (
+    set +u
+    REMOTE_HOST=""; REMOTE_DIR=""; LOCAL_DIR=""
+    [[ -f "${RT_HOME}/${h}/host.conf" ]] && . "${RT_HOME}/${h}/host.conf"
+    [[ -f "${RT_HOME}/${h}/${p}.conf" ]] && . "${RT_HOME}/${h}/${p}.conf"
+    printf '%s\t%s\t%s' "$REMOTE_HOST" "$REMOTE_DIR" "${LOCAL_DIR:-$HOME/Work/Remote/${h}/${p}}"
+  ) 2>/dev/null
+}
+
+# `status --all` enumerated STATE DIRECTORIES — the record `connect` writes — not configured
+# profiles. So a profile that was configured and never connected did not exist as far as this
+# command was concerned, which is exactly the question you run it to answer. The SKILL's first
+# instruction is to run this to enumerate profiles before assuming which one to use, so the one
+# documented use was the one it did not serve. Measured 2026-08-05 on this machine: 11 profile
+# configs, 10 state dirs, one configured profile invisible. (The 2026-08-02 record said "4
+# shown"; that magnitude does NOT reproduce today — the defect does.)
+#
+# Now: enumerate CONFIGS, and union in any state dir that has no config, because a profile whose
+# `.conf` was deleted while it was connected is still syncing and leaving it out would reproduce
+# this very defect one directory over.
 _status_all() {
-  local found=false
-  local state_base="${RT_HOME}/.rt"
+  local -a keys=()
+  local hdir hname f pdir pname
 
-  printf '\n'
-  if [[ -d "$state_base" ]]; then
-    # Two-level enumeration: state_base/<host-group>/<profile-name>/
-    for hdir in "$state_base"/*/; do
+  if [[ -d "$RT_HOME" ]]; then
+    for hdir in "$RT_HOME"/*/; do
       [[ -d "$hdir" ]] || continue
-      local hname
       hname=$(basename "$hdir")
-      for pdir in "$hdir"*/; do
-        [[ -d "$pdir" ]] || continue
-        found=true
-        local pname
-        pname=$(basename "$pdir")
-        local host="" local_dir="" rdir=""
-        [[ -f "$pdir/host" ]]       && host=$(cat "$pdir/host")
-        [[ -f "$pdir/local_dir" ]]  && local_dir=$(cat "$pdir/local_dir")
-        [[ -f "$pdir/remote_dir" ]] && rdir=$(cat "$pdir/remote_dir")
-
-        local sync_state
-        sync_state=$(_sync_status "$hname" "$pname")
-
-        printf '  [%s/%s] sync=%s — %s:%s ⇄ %s\n' "$hname" "$pname" "$sync_state" "$host" "$rdir" "$local_dir"
+      # A directory whose name is not a valid host-group segment is not a host group — e.g. an
+      # `_archive/` of retired configs. Skipped by the same rule that validates `-p`, rather
+      # than by a hardcoded name list.
+      [[ "$hname" =~ ^[a-zA-Z0-9](-?[a-zA-Z0-9])*$ ]] || continue
+      for f in "$hdir"*.conf; do
+        [[ -f "$f" ]] || continue
+        pname=$(basename "$f" .conf)
+        [[ "$pname" == "host" ]] && continue
+        keys+=("${hname}/${pname}")
       done
     done
   fi
 
-  if [[ "$found" == false ]]; then
-    printf '  No profiles connected.\n'
+  local state_base="${RT_HOME}/.rt"
+  if [[ -d "$state_base" ]]; then
+    for hdir in "$state_base"/*/; do
+      [[ -d "$hdir" ]] || continue
+      hname=$(basename "$hdir")
+      for pdir in "$hdir"*/; do
+        [[ -d "$pdir" ]] || continue
+        pname=$(basename "$pdir")
+        keys+=("${hname}/${pname}")
+      done
+    done
   fi
+
   printf '\n'
+  if [[ ${#keys[@]} -eq 0 ]]; then
+    printf '  No profiles configured. Create one with: rt -p <host>/<profile> init\n\n'
+    return
+  fi
+
+  local key h p sync_state host rdir local_dir tag configured live=0 total=0
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    h="${key%%/*}"; p="${key#*/}"
+    total=$((total + 1))
+
+    sync_state=$(_sync_status "$h" "$p")
+    [[ "$sync_state" != "none" && "$sync_state" != "unknown" ]] && live=$((live + 1))
+
+    # The live session's own record wins where it exists — it is what the session was actually
+    # created with, and the config may have been edited since. Otherwise fall back to the
+    # config, which is the only source for a profile that has never connected.
+    host=""; rdir=""; local_dir=""
+    pdir="${state_base}/${h}/${p}"
+    if [[ -f "$pdir/host" ]]; then
+      host=$(cat "$pdir/host" 2>/dev/null)
+      [[ -f "$pdir/remote_dir" ]] && rdir=$(cat "$pdir/remote_dir" 2>/dev/null)
+      [[ -f "$pdir/local_dir" ]]  && local_dir=$(cat "$pdir/local_dir" 2>/dev/null)
+    else
+      IFS=$'\t' read -r host rdir local_dir <<< "$(_profile_identity "$h" "$p")"
+    fi
+
+    configured=no
+    [[ -f "${RT_HOME}/${h}/${p}.conf" ]] && configured=yes
+    tag=""
+    [[ "$configured" == "no" ]] && tag="  ⚠ no config file — 'rt -p ${h}/${p} <cmd>' will fail"
+
+    printf '  [%s/%s] sync=%s — %s:%s ⇄ %s%s\n' "$h" "$p" "$sync_state" "$host" "$rdir" "$local_dir" "$tag"
+  done < <(printf '%s\n' "${keys[@]}" | sort -u)
+
+  # Name the scope. A bare list of rows does not say whether "not listed" means "does not
+  # exist" or "this command does not look there" — which is the defect being closed.
+  printf '\n  %d profile(s) known to %s; %d with a live sync session.\n\n' "$total" "$RT_HOME" "$live"
 }
 
 # ── Sync subcommand (Mutagen passthroughs) ────────────────────────

@@ -334,6 +334,61 @@ else
   fi
 fi
 
+# ── 9. `status --all` enumerates CONFIGURED profiles ─────────────────────────
+#
+# It walked state directories — the record `connect` writes — so a profile that was configured
+# and never connected did not exist as far as this command was concerned. That is the question
+# you run it to answer, and the SKILL's first instruction is to run it to enumerate profiles.
+# Measured on the author's machine 2026-08-05: 11 configs, 10 state dirs, one invisible.
+RT_HOME_SAVE="$RT_HOME"
+export RT_HOME="$SCRATCH/conf2"
+mkdir -p "$RT_HOME/h1" "$RT_HOME/_archive" "$RT_HOME/.rt/h1/connected" "$RT_HOME/.rt/h1/orphan"
+cat > "$RT_HOME/h1/host.conf"  <<'EOF'
+REMOTE_HOST=host-one
+EOF
+cat > "$RT_HOME/h1/connected.conf" <<'EOF'
+REMOTE_DIR=/remote/connected
+EOF
+# NEVER connected: no state dir. This is the row the old enumeration dropped.
+cat > "$RT_HOME/h1/neverconnected.conf" <<'EOF'
+REMOTE_DIR=/remote/never
+EOF
+# A retired config outside any host group must not be mistaken for a profile.
+cat > "$RT_HOME/_archive/old.conf" <<'EOF'
+REMOTE_DIR=/remote/retired
+EOF
+printf 'host-one' > "$RT_HOME/.rt/h1/connected/host"
+printf '/remote/connected' > "$RT_HOME/.rt/h1/connected/remote_dir"
+printf '/local/connected' > "$RT_HOME/.rt/h1/connected/local_dir"
+
+_sync_status() { echo none; }
+all_out="$(_status_all 2>&1)"
+
+chk "9 a configured-but-never-connected profile is LISTED" \
+    "$(grep -q 'h1/neverconnected' <<< "$all_out" && echo 0 || echo 1)" "$(head -c 200 <<< "$all_out")"
+chk "9b a connected profile is still listed" \
+    "$(grep -q 'h1/connected' <<< "$all_out" && echo 0 || echo 1)"
+chk "9c a state dir with NO config is listed and MARKED (it is still syncing)" \
+    "$(grep -q 'h1/orphan' <<< "$all_out" && grep -q 'no config file' <<< "$all_out" && echo 0 || echo 1)" \
+    "$(grep 'orphan' <<< "$all_out")"
+# Asserted on the ROW SHAPE `[_archive/...]`, not on the words in the config. A looser
+# "must not contain 'old'" fired on the scratch path — /var/folders contains it — which is the
+# same over-broad-negative trap this suite exists to avoid, just pointing the other way.
+chk "9d a retired config outside a host group is NOT counted as a profile" \
+    "$(grep -q '^  \[_archive/' <<< "$all_out" && echo 1 || echo 0)" "$(grep '_archive' <<< "$all_out")"
+chk "9e the enumeration names its own SCOPE (count + where it looked)" \
+    "$(grep -q '3 profile(s) known to' <<< "$all_out" && echo 0 || echo 1)" \
+    "$(grep 'profile(s)' <<< "$all_out")"
+# The identity of a never-connected profile comes from sourcing its config, and configs are
+# bash: reading several in one shell would leak each one's vars into the next. `neverconnected`
+# and `connected` set DIFFERENT REMOTE_DIRs, so a leak shows up as the wrong path on a row.
+chk "9f sourcing one profile's config does not leak into the next" \
+    "$(grep -q 'h1/neverconnected.*/remote/never' <<< "$all_out" && echo 0 || echo 1)" \
+    "$(grep 'neverconnected' <<< "$all_out")"
+
+rm -rf "$RT_HOME"
+export RT_HOME="$RT_HOME_SAVE"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1
