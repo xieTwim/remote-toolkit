@@ -1,5 +1,7 @@
 # remote-toolkit — BACKLOG
 
+tier: critical   <!-- a silent failure strands other projects' GPUs, loses a run's only output, or puts a wrong number/citation in a submitted paper -->
+
 One entry per ROOT CAUSE. Protocol: research-loop `commands/CAPABILITIES.md` § ISSUES protocol.
 Grep before adding (`+1 <project> <date>` on a hit); closes in the fix's own commit, replaced by a
 `- [fixed <commit>]` tombstone.
