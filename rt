@@ -888,9 +888,20 @@ cmd_disconnect() {
       fi
       # The exit code says the command succeeded; this says the session is gone. They are
       # different claims, and this command's whole job is the second one.
-      if _has_sync; then
-        die "[$RT_PROFILE] mutagen reported success but the sync session is still present. Local state has NOT been cleared. Inspect with 'rt -p $RT_PROFILE sync status'."
-      fi ;;
+      #
+      # `_has_sync` is NOT the right instrument here: it is a boolean and collapses "there is no
+      # session" with "I could not ask", so a daemon that became unaskable between the terminate
+      # and this check read as proof of termination — and the local record was then deleted over
+      # a session that may still exist. Found by an independent review of this session's own fix.
+      local _post
+      _post=$(_sync_status)
+      case "$_post" in
+        none) : ;;   # established: it is gone
+        unknown)
+          die "[$RT_PROFILE] mutagen reported success, but the daemon could not then be asked whether the session is actually gone — so termination is NOT established. Local state has NOT been cleared. Inspect with 'rt -p $RT_PROFILE sync status'." ;;
+        *)
+          die "[$RT_PROFILE] mutagen reported success but the sync session is still present (state: $_post). Local state has NOT been cleared. Inspect with 'rt -p $RT_PROFILE sync status'." ;;
+      esac ;;
   esac
 
   clear_state
@@ -1391,17 +1402,26 @@ _sync_report_ignores() {
   else
     printf '%s\n' "$live" | sed '/^$/d; s/^/    /'
   fi
+  # Match the enum EXACTLY. `*Ignore*` matched all three values, because every one of them
+  # contains the literal "IgnoreVCSMode" — so this line said ".git/ is ignored" even for
+  # `Propagate`, which is the value that means it is SYNCED. A query that fails says so rather
+  # than picking a side.
   case "$(_sync_live_vcs)" in
-    *Ignore*) printf '    [VCS directories such as .git/ are ignored]\n' ;;
-    *)        printf '    [VCS directories such as .git/ are SYNCED]\n' ;;
+    IgnoreVCSModeIgnore)                        printf '    [VCS directories such as .git/ are ignored]\n' ;;
+    IgnoreVCSModePropagate|IgnoreVCSModeDefault) printf '    [VCS directories such as .git/ are SYNCED]\n' ;;
+    *)                                          printf '    [VCS directory handling: could not be established]\n' ;;
   esac
 
   want=$(_ignore_patterns)
   if [[ "$(printf '%s\n' "$live" | sed '/^$/d' | sort)" != "$(printf '%s\n' "$want" | sed '/^$/d' | sort)" ]]; then
     warn "[$RT_PROFILE] The live session's ignores DIFFER from what this profile's config would create now. Ignores are frozen at session-create time, so editing MUTAGEN_IGNORE has not changed what is being excluded. Recreate to apply: 'rt -p $RT_PROFILE disconnect && rt -p $RT_PROFILE connect'."
     printf '  Config would create (differences marked):\n'
+    # `|| true`: `diff` exits 1 when the inputs differ, which is ALWAYS the case here, and under
+    # `set -euo pipefail` that aborted the whole command. Measured: `rt sync status` on a
+    # drifted profile printed the differences, then exited 1 without the Mutagen dump that
+    # follows — the diagnostic command failing on exactly the profiles it exists to diagnose.
     diff <(printf '%s\n' "$live" | sed '/^$/d' | sort) <(printf '%s\n' "$want" | sed '/^$/d' | sort) \
-      | sed -n 's/^</    only LIVE:   /p; s/^>/    only CONFIG: /p'
+      | sed -n 's/^</    only LIVE:   /p; s/^>/    only CONFIG: /p' || true
   fi
 }
 
@@ -1470,19 +1490,46 @@ _remote_digest_cmd() {
 # "still converging". Reimplementing the whole matcher in Bash would produce a checker that is
 # confidently wrong, which is worse than one with a stated bound.
 _ignored_reason() {
-  local path="$1" pat base
+  local path="$1" pat base rules
+  rules=$(_sync_live_ignores) || return 1
+
+  # A negation re-includes a path an earlier rule excluded, and resolving that needs Mutagen's
+  # real ordering semantics. Checked BEFORE any matching, because the excluding rule usually
+  # comes first and would otherwise answer before the negation is ever seen. `rt` never
+  # generates one, so this only fires on a hand-written MUTAGEN_IGNORE — where declining to
+  # claim is better than refusing a path that would in fact sync.
+  case "$rules" in \!*|*$'\n'\!*) return 1 ;; esac
+
   while IFS= read -r pat; do
     [[ -n "$pat" ]] || continue
     if [[ "$pat" == */ ]]; then
       base="${pat%/}"
-      case "/$path/" in */"$base"/*) printf '%s' "$pat"; return 0 ;; esac
+      # NOT `"/$path/"`. Wrapping the path in a trailing slash made `outputs/` match a regular
+      # FILE named `outputs`, and Mutagen's trailing slash means directory-only. Comparing
+      # `/outputs` against `*/outputs/*` correctly matches `outputs/x` and not `outputs`.
+      case "/$path" in */"$base"/*) printf '%s' "$pat"; return 0 ;; esac
     elif [[ "$pat" == \** ]]; then
       # shellcheck disable=SC2254
       case "${path##*/}" in $pat) printf '%s' "$pat"; return 0 ;; esac
     else
       case "/$path" in */"$pat") printf '%s' "$pat"; return 0 ;; esac
     fi
-  done < <(_sync_live_ignores)
+  done <<< "$rules"
+  return 1
+}
+
+# Does any component of this relative path traverse a symlink out of LOCAL_DIR? Checking only
+# the final component (`[[ -L $LOCAL_DIR/$p ]]`) misses `sub/file` where `sub` itself is a
+# symlink pointing outside the profile root — verify would then certify a file neither endpoint
+# is syncing.
+_escapes_via_symlink() {
+  local rel="$1" acc="$LOCAL_DIR" part
+  local IFS=/
+  for part in $rel; do
+    [[ -n "$part" ]] || continue
+    acc="${acc}/${part}"
+    [[ -L "$acc" ]] && { printf '%s' "$acc"; return 0; }
+  done
   return 1
 }
 
@@ -1525,12 +1572,13 @@ cmd_verify() {
   for p in "${paths[@]}"; do
     [[ -n "$p" ]]         || die2 "Empty path"
     [[ "$p" != /* ]]      || die2 "verify takes paths RELATIVE to the profile root, got absolute '$p'. (Local root: $LOCAL_DIR)"
-    [[ "$p" != *..* ]]    || die2 "Path escapes the profile root: '$p'"
+    case "/$p/" in */../*) die2 "Path escapes the profile root: '$p'" ;; esac
     # A newline would split one path across two manifest lines on BOTH sides, making the
     # comparison and the per-file mismatch report describe something other than the file.
     [[ "$p" != *$'\n'* ]] || die2 "Path contains a newline, which the digest manifest is line-oriented about: $(printf '%q' "$p")"
-    [[ ! -L "${LOCAL_DIR}/${p}" ]] \
-      || die2 "'$p' is a symlink. Hashing the link text would not prove what the remote launches, and following it would not prove the link. Verify the target by its own path."
+    if reason=$(_escapes_via_symlink "$p"); then
+      die2 "'$p' passes through a symlink ($reason). Hashing the link text would not prove what the remote launches, following it would not prove the link, and an intermediate one can leave the profile root entirely. Verify the real path."
+    fi
     [[ ! -d "${LOCAL_DIR}/${p}" ]] \
       || die2 "'$p' is a directory. Verify the files you are about to launch, by name — a recursive manifest brings in ordering, ignored descendants and mid-check mutation, which is a larger decision than this."
     [[ -f "${LOCAL_DIR}/${p}" ]] \
@@ -1574,8 +1622,12 @@ cmd_verify() {
     if grep -q '^RT_NO_REMOTE_DIR' <<< "$remote"; then
       die2 "[$RT_PROFILE] Remote directory does not exist: $REMOTE_DIR"
     fi
-    if (( rrc != 0 )) && [[ -z "$remote" ]]; then
-      die2 "[$RT_PROFILE] Could not read digests from the remote (ssh exit $rrc). Unverifiable, NOT a mismatch."
+    # ANY non-zero status from the evidence-producing command makes its output inadmissible —
+    # not just an empty one. A forced-command wrapper, a dying transport, or a remote shell that
+    # fails after printing can emit a complete, MATCHING manifest and still exit non-zero, and
+    # certifying arrival on that is a benign result over a scope that was never established.
+    if (( rrc != 0 )); then
+      die2 "[$RT_PROFILE] The remote digest command exited $rrc, so its output cannot be used as evidence. Unverifiable, NOT a mismatch and NOT an arrival."
     fi
 
     local2=$(_local_digests "${paths[@]}") || die2 "[$RT_PROFILE] No sha256 tool locally."
@@ -1596,7 +1648,10 @@ cmd_verify() {
       local line want got
       while IFS= read -r line; do
         want="${line%%  *}"; p="${line#*  }"
-        got=$(grep -F "  $p" <<< "$remote" | head -1)
+        # `|| true`: grep exits 1 when the remote said nothing about this path, and under
+        # `set -euo pipefail` that would abort here and exit 1 — leaking a status outside the
+        # 0/2/3 contract this command promises, in the middle of reporting a mismatch.
+        got=$(grep -F "  $p" <<< "$remote" | head -1) || true
         got="${got%%  *}"
         [[ "$want" == "$got" ]] && continue
         if [[ "$got" == "MISSING" ]]; then
@@ -1608,7 +1663,12 @@ cmd_verify() {
       warn "[$RT_PROFILE] A mismatch is NOT evidence that sync is still working on it — check 'rt -p $RT_PROFILE sync status'."
       return 3
     fi
-    sleep "$interval"
+    # Sleep no longer than the deadline allows. Sleeping a full interval AFTER checking the
+    # deadline made `--timeout 1 --interval 3` take 3 seconds, i.e. --timeout was not the bound
+    # it claims to be; a large interval could overshoot by that much.
+    local _left=$(( deadline - now ))
+    (( _left > interval )) && _left=$interval
+    (( _left > 0 )) && sleep "$_left"
   done
 }
 
@@ -1680,9 +1740,18 @@ _slurm_submit() {
 
   info "[$RT_PROFILE] sbatch ${sbatch_args[*]:-} ${script}"
   local output
-  # sbatch_args stay unquoted on purpose: they are operator-supplied FLAGS and must word-split.
-  # The script path is data.
-  if ! output=$(_ssh "cd $(_shq "$REMOTE_DIR") && sbatch ${sbatch_args[*]:-} $(_shq "$script")" 2>&1); then
+  # Each sbatch arg is quoted as ITS OWN word. An earlier version left `${sbatch_args[*]}`
+  # unquoted "because flags must word-split" — but the splitting has already happened: explicit
+  # `-- …` args arrive as separate argv elements, and `SLURM_SBATCH_ARGS` was split by
+  # `read -r -a` at parse time. Leaving it unquoted only ever added shell POWER, and the args
+  # after `--` are agent-supplied, i.e. exactly the trust boundary this repo just closed
+  # elsewhere. `rt slurm submit x -- '--comment=y;' true` built `sbatch --comment=y; true 'x'`,
+  # whose status is `true`'s — so a submission that never happened reported success.
+  local _qargs="" _a
+  for _a in ${sbatch_args[@]+"${sbatch_args[@]}"}; do
+    _qargs="${_qargs} $(_shq "$_a")"
+  done
+  if ! output=$(_ssh "cd $(_shq "$REMOTE_DIR") && sbatch${_qargs} $(_shq "$script")" 2>&1); then
     printf '%s\n' "$output" >&2
     die "sbatch failed."
   fi

@@ -196,7 +196,12 @@ chk "5e ... unless --assume-staged says the script was placed by other means" \
 # ── 6. disconnect leaves jobs running unless told otherwise ──────────────────
 # README and SKILL both said disconnect terminates sync and preserves work; it killed every
 # background job, with no flush before or after. Two different intentions under one name.
+# This block is about the JOB-killing behaviour, so the sync side is stubbed to "no session".
+# `_sync_status` must agree with `_has_sync` here: blocks 4-5 left it returning `active`, and
+# `cmd_disconnect` is called WITHOUT a subshell below, so its termination-postcondition `die`
+# would take the whole runner down mid-suite rather than failing one check.
 _has_sync() { return 1; }
+_sync_status() { echo none; }
 KILLED=""
 _ssh() {
   case "$*" in
@@ -504,21 +509,29 @@ load_config() { :; }
 _ssh_test() { return 1; }                     # isolate: skip the background-job branch
 clear_state() { touch "$SCRATCH/cleared"; }
 
-_d() { # _d <status> <terminate-rc> <still-present-after> -> "<rc>|<cleared>|<output>"
-       # The stub bodies are eval'd so the values are BOUND into them: a `$1` inside a stub
-       # would resolve to the stub's own arguments, not to _d's.
+# _d <initial-status> <terminate-rc> <post-termination-status>
+#      -> "<rc>|<cleared>|<output>"
+#
+# `_sync_status` must answer DIFFERENTLY for the two probes: once before terminating, once to
+# establish the session is actually gone. A single-valued stub cannot express the case that
+# matters — "gone" vs "I could not tell" at the postcondition — so the call is counted through a
+# FILE, since `cmd_disconnect` reads it inside a subshell.
+_d() {
   rm -f "$SCRATCH/cleared"
-  local st="$1" trc="$2" present="$3" out rc=0
+  local st="$1" trc="$2" post="$3" out rc=0
+  printf '0' > "$SCRATCH/dcalls"
   out=$(
-    eval "_sync_status() { echo $st; }"
+    eval "_sync_status() {
+      local n; n=\$(( \$(cat '$SCRATCH/dcalls') + 1 )); printf '%s' \"\$n\" > '$SCRATCH/dcalls'
+      if [ \"\$n\" -eq 1 ]; then echo $st; else echo $post; fi
+    }"
     eval "_sync_terminate() { echo 'unable to terminate: connection refused'; return $trc; }"
-    eval "_has_sync() { return $present; }"
     cmd_disconnect 2>&1
   ) || rc=$?
   printf '%s|%s|%s' "$rc" "$([ -e "$SCRATCH/cleared" ] && echo yes || echo no)" "$out"
 }
 
-r="$(_d active 1 0)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
+r="$(_d active 1 none)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
 chk "10 a FAILED terminate exits non-zero (was: rc 0, 'Disconnected')" \
     "$([ "$rc" != 0 ] && echo 0 || echo 1)" "rc=$rc"
 chk "10b ... and does NOT delete the local record of a session that may still be running" \
@@ -526,19 +539,27 @@ chk "10b ... and does NOT delete the local record of a session that may still be
 chk "10c ... and quotes mutagen's own reason" \
     "$(grep -q 'connection refused' <<< "$out" && echo 0 || echo 1)" "$(head -c 160 <<< "$out")"
 
-r="$(_d active 0 0)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+r="$(_d active 0 active)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
 chk "10d terminate reporting SUCCESS while the session survives is still a failure" \
     "$([ "$rc" != 0 ] && [ "$cleared" = "no" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
 
-r="$(_d active 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
+# The case an independent review found, which nothing here covered: the daemon becomes
+# UNASKABLE between the terminate and the confirmation. `_has_sync` returned false for that —
+# indistinguishable from "no session" — so the local record was deleted and rc 0 returned over a
+# session that may still exist.
+r="$(_d active 0 unknown)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+chk "10d2 a daemon that goes unaskable AFTER terminating is not proof the session is gone" \
+    "$([ "$rc" != 0 ] && [ "$cleared" = "no" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
+
+r="$(_d active 0 none)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
 chk "10e a termination that is ESTABLISHED clears state and succeeds" \
     "$([ "$rc" = 0 ] && [ "$cleared" = "yes" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
 
-r="$(_d unknown 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+r="$(_d unknown 0 none)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
 chk "10f an unaskable daemon does not license deleting the record either" \
     "$([ "$rc" != 0 ] && [ "$cleared" = "no" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
 
-r="$(_d none 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+r="$(_d none 0 none)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
 chk "10g no session at all still disconnects cleanly" \
     "$([ "$rc" = 0 ] && [ "$cleared" = "yes" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
 
@@ -985,6 +1006,133 @@ $(_local_digests launch.sh)"
 out=$( cmd_verify --timeout 0 launch.sh 2>&1 ); rc=$?
 chk "15j a login banner on the remote's stdout does not read as an arrival" \
     "$([ "$rc" -eq 3 ] && echo 0 || echo 1)" "rc=$rc out=$(head -c 200 <<< "$out")"
+
+# ── 16. findings from the independent review of THIS session's work ──────────
+#
+# Every check below exists because a de-correlated reader attacked the code I had just written
+# and the suite I had just written to score it. None of these were caught by 122 green checks.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="/remote/proj"; LOCAL_DIR="$SCRATCH/vlocal"
+info() { :; }; warn() { :; }; load_config() { :; }
+_sync_status() { echo active; }
+_sync_live_ignores() { printf 'outputs/\n'; }
+
+# (a) A failed evidence-producing command cannot certify, whatever it printed. A forced-command
+# wrapper or a dying transport can emit a COMPLETE, MATCHING manifest and still exit non-zero.
+_ssh() { printf '%s\n' "$FAKE_REMOTE"; return "${FAKE_SSH_RC:-0}"; }
+FAKE_REMOTE="$(_local_digests launch.sh)"; FAKE_SSH_RC=255
+( cmd_verify --timeout 0 launch.sh ) >/dev/null 2>&1
+chk "16 verify does NOT report ARRIVED when the remote command exited non-zero" \
+    "$([ $? -eq 2 ] && echo 0 || echo 1)"
+FAKE_SSH_RC=0
+( cmd_verify --timeout 0 launch.sh ) >/dev/null 2>&1
+chk "16b ... and still reports ARRIVED when it exited 0" "$([ $? -eq 0 ] && echo 0 || echo 1)"
+
+# (b) `--timeout` must be a real bound. Sleeping a full interval AFTER checking the deadline made
+# `--timeout 1 --interval 5` take 5 seconds.
+FAKE_REMOTE="MISSING  launch.sh"
+t0=$(date +%s); ( cmd_verify --timeout 1 --interval 5 launch.sh ) >/dev/null 2>&1; t1=$(date +%s)
+chk "16c --timeout bounds the wait even when --interval is larger" \
+    "$([ $((t1-t0)) -le 3 ] && echo 0 || echo 1)" "took $((t1-t0))s for a 1s timeout"
+
+# (c) The mismatch REPORT must not itself abort. `grep` exits 1 when the remote said nothing
+# about a path, and under `set -euo pipefail` that leaked rc 1 out of a 0/2/3-only contract.
+FAKE_REMOTE="unrelated  other.txt"
+( cmd_verify --timeout 0 launch.sh ) >/dev/null 2>&1
+chk "16d a remote that mentions none of the requested paths still returns 3, not 1" \
+    "$([ $? -eq 3 ] && echo 0 || echo 1)"
+
+# (d) `..` is a path COMPONENT, not a substring: `model..yaml` is a legal filename.
+printf 'x\n' > "$LOCAL_DIR/model..yaml"
+FAKE_REMOTE="$(_local_digests model..yaml)"
+( cmd_verify --timeout 0 model..yaml ) >/dev/null 2>&1
+chk "16e a filename containing '..' is accepted; only a '..' COMPONENT is a traversal" \
+    "$([ $? -eq 0 ] && echo 0 || echo 1)"
+( cmd_verify --timeout 0 "sub/../launch.sh" ) >/dev/null 2>&1
+chk "16f ... while a real '..' component is still refused" "$([ $? -eq 2 ] && echo 0 || echo 1)"
+
+# (h) A symlink in ANY component, not just the last: `sub/file` where `sub` is a symlink out of
+# the profile root would otherwise be certified, and it is a file neither endpoint is syncing.
+mkdir -p "$SCRATCH/outside"; printf 'elsewhere\n' > "$SCRATCH/outside/f.txt"
+ln -sfn "$SCRATCH/outside" "$LOCAL_DIR/viasym"
+FAKE_REMOTE="$(_local_digests viasym/f.txt 2>/dev/null)"
+( cmd_verify --timeout 0 viasym/f.txt ) >/dev/null 2>&1
+chk "16l a symlinked INTERMEDIATE component is refused, not just a symlinked leaf" \
+    "$([ $? -eq 2 ] && echo 0 || echo 1)"
+
+# (i) A trailing slash means DIRECTORY in Mutagen, so `outputs/` must not block a regular file
+# that happens to be named `outputs`.
+_sync_live_ignores() { printf 'outputs/\n'; }
+printf 'not a dir\n' > "$LOCAL_DIR/outputs2"
+_ignored_reason "outputs2" >/dev/null 2>&1
+chk "16m an unrelated name is not matched by a directory rule" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+_ignored_reason "outputs" >/dev/null 2>&1
+chk "16n a FILE named like a directory rule is not treated as ignored" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+_ignored_reason "outputs/x.txt" >/dev/null 2>&1
+chk "16o ... while a path UNDER that directory still is" "$([ $? -eq 0 ] && echo 0 || echo 1)"
+
+# (j) A negation needs Mutagen's real ordering to resolve. The helper stops claiming rather than
+# answering wrongly and refusing a path that would in fact sync.
+_sync_live_ignores() { printf 'CLAUDE.md\n!CLAUDE.md\n'; }
+_ignored_reason "CLAUDE.md" >/dev/null 2>&1
+chk "16p a negation rule makes the matcher decline to claim, not guess" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+_sync_live_ignores() { printf 'outputs/\n'; }
+
+# (e) The VCS enum. `*Ignore*` matched ALL THREE values, because every one of them contains the
+# literal "IgnoreVCSMode" — so this line said ".git/ is ignored" even for Propagate, which means
+# the opposite. A failed query said "SYNCED", also a claim.
+_has_sync() { return 0; }
+_ignore_patterns() { printf 'a/\n'; }
+_sync_live_ignores() { printf 'a/\n'; }
+for c in "IgnoreVCSModeIgnore:ignored" "IgnoreVCSModePropagate:SYNCED" "IgnoreVCSModeDefault:SYNCED" ":could not be established"; do
+  v="${c%%:*}"; want="${c#*:}"
+  eval "_sync_live_vcs() { printf '%s' '$v'; }"
+  out="$(_sync_report_ignores 2>&1)"
+  chk "16g VCS=${v:-<query failed>} reports '$want'" \
+      "$(grep -qF "$want" <<< "$out" && echo 0 || echo 1)" "$(grep -i 'VCS' <<< "$out")"
+done
+
+# (f) `rt sync status` must SURVIVE printing drift. `diff` exits 1 whenever the inputs differ —
+# which is always, here — and under `set -euo pipefail` that aborted the command partway
+# through, on exactly the profiles it exists to diagnose. Measured live before the fix: rc 1 and
+# no Mutagen dump after the drift lines.
+_sync_live_vcs() { printf 'IgnoreVCSModeIgnore'; }
+_ignore_patterns() { printf 'a/\nb-only-in-config/\n'; }
+_sync_live_ignores() { printf 'a/\n'; }
+( set -euo pipefail; _sync_report_ignores >/dev/null 2>&1; echo REACHED_END > "$SCRATCH/dr" )
+chk "16h reporting drift does not abort the command that reports it" \
+    "$([ -e "$SCRATCH/dr" ] && echo 0 || echo 1)"
+
+# (g) sbatch arguments are agent-supplied and were remote SHELL SOURCE. A `;` in one of them
+# built a compound command whose LAST element supplied the exit status, so a submission that
+# never happened reported success.
+cat > "$SCRATCH/bin/sbatch" <<'EOF'
+#!/bin/sh
+for a in "$@"; do printf 'SARG[%s]\n' "$a"; done
+echo "Submitted batch job 1"
+EOF
+chmod +x "$SCRATCH/bin/sbatch"
+rm -f "$SCRATCH/captured" "$SCRATCH/PWNED.sb"
+# REMOTE_DIR must EXIST: the emitted command is `cd <dir> && sbatch …`, so a nonexistent dir
+# short-circuits before sbatch and the check would score an empty argv as "nothing injected".
+mkdir -p "$SCRATCH/proj"; REMOTE_DIR="$SCRATCH/proj"
+RT_STATE_DIR="$SCRATCH/state16"; SLURM_ENABLED=1; SLURM_LOG_DIR="$SCRATCH"; SLURM_SBATCH_ARGS=""
+_ssh_test() { return 0; }; _has_sync() { return 1; }
+_ssh() { printf '%s' "$*" > "$SCRATCH/captured"; echo "Submitted batch job 1"; }
+_slurm_submit --assume-staged run.sbatch -- "--comment=x; touch $SCRATCH/PWNED.sb" >/dev/null 2>&1
+sent="$(cat "$SCRATCH/captured" 2>/dev/null)"
+argv="$(cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$sent" 2>/dev/null | grep '^SARG\[')"
+chk "16i an sbatch arg containing ';' stays ONE argument" \
+    "$(grep -qF "SARG[--comment=x; touch $SCRATCH/PWNED.sb]" <<< "$argv" && echo 0 || echo 1)" "argv='$argv'"
+chk "16j ... and does not run as a second remote command" \
+    "$([ ! -e "$SCRATCH/PWNED.sb" ] && echo 0 || echo 1)" "sent='$sent'"
+# Ordinary flags must still reach sbatch as separate arguments.
+rm -f "$SCRATCH/captured"
+_slurm_submit --assume-staged run.sbatch -- --time=04:00:00 --gres=gpu:2 >/dev/null 2>&1
+argv="$(cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$(cat "$SCRATCH/captured")" 2>/dev/null | grep -c '^SARG\[')"
+chk "16k ordinary sbatch flags still arrive as separate arguments" \
+    "$([ "$argv" = "3" ] && echo 0 || echo 1)" "got $argv args (want 3: 2 flags + script)"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi

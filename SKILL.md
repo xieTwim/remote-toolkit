@@ -151,7 +151,8 @@ It hashes each path locally, has the remote hash the same paths, and compares �
 
 Rules it enforces, each because the alternative is a false "arrived":
 - Paths are **relative to the profile root**, regular files only. Directories and symlinks are refused rather than guessed at.
-- A path matching the **live session's ignore rules** is refused immediately: it can never arrive by syncing, so waiting for it waits forever. (The ignore matching covers the pattern shapes `rt` itself generates. A match is authoritative; a non-match claims nothing, which is why an unexplained difference is reported as "not equal by the deadline" and never as "still converging".)
+- A path matching the **live session's ignore rules** is refused immediately: it can never arrive by syncing, so waiting for it waits forever. The matcher covers the pattern shapes `rt` itself generates — `dir/`, `*.ext`, and a bare name — not Mutagen's full grammar, so a **non-match claims nothing** (an unexplained difference is reported as "not equal by the deadline", never as "still converging"), and it **declines to answer at all** if the live rules contain a negation (`!pattern`), whose resolution needs Mutagen's real ordering. It also does not know about root-relative patterns or the separate VCS-ignore setting, so `.git/config` is not recognised as blocked.
+- A path is refused if **any component** of it passes through a symlink, not just the last one — an intermediate symlink can leave the profile root entirely, and certifying a file neither endpoint syncs is worse than refusing to answer.
 - A missing hashing tool is **unverifiable**, never a mismatch and never an arrival.
 
 Use it before `cp`-ing a staged file into place, before `rt slurm submit`, and before any `exec --bg` that launches code you just edited.
