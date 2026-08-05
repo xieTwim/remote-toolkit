@@ -471,6 +471,15 @@ chk "9f sourcing one profile's config does not leak into the next" \
     "$(grep -q 'h1/neverconnected.*/remote/never' <<< "$all_out" && echo 0 || echo 1)" \
     "$(grep 'neverconnected' <<< "$all_out")"
 
+# A FRESH INSTALL: no configs, no state. This is the empty-array expansion path, and macOS ships
+# bash 3.2, where `"${arr[@]}"` on an empty array is an "unbound variable" error under `set -u` —
+# so the very first command a new user runs is the one that would abort.
+rm -rf "$RT_HOME"; mkdir -p "$RT_HOME"
+out="$(_status_all 2>&1)"; rc=$?
+chk "9g a completely empty RT_HOME says so instead of erroring (bash 3.2 empty-array path)" \
+    "$([ "$rc" -eq 0 ] && grep -q 'No profiles configured' <<< "$out" && ! grep -qi 'unbound' <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 160 <<< "$out")"
+
 rm -rf "$RT_HOME"
 export RT_HOME="$RT_HOME_SAVE"
 
