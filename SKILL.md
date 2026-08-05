@@ -153,8 +153,13 @@ Short commands (< 30 seconds) — auto-flushes sync first:
 ```bash
 rt -p fact-cluster/scratch exec "pwd"
 rt -p fact-cluster/scratch exec "nvidia-smi"
-rt -p fact-cluster/scratch exec --no-flush "ls"   # skip flush for fast iteration
+rt -p fact-cluster/scratch exec --no-flush "ls"          # skip flush for fast iteration
+rt -p fact-cluster/scratch exec --timeout 30 "cat big.log"   # bound the wait
 ```
+
+**To bound a read, use `--timeout`, never `timeout(1)`.** macOS has no `timeout` — it is `gtimeout`, from coreutils, and usually not installed — so `timeout 30 rt … exec …` dies with `command not found: timeout` **without running the command at all**. Written as `timeout 30 rt … exec … | head -3` it is worse: the pipeline still exits 0 because `head` succeeded, so a read that never happened is indistinguishable from a successful read that returned nothing. `rt exec --timeout SECS` implements the bound inside `rt` in pure Bash, needs no GNU binary, and exits **124** (timeout(1)'s conventional code) when it elapses.
+
+The bound is on the **wait**, not on the work: `rt` kills the local `ssh`, which does not reliably kill the remote process. It says so when it fires. If you need the remote side to stop too, run it with `--bg` and kill the tmux session.
 
 Long commands (builds, training daemons, services):
 ```bash

@@ -774,6 +774,70 @@ printf 'REMOTE_DIR="/tmp/ordinary"\n' > "$RT_HOME/q/r.conf"
 ( RT_PROFILE="q/r"; _init_profile; load_config ) >/dev/null 2>&1
 chk "13m ... while an ordinary REMOTE_DIR still loads" "$([ $? -eq 0 ] && echo 0 || echo 1)"
 
+# ── 14. bounded reads work without a GNU timeout(1) ──────────────────────────
+#
+# Callers bounded remote reads by writing `timeout 30 rt … exec …` on the Mac, and macOS has NO
+# `timeout` — it is `gtimeout`, from coreutils, usually not installed. The command died with
+# "command not found: timeout" without running. A sibling report records the nastier form:
+# written as `timeout 120 <cmd> | head -3`, the PIPELINE still exits 0 because `head` succeeded,
+# so a read that never happened looks like a success that returned nothing.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; SSH_OPTS=(-o BatchMode=yes); REMOTE_DIR="$SCRATCH/proj"
+info() { :; }; warn() { :; }
+
+# A real executable, not a shell function: backgrounding a FUNCTION forks a subshell, so `$!`
+# would be the subshell and the check would be scoring the wrong process — which is exactly the
+# bug this block caught in the implementation.
+LATE="$SCRATCH/late-write"
+cat > "$SCRATCH/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in
+  *SLOW*) sleep 4; echo LATE >> "$LATE"; echo SLOW_DONE ;;
+  *)      echo REMOTE_OK ;;
+esac
+EOF
+chmod +x "$SCRATCH/bin/ssh"
+PATH_SAVE="$PATH"; export PATH="$SCRATCH/bin:$PATH"
+
+rm -f "$LATE"
+# Output goes to a FILE, not through `$( )`. A command substitution waits for every writer to
+# close the pipe, and this stub leaves an orphaned `sleep` holding the inherited stdout — so
+# capturing would measure the orphan's lifetime, not the bound, and read 5s for a bound of 2.
+# (The real path was measured live at 3.3s for a bound of 3: ssh has no such local child.)
+t0=$(date +%s); _ssh_bounded 2 "SLOW" >"$SCRATCH/o14" 2>/dev/null; rc=$?; t1=$(date +%s)
+chk "14 a bounded read returns 124 at the bound, with no GNU timeout(1) anywhere" \
+    "$([ "$rc" = 124 ] && [ $((t1-t0)) -lt 4 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
+chk "14b ... and it returns nothing rather than the slow command's output" \
+    "$([ ! -s "$SCRATCH/o14" ] && echo 0 || echo 1)" "out='$(cat "$SCRATCH/o14")'"
+# The killed process must really be dead. With the bound applied to a subshell instead of to
+# ssh itself, the ssh survives, keeps the pipe open and writes AFTER the caller gave up —
+# measured live before this was fixed: the bound returned at 3s and the output arrived at 30s.
+sleep 4
+chk "14c ... and the killed remote client does not write after the bound elapsed" \
+    "$([ ! -e "$LATE" ] && echo 0 || echo 1)" "late write happened"
+
+_ssh_bounded 10 "quick" >"$SCRATCH/o14b" 2>/dev/null; rc=$?
+chk "14d a command that finishes inside the bound returns 0 and its output" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$SCRATCH/o14b")" = "REMOTE_OK" ] && echo 0 || echo 1)" \
+    "rc=$rc out='$(cat "$SCRATCH/o14b")'"
+
+# The flag is validated at the boundary, like every other agent-supplied value.
+_ssh_test() { return 0; }; _has_sync() { return 1; }; load_config() { :; }
+( cmd_exec --timeout abc "echo hi" ) >/dev/null 2>&1
+chk "14e --timeout rejects a non-numeric bound" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+( cmd_exec --timeout 0 "echo hi" ) >/dev/null 2>&1
+chk "14f --timeout rejects zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+( cmd_exec --bg --timeout 5 "echo hi" ) >/dev/null 2>&1
+chk "14g --timeout with --bg is refused (a background job outlives this shell)" \
+    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+export PATH="$PATH_SAVE"
+
+# The entry's fallback clause: say so where the bounded-read path is documented.
+DOCS_DIR="$(dirname "$HERE")"
+chk "14h the docs name the macOS timeout(1) trap at the bounded-read path" \
+    "$(grep -q 'gtimeout' "$DOCS_DIR/SKILL.md" && grep -q 'timeout' "$DOCS_DIR/README.md" && echo 0 || echo 1)"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

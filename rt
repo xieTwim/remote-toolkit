@@ -901,6 +901,7 @@ cmd_exec() {
   local bg=false
   local name=""
   local no_flush=false
+  local timeout_s=""
   local cmd_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -909,13 +910,23 @@ cmd_exec() {
       --name)      name="$2"; shift 2 ;;
       --name=*)    name="${1#--name=}"; shift ;;
       --no-flush)  no_flush=true; shift ;;
+      --timeout)   timeout_s="$2"; shift 2 ;;
+      --timeout=*) timeout_s="${1#--timeout=}"; shift ;;
       --)          shift; cmd_args+=("$@"); break ;;
       -*)          die "Unknown flag: $1" ;;
       *)           cmd_args+=("$@"); break ;;
     esac
   done
 
-  [[ ${#cmd_args[@]} -gt 0 ]] || die "Usage: rt exec [--bg] [--name NAME] [--no-flush] <command>"
+  [[ ${#cmd_args[@]} -gt 0 ]] || die "Usage: rt exec [--bg] [--name NAME] [--no-flush] [--timeout SECS] <command>"
+
+  if [[ -n "$timeout_s" ]]; then
+    [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
+      || die "--timeout takes whole seconds greater than zero, got '$timeout_s'."
+    # A background job is unbounded BY DESIGN — that is what --bg is for — so bounding it would
+    # only ever kill the ssh that launched tmux, which says nothing about the job.
+    [[ "$bg" == false ]] || die "--timeout and --bg are contradictory: a background job outlives this shell. Use 'rt logs' to check on it."
+  fi
 
   # Need SSH; sync state is independent
   _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST. Run 'rt connect' first."
@@ -953,14 +964,60 @@ cmd_exec() {
   if [[ "$bg" == true ]]; then
     _exec_bg "$command" "$name"
   else
-    _exec_sync "$command"
+    _exec_sync "$command" "$timeout_s"
   fi
 }
 
 _exec_sync() {
   local command="$1"
+  local limit="${2:-}"
   # $command is deliberately shell text — that is what `rt exec` is for. REMOTE_DIR is not.
-  _ssh "cd $(_shq "$REMOTE_DIR") && ${command}"
+  local remote="cd $(_shq "$REMOTE_DIR") && ${command}"
+  if [[ -n "$limit" ]]; then
+    _ssh_bounded "$limit" "$remote"
+  else
+    _ssh "$remote"
+  fi
+}
+
+# Bound an `_ssh` call in the WRAPPER, in pure Bash.
+#
+# The recorded failure is that callers bound a remote read by writing `timeout 30 rt … exec …`
+# on the Mac, and **macOS has no `timeout`** — it is `gtimeout`, from coreutils, and usually not
+# installed. The command then dies with "command not found: timeout" without ever running. A
+# sibling report in another project records the nastier version of the same thing: written as
+# `timeout 120 <cmd> | head -3`, the PIPELINE still exits 0 because `head` succeeded, so the
+# read looks like a success that returned nothing.
+#
+# So the bound belongs here rather than in the caller's shell or the remote's: no GNU binary,
+# no PATH assumption, and one exit code that means this and nothing else.
+#
+# 124 is timeout(1)'s conventional code, so a caller that already branched on `timeout`'s status
+# does not have to learn a new one. Granularity is 1s, as in `_run_bounded`.
+_ssh_bounded() {
+  local limit="$1"; shift
+  # `ssh` is invoked DIRECTLY rather than through `_ssh`. Backgrounding a shell FUNCTION forks a
+  # subshell, so `$!` would be the subshell's pid and `kill` would leave the real ssh running —
+  # measured: the bound returned at 3s while the remote command's output still arrived at 30s,
+  # because the surviving ssh held the pipe open. The point of the bound is that the caller stops
+  # waiting, so the process that must die is ssh itself.
+  # No redirection: the remote command's stdout/stderr are the point of `exec`.
+  ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@" &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= limit )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      # Say what was NOT established. Killing the local ssh client does not reliably kill the
+      # remote process — there is no tty to carry a SIGHUP — so the remote command may still be
+      # running, and any output it produces after this point is lost rather than absent.
+      warn "[$RT_PROFILE] Remote command exceeded ${limit}s and the local ssh was killed. The REMOTE process may still be running; this bound is on the wait, not on the work."
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
 }
 
 _exec_bg() {
@@ -1540,6 +1597,11 @@ COMMANDS:
   exec <command>       Run a command on the remote (auto-flushes sync)
   exec --no-flush <cmd>
                        Skip sync flush (faster for fast iteration)
+  exec --timeout SECS <cmd>
+                       Bound the wait on a foreground command; exits 124 if it
+                       elapses. Use this instead of wrapping rt in timeout(1) --
+                       macOS has no timeout(1), only gtimeout from coreutils.
+                       The bound is on the WAIT: the remote process may survive.
   exec --bg [--name N] <cmd>
                        Run in background (tmux), survives disconnection
   logs                 List background jobs for this profile

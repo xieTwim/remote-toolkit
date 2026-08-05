@@ -142,6 +142,7 @@ Reference templates: `host.conf.example` and `profile.conf.example` in the repo.
 | Problem | Solution |
 |---------|----------|
 | `rt check` says `mutagen: command not found` | Install Mutagen (see Install section) |
+| `command not found: timeout` when bounding a remote read | macOS has no `timeout(1)` (it is `gtimeout`, from coreutils). Do not wrap `rt` in it — use `rt exec --timeout SECS`, which implements the bound in pure Bash and exits 124. Piping a failed `timeout` into `head` is especially bad: the pipeline exits 0, so a read that never ran looks like a read that found nothing. |
 | SSH connection failed | Check network: `ssh -p PORT user@host "echo ok"` |
 | `rt status` shows `sync=offline` | `rt sync flush` to retry; check network; verify `~/.ssh/config` matches the `host.conf`'s SSH params |
 | `rt status` shows `sync=erroring` | Mutagen has a live error and is syncing **nothing** (the error is printed beside the state). `rt connect` cannot recover it — it is not paused, so there is nothing to resume. Fix the cause (usually a heavy dir missing from `MUTAGEN_IGNORE`, or raise `MUTAGEN_MAX_ENTRY_COUNT`), then **recreate**: `rt disconnect && rt connect`. Editing `MUTAGEN_IGNORE` alone does nothing — ignores apply only at session-create time. |
