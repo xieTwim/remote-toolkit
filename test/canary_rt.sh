@@ -241,19 +241,46 @@ FAKE_MUTAGEN_RC=0
 
 # <want> <.Paused>|<.Status>|<.Alpha.Connected>|<.Beta.Connected>|<.LastError>
 # Deliberately NOT column-aligned: the padding would land in the trailing .LastError field and
-# make three of these read as halted. The record is data, so it gets no cosmetics.
+# make three of these read as erroring. The record is data, so it gets no cosmetics.
+#
+# The three Halted* rows are the ones that broke the first version of this fix. Each was
+# MEASURED against 0.18.1 by driving the condition on local endpoints, and each reports an
+# EMPTY .LastError with BOTH endpoints connected — so a classifier that keys on the error alone
+# calls all three healthy. That is the same defect this entry is about, one state over.
 for case in \
   "active false|Watching|true|true|" \
-  "halted false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count" \
+  "active false|WaitingForRescan|true|true|" \
+  "active false|StagingBeta|true|true|" \
+  "erroring false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count" \
+  "halted false|HaltedOnRootEmptied|true|true|" \
+  "halted false|HaltedOnRootDeletion|true|true|" \
+  "halted false|HaltedOnRootTypeChange|true|true|" \
   "paused true|Disconnected|false|false|" \
   "offline false|Watching|false|true|" \
+  "offline false|Disconnected|true|true|" \
+  "unknown false|HaltedOnSomethingAddedInAFutureMutagen|true|true|" \
 ; do
   want="${case%% *}"; rec="${case#* }"
   FAKE_TEMPLATE_OUT="$rec"
   got="$(_sync_status)"
-  chk "7 [$want] a session reporting Status=$(echo "$rec" | cut -d'|' -f2) classifies as $want" \
+  chk "7 [$want] Status=$(echo "$rec" | cut -d'|' -f2)$([ -n "$(echo "$rec" | cut -d'|' -f5)" ] && echo ' +error') -> $want" \
       "$([ "$got" = "$want" ] && echo 0 || echo 1)" "classified '$got', want '$want'"
 done
+
+# The classification is POSITIVE — `active` requires a RECOGNISED healthy verb. The row above
+# pins that an unrecognised one reports `unknown`; this says why it matters. The old classifier
+# called everything it did not recognise `active`, so every state Mutagen has that it did not
+# name read as healthy, and a future Mutagen adding a brake would silently rejoin that set.
+FAKE_TEMPLATE_OUT='false|Watching|true|true|'
+chk "7a1 ... while a verb the tool DOES recognise as healthy still reads active" \
+    "$([ "$(_sync_status)" = "active" ] && echo 0 || echo 1)" "got $(_sync_status)"
+
+# One profile is one session. Two records matching this label pair means something outside `rt`
+# created one, and answering from the first would report a state over a scope not established.
+FAKE_TEMPLATE_OUT='false|Watching|true|true|
+false|HaltedOnRootEmptied|true|true|'
+chk "7a2 two sessions matching one profile's labels -> unknown, not first-one-wins" \
+    "$([ "$(_sync_status)" = "unknown" ] && echo 0 || echo 1)" "got $(_sync_status)"
 
 FAKE_TEMPLATE_OUT=""
 chk "7b no session -> none" "$([ "$(_sync_status)" = "none" ] && echo 0 || echo 1)" "got $(_sync_status)"
@@ -274,18 +301,23 @@ FAKE_MUTAGEN_RC=0
 # The error message may itself contain '|'; it is the LAST field, so it must not shift the others.
 FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|scan error: a|b|c'
 chk "7e a '|' inside the error text does not corrupt the classification" \
-    "$([ "$(_sync_status)" = "halted" ] && echo 0 || echo 1)" "got $(_sync_status)"
+    "$([ "$(_sync_status)" = "erroring" ] && echo 0 || echo 1)" "got $(_sync_status)"
 chk "7f ... and the full error is recoverable for the message" \
     "$([ "$(_sync_last_error)" = "scan error: a|b|c" ] && echo 0 || echo 1)" "got '$(_sync_last_error)'"
 
-# A halted session does not FAIL a flush, it HANGS (measured: `mutagen sync flush` still running
-# after 15s on a breaker-halted session). So without a fail-fast it burns RT_FLUSH_TIMEOUT and
-# returns 3 — "the daemon is still syncing" — and `rt exec` continues on 3. That is the
-# fail-open: a command running against stale code behind a reassuring warning.
-FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count'
-_sync_flush >/dev/null 2>&1; rc=$?
-chk "7g a HALTED session -> flush returns 2 (nothing synced), never 3 (still working)" \
-    "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+# A non-converging session does not FAIL a flush, it HANGS (measured: `mutagen sync flush` still
+# running after 15s on a breaker-halted session). So without a fail-fast it burns
+# RT_FLUSH_TIMEOUT and returns 3 — "the daemon is still syncing" — and `rt exec` continues on 3.
+# That is the fail-open: a command running against stale code behind a reassuring warning.
+for rec in \
+  'false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count' \
+  'false|HaltedOnRootEmptied|true|true|' \
+; do
+  FAKE_TEMPLATE_OUT="$rec"
+  _sync_flush >/dev/null 2>&1; rc=$?
+  chk "7g [$(echo "$rec" | cut -d'|' -f2)] flush returns 2 (nothing synced), never 3 (still working)" \
+      "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+done
 # 7h also passes with the `unknown` branch reverted — the stubbed mutagen fails inside
 # `_run_bounded` too, so flush reaches 2 by the other road. It pins the OUTCOME (an unaskable
 # daemon is never a benign flush), not the branch; 7c is what pins the branch.
@@ -314,12 +346,12 @@ else
        --max-entry-count=2 "$SCRATCH/live/a" "$SCRATCH/live/b" >/dev/null 2>&1; then
     RT_HOST_GROUP=rtcanary; RT_PROFILE_NAME=breaker
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      [ "$(_sync_status)" = "halted" ] && break
+      [ "$(_sync_status)" = "erroring" ] && break
       sleep 1
     done
     live="$(_sync_status)"
-    chk "8 a REAL breaker-halted session classifies as halted, not active" \
-        "$([ "$live" = "halted" ] && echo 0 || echo 1)" "classified '$live'"
+    chk "8 a REAL entry-count breaker session classifies as erroring, not active" \
+        "$([ "$live" = "erroring" ] && echo 0 || echo 1)" "classified '$live'"
     chk "8b ... and the live error text is reported" \
         "$(if [[ "$(_sync_last_error)" == *"entry count"* ]]; then echo 0; else echo 1; fi)" \
         "got '$(_sync_last_error)'"
@@ -328,11 +360,60 @@ else
     chk "8c ... and flush REFUSES it (rc 2) instead of waiting out the bound" \
         "$([ "$rc" = 2 ] && [ $((t1-t0)) -lt 3 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
     mutagen sync terminate --label-selector "$LIVE_SEL" >/dev/null 2>&1
-    RT_HOST_GROUP=h; RT_PROFILE_NAME=p
   else
-    printf '  SKIP 8 live Mutagen classification (could not create a probe session)\n'
+    printf '  SKIP 8 live entry-count classification (could not create a probe session)\n'
   fi
+
+  # The state that broke the first version of this fix, driven for real: a Mutagen SAFETY BRAKE
+  # reports an empty .LastError with both endpoints connected, so an error-only classifier calls
+  # it healthy. This is the check that says the measured shape is still the shipped shape.
+  mutagen sync terminate --label-selector "$LIVE_SEL" >/dev/null 2>&1
+  rm -rf "$SCRATCH/live2"; mkdir -p "$SCRATCH/live2/a" "$SCRATCH/live2/b"
+  for i in 1 2 3; do echo "keepme$i" > "$SCRATCH/live2/a/f$i.txt"; done
+  if mutagen sync create --name=rt-canary--breaker \
+       --label='rt-host=rtcanary' --label='rt-profile=breaker' \
+       "$SCRATCH/live2/a" "$SCRATCH/live2/b" >/dev/null 2>&1; then
+    RT_HOST_GROUP=rtcanary; RT_PROFILE_NAME=breaker
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ "$(_sync_status)" = "active" ] && break
+      sleep 1
+    done
+    rm -f "$SCRATCH/live2/a"/*.txt      # one-sided root emptying
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      [ "$(_sync_status)" = "halted" ] && break
+      sleep 1
+    done
+    live="$(_sync_status)"
+    chk "8d a REAL safety-brake halt classifies as halted, though its .LastError is EMPTY" \
+        "$([ "$live" = "halted" ] && echo 0 || echo 1)" "classified '$live'"
+    chk "8e ... and it really does carry no error text (the reason 8d cannot key on one)" \
+        "$([ -z "$(_sync_last_error)" ] && echo 0 || echo 1)" "got '$(_sync_last_error)'"
+    mutagen sync terminate --label-selector "$LIVE_SEL" >/dev/null 2>&1
+  else
+    printf '  SKIP 8d live safety-brake classification (could not create a probe session)\n'
+  fi
+  RT_HOST_GROUP=h; RT_PROFILE_NAME=p
 fi
+
+# ── 8f. `exec` must not run when the sync state could not be established ──────
+#
+# Found by an INDEPENDENT REVIEW of this session's own change, not by the suite. `_has_sync` is
+# a boolean and cannot carry "I could not find out": it returns false for `unknown`, and
+# `cmd_exec` gated its whole flush block on `_has_sync`, so an unaskable daemon skipped the
+# flush and ran the command with no warning — the most permissive path taken for the least
+# established state. The classification was right and the consumer ignored it.
+_sync_status() { echo "${FAKE_STATUS:-active}"; }
+_ssh_test() { return 0; }
+_exec_sync() { echo "RAN_THE_COMMAND"; }
+_exec_bg()   { echo "RAN_THE_COMMAND"; }
+load_config() { :; }
+out=$( FAKE_STATUS=unknown; cmd_exec "echo hi" 2>&1 ); rc=$?
+chk "8f exec REFUSES when the sync state could not be established" \
+    "$([ "$rc" != 0 ] && ! grep -q RAN_THE_COMMAND <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 160 <<< "$out")"
+out=$( FAKE_STATUS=unknown; cmd_exec --no-flush "echo hi" 2>&1 ); rc=$?
+chk "8g ... unless --no-flush says the caller meant the remote as it stands" \
+    "$(grep -q RAN_THE_COMMAND <<< "$out" && echo 0 || echo 1)" "rc=$rc out=$(head -c 160 <<< "$out")"
 
 # ── 9. `status --all` enumerates CONFIGURED profiles ─────────────────────────
 #

@@ -186,18 +186,24 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
    - **The wedge is cross-project.** All profiles share ONE Mutagen daemon (and, per host, one mount), so a runaway sync in *one* profile stalls *every* profile's flush, not just its own. `rt` now caps each session with `--max-entry-count` (default 50000, override `MUTAGEN_MAX_ENTRY_COUNT`, empty disables) so a runaway **halts itself** instead of taking the daemon down — a *halted* session with a huge entry count in `mutagen sync list` is the tell; fix its `MUTAGEN_IGNORE` and recreate. The cap backstops ignore hygiene, it doesn't replace it (on ceph-fuse even a few-thousand-file dir hurts below the cap).
    - When the sync itself is wedged, a **direct `ssh <host>` bypasses `rt` entirely** (and skips the flush) — the fastest escape for read-only/inspection work.
 
-5. **Connection issues — `rt status` reports one of six sync states, and they need different responses.** A flush fails fast (rc 2, nothing synchronised) on `paused`, `halted` and `unknown`; `exec` refuses on rc 2 and `slurm submit` refuses on 2 and 3.
+5. **Connection issues — `rt status` reports one of seven sync states, and they need different responses.** A flush fails fast (rc 2, nothing synchronised) on `paused`, `halted`, `erroring` and `unknown`; `exec` refuses on rc 2 and on `unknown`, and `slurm submit` refuses on rc 2 and 3.
 
    | `sync=` | means | what fixes it |
    |---|---|---|
-   | `active` | connected, scanning/watching normally | — |
-   | `offline` | an endpoint is disconnected | check network; `rt sync flush` to retry |
+   | `active` | connected, and the status verb is one this tool recognises as healthy | — |
+   | `offline` | an endpoint is disconnected, or still connecting | check network; `rt sync flush` to retry |
    | `paused` | someone paused it | **`rt connect` resumes it** |
-   | `halted` | connected, but Mutagen has a live error and is synchronising **nothing** | see below — `connect` cannot fix it |
+   | `erroring` | connected, but Mutagen has a live error and is synchronising **nothing** | usually the entry-count breaker — see below |
+   | `halted` | Mutagen hit a **safety brake**: a root was emptied, deleted, or changed type | needs a human decision — see below |
    | `none` | no session for this profile | `rt connect` |
-   | `unknown` | the Mutagen daemon could not be asked, so **no claim is made either way** | `mutagen daemon start`, then retry |
+   | `unknown` | the daemon could not be asked, answered ambiguously, or reported a status verb this tool does not recognise — **no claim is made either way** | `mutagen daemon start`; if it persists, `rt` may be older than your Mutagen |
 
-   **`halted` was previously reported as `active`.** The classifier decided health from the absence of two strings, and the entry-count circuit breaker reports `Connected: Yes` on both endpoints with `Status: Waiting … for rescan` — so a session synchronising nothing read as healthy, and this document used to tell you it would show as `paused`. It does not, and `rt connect` does **not** recover it: a halted session is not paused, so there is nothing to resume. Flushing one does not fail either — measured, it **hangs**. Fix the cause (usually a heavy dir missing from `MUTAGEN_IGNORE`; or raise `MUTAGEN_MAX_ENTRY_COUNT`) and then **recreate** the session with `rt disconnect && rt connect` — editing `MUTAGEN_IGNORE` alone does nothing, because ignores are applied only at session-create time. `rt status` prints the live error next to the state.
+   **Both `erroring` and `halted` used to be reported as `active`.** The classifier decided health from the *absence* of two strings, so every state Mutagen has that those strings do not name read as healthy. Two measured examples: the entry-count breaker reports `Connected: Yes` on both endpoints with `Status: Waiting … for rescan`; and all three safety brakes (`HaltedOnRootEmptied`, `HaltedOnRootDeletion`, `HaltedOnRootTypeChange`) report `Connected: Yes` on both endpoints with an **empty** last-error field. Classification is now positive: `active` requires a recognised healthy verb, and anything unrecognised is `unknown`.
+
+   `rt connect` does **not** recover either state — neither is paused, so there is nothing to resume — and flushing them does not fail, it **hangs** (measured). The remedies differ, which is why they are separate states:
+
+   - **`erroring`** — fix the cause (usually a heavy dir missing from `MUTAGEN_IGNORE`, or raise `MUTAGEN_MAX_ENTRY_COUNT`), then **recreate**: `rt disconnect && rt connect`. Editing `MUTAGEN_IGNORE` alone does nothing, because ignores are applied only at session-create time. `rt status` prints the live error beside the state.
+   - **`halted`** — do **not** recreate the session to clear it. The brake fired because one root's contents vanished or changed type, and clearing it decides which side wins. Inspect with `rt sync status`, then recover deliberately with `mutagen sync reset --label-selector="rt-host=<host>,rt-profile=<profile>"` or by reconciling the two roots by hand.
 
 6. **Missing dependencies** — If `rt check` reports "not found", **do not attempt to sudo install**. Tell the user to run the install commands.
 
