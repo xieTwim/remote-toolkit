@@ -68,6 +68,26 @@ Then refer to it as `hpc/train`:
 
 Disconnecting only terminates the sync session. Your local replica at `~/Work/Remote/hpc/train/` is preserved — say "connect hpc/train" to reconnect. To add another workspace on the same cluster (e.g. `hpc/eval`), CC just creates a new `<profile>.conf` under `~/.config/remote-toolkit/hpc/`; the existing `host.conf` is reused.
 
+### A flush is not a proof of arrival
+
+`rt sync flush` forces a synchronization **cycle**. It does not compare content, and it does not
+prove the two sides are equal — confirmed against the real engine, a session with an unresolved
+conflict and a session with an ignored path **both flush with exit 0 while the endpoints differ**.
+So "flush returned 0" means a cycle completed, not "the remote has my file", and `sleep N` means
+even less.
+
+When it matters that a specific file has actually landed — you are about to launch it, submit it,
+or copy it into place — assert it:
+
+```bash
+rt -p hpc/train verify train.py configs/run.yaml
+```
+
+It hashes those paths on both sides and waits until they match (default 60s). `0` = equal and
+stable, `2` = blocked or unverifiable (bad/ignored path, sync not propagating, no hashing tool),
+`3` = still different at the deadline. A `3` means non-arrival; it is **not** a promise that sync
+is still working on it.
+
 ### What does not sync
 
 The local replica is **not** a full copy of the remote directory. Every profile is created with this default ignore set, and files under these paths never cross in either direction:

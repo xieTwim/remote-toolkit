@@ -128,6 +128,34 @@ These are **regular local directories**, not network mounts. Read / Edit / Write
 
 Mutagen syncs changes to and from the remote in the background (typically < 1s for small files). Use `rt sync flush` to force reconciliation; `rt sync status` for diagnostics.
 
+#### Before you launch anything from a file you just edited: `rt verify`
+
+**A returned flush does NOT mean the two sides are equal, and nothing about a flush ever claimed it did.** `mutagen sync flush` forces a synchronization *cycle*; it does not compare content. Confirmed against the real engine: a session with an unresolved conflict, and a path under an ignore rule, **both flush with exit 0 while the endpoints differ**. `rt sync flush` returning 0 therefore means "a cycle completed", not "the remote has your file".
+
+This is not academic. A patched launcher was staged, waited on with a fixed `sleep 10`, and the still-stale remote copy was copied into place; `bash -n` passed because the *old* file is also valid shell, so the run started, died instantly on an unknown case, and held 8 GPUs idle for ~25 minutes.
+
+`rt verify` is the assertion that a flush is not:
+
+```bash
+rt -p wxg-cvm/train verify train.py configs/run.yaml     # waits (default 60s) until they match
+rt -p wxg-cvm/train verify --timeout 5 --interval 1 launch.sh
+```
+
+It hashes each path locally, has the remote hash the same paths, and compares — including recomputing the local side afterwards, so a file edited mid-check is not certified. Exit codes mirror the flush codes:
+
+| rc | meaning |
+|---|---|
+| 0 | equality **observed**, and stable across the check |
+| 2 | **blocked or unverifiable** — bad/absent/ignored path, a symlink or directory, no sync session, sync not propagating, or no sha256 tool on either side. Waiting cannot help. |
+| 3 | the deadline elapsed and the sides still differ. **Non-arrival — not evidence that sync is still working on it.** |
+
+Rules it enforces, each because the alternative is a false "arrived":
+- Paths are **relative to the profile root**, regular files only. Directories and symlinks are refused rather than guessed at.
+- A path matching the **live session's ignore rules** is refused immediately: it can never arrive by syncing, so waiting for it waits forever. (The ignore matching covers the pattern shapes `rt` itself generates. A match is authoritative; a non-match claims nothing, which is why an unexplained difference is reported as "not equal by the deadline" and never as "still converging".)
+- A missing hashing tool is **unverifiable**, never a mismatch and never an arrival.
+
+Use it before `cp`-ing a staged file into place, before `rt slurm submit`, and before any `exec --bg` that launches code you just edited.
+
 #### What does NOT sync — read this before looking for a result that never arrived
 
 **Sync is not the whole directory.** Every profile is created with this default ignore set, and a file under any of these paths never becomes part of the local replica in either direction:

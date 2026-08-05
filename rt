@@ -19,6 +19,9 @@ _reset() { _color 0; }
 info()  { _color 32; printf ':: %s\n' "$*" >&2; _reset; }
 warn()  { _color 33; printf '!! %s\n' "$*" >&2; _reset; }
 die()   { _color 31; printf 'ERROR: %s\n' "$*" >&2; _reset; exit 1; }
+# Same, but exit 2. `rt verify` promises exactly three statuses — 0 equal, 2 blocked or
+# unverifiable, 3 not equal at the deadline — so it must never leak the generic 1.
+die2()  { _color 31; printf 'ERROR: %s\n' "$*" >&2; _reset; exit 2; }
 
 # ── Platform detection ────────────────────────────────────────────
 RT_OS="$(uname -s)"   # "Linux" or "Darwin"
@@ -1402,6 +1405,202 @@ _sync_report_ignores() {
   fi
 }
 
+# ── verify: the arrival assertion ──────────────────────────────────────────────
+#
+# Nothing told a caller when a staged file had actually ARRIVED, so callers slept a fixed
+# interval and then used whatever was there. Measured 2026-08-01: a patched launcher was staged,
+# waited on for ten seconds, and the still-stale remote copy was copied into place. `bash -n`
+# passed because the OLD file is valid shell, so the run started, died instantly on an unknown
+# case, and held 8 GPUs idle for ~25 minutes.
+#
+# A returned flush is NOT the missing signal. Flush forces a synchronization CYCLE; it does not
+# prove the endpoints are equal, and both an unresolved conflict and an ignored path flush with
+# exit 0 while the two sides differ. The only thing that establishes arrival is CONTENT: hash
+# the launch set here, make the remote hash the same paths, and compare.
+#
+# Scope, per the human ruling of 2026-08-05: this is the arrival assertion only. The per-run
+# staging wrapper the design note proposes is a separate, larger decision and is not this.
+
+# Digest one file, reading from stdin so the filename never reaches the tool's output and the
+# two platforms' differing output formats do not have to be reconciled. Linux has sha256sum;
+# macOS has only shasum. Missing BOTH is "unverifiable", never "mismatch".
+_sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum < "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 < "$1" | awk '{print $1}'
+  else
+    return 97
+  fi
+}
+
+# "<digest>  <relative-path>" per path, in the caller's order. The PATH is bound into the record
+# so that renaming or swapping two files cannot produce an equal manifest.
+_local_digests() {
+  local p h
+  for p in "$@"; do
+    h=$(_sha256_file "${LOCAL_DIR}/${p}") || return 97
+    printf '%s  %s\n' "$h" "$p"
+  done
+}
+
+# The same thing, as one remote shell program. A path that is absent remotely yields MISSING
+# rather than nothing: an empty line would compare equal to another empty line, and "absent on
+# both sides" is not the question being asked.
+_remote_digest_cmd() {
+  local p out
+  out='if command -v sha256sum >/dev/null 2>&1; then RTH=sha256sum; '
+  out+='elif command -v shasum >/dev/null 2>&1; then RTH="shasum -a 256"; '
+  out+='else echo RT_NO_SHA_TOOL; exit 97; fi; '
+  out+="cd $(_shq "$REMOTE_DIR") || { echo RT_NO_REMOTE_DIR; exit 98; }; "
+  for p in "$@"; do
+    out+="if [ -f $(_shq "$p") ]; then "
+    out+="printf '%s  %s\\n' \"\$(\$RTH < $(_shq "$p") | awk '{print \$1}')\" $(_shq "$p"); "
+    out+="else printf 'MISSING  %s\\n' $(_shq "$p"); fi; "
+  done
+  printf '%s' "$out"
+}
+
+# Is this path excluded by the LIVE session's ignore rules? A match here is authoritative: the
+# file can never arrive, so waiting for it is waiting forever.
+#
+# This deliberately implements only the pattern SHAPES `rt` itself generates — `dir/`, `*.ext`,
+# and a bare name — not Mutagen's full ignore grammar. So a MATCH is a fact and a NON-MATCH
+# claims nothing: an unexplained mismatch is reported as "not equal by the deadline", never as
+# "still converging". Reimplementing the whole matcher in Bash would produce a checker that is
+# confidently wrong, which is worse than one with a stated bound.
+_ignored_reason() {
+  local path="$1" pat base
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] || continue
+    if [[ "$pat" == */ ]]; then
+      base="${pat%/}"
+      case "/$path/" in */"$base"/*) printf '%s' "$pat"; return 0 ;; esac
+    elif [[ "$pat" == \** ]]; then
+      # shellcheck disable=SC2254
+      case "${path##*/}" in $pat) printf '%s' "$pat"; return 0 ;; esac
+    else
+      case "/$path" in */"$pat") printf '%s' "$pat"; return 0 ;; esac
+    fi
+  done < <(_sync_live_ignores)
+  return 1
+}
+
+# EXIT CODES, deliberately the same three-way split the flush codes use:
+#   0  equality OBSERVED, and observed to be stable across the check.
+#   2  BLOCKED or unverifiable — a bad path, an ignored path, no sync session, no hashing tool
+#      on the remote. Waiting longer cannot help.
+#   3  the deadline elapsed while the two sides still differed. This says non-arrival; it does
+#      NOT claim the daemon is still making progress, because a mismatch is not evidence of that.
+cmd_verify() {
+  load_config
+
+  local timeout_s=60 interval=2
+  local paths=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)   timeout_s="$2"; shift 2 ;;
+      --timeout=*) timeout_s="${1#--timeout=}"; shift ;;
+      --interval)  interval="$2"; shift 2 ;;
+      --interval=*) interval="${1#--interval=}"; shift ;;
+      --)          shift; paths+=("$@"); break ;;
+      -*)          die2 "Unknown flag: $1" ;;
+      *)           paths+=("$@"); break ;;
+    esac
+  done
+
+  [[ ${#paths[@]} -gt 0 ]] \
+    || die2 "Usage: rt verify [--timeout SECS] [--interval SECS] <path>... (paths are relative to the profile root)"
+  [[ "$timeout_s" =~ ^[0-9]+$ ]]  || die2 "--timeout takes whole seconds, got '$timeout_s'."
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die2 "--interval takes whole seconds greater than zero, got '$interval'."
+
+  # Every reason a path can never be verified is decided HERE, before any waiting. A caller that
+  # waits 60 seconds to be told its path was misspelled has been told the wrong thing slowly.
+  local p reason
+  for p in "${paths[@]}"; do
+    [[ "$p" != /* ]]      || die2 "verify takes paths RELATIVE to the profile root, got absolute '$p'. (Local root: $LOCAL_DIR)"
+    [[ "$p" != *..* ]]    || die2 "Path escapes the profile root: '$p'"
+    [[ -n "$p" ]]         || die2 "Empty path"
+    [[ ! -L "${LOCAL_DIR}/${p}" ]] \
+      || die2 "'$p' is a symlink. Hashing the link text would not prove what the remote launches, and following it would not prove the link. Verify the target by its own path."
+    [[ ! -d "${LOCAL_DIR}/${p}" ]] \
+      || die2 "'$p' is a directory. Verify the files you are about to launch, by name — a recursive manifest brings in ordering, ignored descendants and mid-check mutation, which is a larger decision than this."
+    [[ -f "${LOCAL_DIR}/${p}" ]] \
+      || die2 "'$p' does not exist locally (looked in $LOCAL_DIR). Local is the authority for what you are staging; there is nothing to assert about."
+    if reason=$(_ignored_reason "$p"); then
+      warn "[$RT_PROFILE] '$p' matches the live session's ignore rule '${reason}'."
+      die2 "That path is excluded from sync, so it can NEVER arrive by syncing and waiting for it would wait forever. Stage it another way, or remove the rule and recreate the session."
+    fi
+  done
+
+  local st
+  st=$(_sync_status)
+  case "$st" in
+    none)    die2 "[$RT_PROFILE] No sync session, so nothing is propagating these files. 'rt -p $RT_PROFILE connect' first." ;;
+    unknown) die2 "[$RT_PROFILE] Could not establish the sync session's state, so this cannot report on arrival either." ;;
+    paused|halted|erroring)
+      die2 "[$RT_PROFILE] Sync is '$st' and is propagating nothing, so these files will not arrive. 'rt -p $RT_PROFILE sync status' says why." ;;
+  esac
+
+  local remote_cmd deadline now
+  remote_cmd=$(_remote_digest_cmd "${paths[@]}")
+  now=$(date +%s); deadline=$(( now + timeout_s ))
+
+  local local1 local2 remote rrc
+  while :; do
+    # L1, R, then L2. Accepting only L1 == R == L2 means a file edited DURING the check cannot
+    # be certified: the local side moved, so the remote digest describes neither state. The
+    # contract is "equality was observed and held across the check", not "these bytes are now
+    # frozen" — nothing here can promise the second.
+    local1=$(_local_digests "${paths[@]}") \
+      || die2 "[$RT_PROFILE] No sha256 tool locally (need sha256sum or shasum). Cannot verify — this is unverifiable, not a mismatch."
+
+    rrc=0
+    remote=$(_ssh "$remote_cmd" 2>/dev/null) || rrc=$?
+    if grep -q '^RT_NO_SHA_TOOL' <<< "$remote"; then
+      die2 "[$RT_PROFILE] The remote has neither sha256sum nor shasum, so arrival cannot be established there. Unverifiable, NOT a mismatch."
+    fi
+    if grep -q '^RT_NO_REMOTE_DIR' <<< "$remote"; then
+      die2 "[$RT_PROFILE] Remote directory does not exist: $REMOTE_DIR"
+    fi
+    if (( rrc != 0 )) && [[ -z "$remote" ]]; then
+      die2 "[$RT_PROFILE] Could not read digests from the remote (ssh exit $rrc). Unverifiable, NOT a mismatch."
+    fi
+
+    local2=$(_local_digests "${paths[@]}") || die2 "[$RT_PROFILE] No sha256 tool locally."
+
+    if [[ "$local1" == "$local2" && "$local1" == "$remote" ]]; then
+      info "[$RT_PROFILE] ARRIVED: ${#paths[@]} path(s) are byte-identical on both sides."
+      return 0
+    fi
+
+    now=$(date +%s)
+    if (( now >= deadline )); then
+      if [[ "$local1" != "$local2" ]]; then
+        warn "[$RT_PROFILE] The local files kept changing during every attempt, so no stable state was ever compared."
+        return 3
+      fi
+      warn "[$RT_PROFILE] NOT ARRIVED after ${timeout_s}s. These differ:"
+      # Report per path, so the caller learns WHICH file and whether it is absent or different.
+      local line want got
+      while IFS= read -r line; do
+        want="${line%%  *}"; p="${line#*  }"
+        got=$(grep -F "  $p" <<< "$remote" | head -1)
+        got="${got%%  *}"
+        [[ "$want" == "$got" ]] && continue
+        if [[ "$got" == "MISSING" ]]; then
+          printf '    %-40s absent on the remote\n' "$p" >&2
+        else
+          printf '    %-40s differs (local %s… remote %s…)\n' "$p" "${want:0:8}" "${got:0:8}" >&2
+        fi
+      done <<< "$local1"
+      warn "[$RT_PROFILE] A mismatch is NOT evidence that sync is still working on it — check 'rt -p $RT_PROFILE sync status'."
+      return 3
+    fi
+    sleep "$interval"
+  done
+}
+
 # ── Slurm subcommand (opt-in via SLURM_ENABLED=1) ─────────────────
 cmd_slurm() {
   load_config
@@ -1609,6 +1808,13 @@ COMMANDS:
   logs <job_id> -f     Follow (tail -f) a background job's output
   status               Show sync + SSH state for current profile
   status --all         Show all profiles
+  verify <path>...     Assert that these paths have ARRIVED: hash them locally,
+                       make the remote hash the same paths, compare. Waits until
+                       they match. 0 = equal, 2 = blocked/unverifiable, 3 = still
+                       different at the deadline. A returned flush does NOT prove
+                       equality; this does.
+  verify --timeout N --interval N <path>...
+                       Bound the wait (default 60s, polling every 2s)
   sync flush           Force sync to reconcile now
   sync status          Detailed Mutagen sync state for this profile
   slurm submit <script> [-- sbatch_args...]
@@ -1701,6 +1907,7 @@ main() {
     status)        cmd_status "$@" ;;
     logs)          cmd_logs "$@" ;;
     sync)          cmd_sync "$@" ;;
+    verify)        cmd_verify "$@" ;;
     slurm)         cmd_slurm "$@" ;;
     help|--help|-h) cmd_help ;;
     *)             die "Unknown command: $subcmd. Run 'rt help' for usage." ;;

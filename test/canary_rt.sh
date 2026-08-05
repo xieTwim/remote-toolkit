@@ -838,6 +838,131 @@ DOCS_DIR="$(dirname "$HERE")"
 chk "14h the docs name the macOS timeout(1) trap at the bounded-read path" \
     "$(grep -q 'gtimeout' "$DOCS_DIR/SKILL.md" && grep -q 'timeout' "$DOCS_DIR/README.md" && echo 0 || echo 1)"
 
+# ── 15. `rt verify` — the arrival assertion ──────────────────────────────────
+#
+# Nothing told a caller when a staged file had actually ARRIVED, so callers slept a fixed
+# interval and used whatever was there. Measured 2026-08-01: a patched launcher was staged,
+# waited on for ten seconds, and the still-stale remote copy was copied into place. `bash -n`
+# passed because the OLD file is valid shell, so the run started, died instantly, and held 8
+# GPUs idle for ~25 minutes. A returned flush was never the missing signal — it forces a sync
+# CYCLE and does not prove the endpoints are equal.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="/remote/proj"
+LOCAL_DIR="$SCRATCH/vlocal"; rm -rf "$LOCAL_DIR"; mkdir -p "$LOCAL_DIR/sub"
+info() { :; }; warn() { :; }
+load_config() { :; }
+_sync_status() { echo "${FAKE_STATUS:-active}"; }
+_sync_live_ignores() { printf 'outputs/\n*.pyc\nCLAUDE.md\n'; }
+
+printf 'launcher v2\n' > "$LOCAL_DIR/launch.sh"
+printf 'config A\n'    > "$LOCAL_DIR/sub/cfg.yaml"
+
+# The stub plays the REMOTE side: it answers with whatever manifest the test dictates.
+_ssh() { printf '%s\n' "$FAKE_REMOTE"; return "${FAKE_SSH_RC:-0}"; }
+FAKE_SSH_RC=0
+_mk_remote() { _local_digests "$@"; }        # remote agrees with local
+
+FAKE_REMOTE="$(_mk_remote launch.sh sub/cfg.yaml)"
+( cmd_verify --timeout 0 launch.sh sub/cfg.yaml ) >/dev/null 2>&1
+chk "15 identical content on both sides verifies (rc 0)" "$([ $? -eq 0 ] && echo 0 || echo 1)"
+
+# The incident: the remote still holds the OLD file. Valid shell, wrong content.
+FAKE_REMOTE="$(printf '%s  launch.sh\n' "$(printf 'launcher v1\n' | shasum -a 256 | awk '{print $1}')")
+$(_local_digests sub/cfg.yaml)"
+out=$( cmd_verify --timeout 0 launch.sh sub/cfg.yaml 2>&1 ); rc=$?
+chk "15b a stale remote copy is NOT arrival (rc 3)" "$([ "$rc" = 3 ] && echo 0 || echo 1)" "rc=$rc"
+chk "15c ... and the differing path is named" \
+    "$(grep -q 'launch.sh.*differs' <<< "$out" && echo 0 || echo 1)" "$(head -c 200 <<< "$out")"
+
+FAKE_REMOTE="MISSING  launch.sh
+$(_local_digests sub/cfg.yaml)"
+out=$( cmd_verify --timeout 0 launch.sh sub/cfg.yaml 2>&1 ); rc=$?
+chk "15d a path absent on the remote is reported as absent, not as a mismatch" \
+    "$([ "$rc" = 3 ] && grep -q 'launch.sh.*absent' <<< "$out" && echo 0 || echo 1)" "rc=$rc"
+
+# The remote holds the right BYTES under the wrong NAMES. Worth pinning on its own: "both files
+# are present and every digest I expected exists somewhere" is the shape a sloppier check would
+# accept, and the caller would launch the wrong file.
+#
+# What actually catches it is not stated as path binding: a mutation run showed this check still
+# passes with the path removed from the manifest, because the two manifests then differ in
+# format and order anyway. The path in each line earns its place by making the PER-FILE
+# diagnosis possible — 15c and 15d are the checks that fail when it is removed.
+printf 'launcher v2\n' > "$LOCAL_DIR/a.sh"; printf 'config A\n' > "$LOCAL_DIR/b.sh"
+FAKE_REMOTE="$(printf '%s  a.sh\n%s  b.sh\n' \
+  "$(printf 'config A\n'   | shasum -a 256 | awk '{print $1}')" \
+  "$(printf 'launcher v2\n' | shasum -a 256 | awk '{print $1}')")"
+( cmd_verify --timeout 0 a.sh b.sh ) >/dev/null 2>&1
+chk "15e the right bytes under the wrong names do not verify" \
+    "$([ $? -eq 3 ] && echo 0 || echo 1)"
+
+# Everything that can NEVER be verified is decided before any waiting, and exits 2 — not 1, and
+# never 3, because 3 means "not yet" and would invite a caller to retry forever.
+FAKE_REMOTE="$(_mk_remote launch.sh)"
+mkdir -p "$LOCAL_DIR/outputs"; printf 'x\n' > "$LOCAL_DIR/outputs/res.txt"
+ln -sf launch.sh "$LOCAL_DIR/link.sh"
+for c in "outputs/res.txt:an ignored path" "/etc/passwd:an absolute path" "../x:a traversal" \
+         "sub:a directory" "link.sh:a symlink" "nope.txt:a path absent locally"; do
+  path="${c%%:*}"; what="${c#*:}"
+  ( cmd_verify --timeout 0 "$path" ) >/dev/null 2>&1
+  chk "15f [$what] is refused with rc 2 (blocked), not 1 and not 3" \
+      "$([ $? -eq 2 ] && echo 0 || echo 1)"
+done
+
+# A remote with no hashing tool is UNVERIFIABLE. Reporting it as a mismatch would be a lie in
+# the dangerous direction; reporting it as arrival would be worse.
+FAKE_REMOTE="RT_NO_SHA_TOOL"
+( cmd_verify --timeout 0 launch.sh ) >/dev/null 2>&1
+chk "15g a remote with no sha256 tool is unverifiable (rc 2), never a mismatch or an arrival" \
+    "$([ $? -eq 2 ] && echo 0 || echo 1)"
+
+# A session that is propagating nothing cannot deliver these files, so waiting is pointless.
+FAKE_REMOTE="$(_mk_remote launch.sh)"
+for st in none unknown paused halted erroring; do
+  ( FAKE_STATUS=$st; cmd_verify --timeout 0 launch.sh ) >/dev/null 2>&1
+  chk "15h sync=$st refuses immediately (rc 2) rather than waiting for what cannot come" \
+      "$([ $? -eq 2 ] && echo 0 || echo 1)"
+done
+
+# A file edited DURING the check cannot be certified: the local side moved, so the remote digest
+# describes neither state. The contract is "equality was observed and held", not "these bytes
+# are frozen" — nothing here can promise the second.
+FAKE_STATUS=active
+FAKE_REMOTE="$(_mk_remote launch.sh)"
+# The call counter lives in a FILE. `cmd_verify` reads these through `$( )`, so a shell variable
+# would be incremented in a subshell and every call would look like the first — which is exactly
+# what happened, and made this check pass an implementation that never compared L1 against L2.
+printf '0' > "$SCRATCH/ldcalls"
+_local_digests() {           # returns a DIFFERENT manifest on the second call of each round
+  local n; n=$(( $(cat "$SCRATCH/ldcalls") + 1 )); printf '%s' "$n" > "$SCRATCH/ldcalls"
+  if [ $((n % 2)) -eq 0 ]; then printf 'deadbeef  launch.sh\n'
+  else printf '%s\n' "$FAKE_REMOTE"; fi
+}
+out=$( cmd_verify --timeout 0 launch.sh 2>&1 ); rc=$?
+chk "15i a file that changes mid-check is not certified" "$([ "$rc" = 3 ] && echo 0 || echo 1)" "rc=$rc"
+
+# Many hosts print a banner or an MOTD on stdout. It must not be mistaken for a digest. The
+# comparison is whole-manifest equality, so extra output can only make the sides UNEQUAL — a
+# false negative, in the safe direction. Pinned so a future "be tolerant of leading noise"
+# change has to argue with a check rather than slip past one.
+# Re-source to get the REAL `_local_digests` back. `unset -f` would not do it: the stub above
+# replaced rt's own definition rather than shadowing it, so unsetting leaves nothing behind and
+# the check fails with "command not found" — fail-safe, but not the path being tested.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="/remote/proj"; LOCAL_DIR="$SCRATCH/vlocal"
+info() { :; }; warn() { :; }; load_config() { :; }
+_sync_status() { echo active; }
+_sync_live_ignores() { printf 'outputs/\n*.pyc\nCLAUDE.md\n'; }
+_ssh() { printf '%s\n' "$FAKE_REMOTE"; return 0; }
+FAKE_REMOTE="Welcome to the cluster
+Last login: never
+$(_local_digests launch.sh)"
+out=$( cmd_verify --timeout 0 launch.sh 2>&1 ); rc=$?
+chk "15j a login banner on the remote's stdout does not read as an arrival" \
+    "$([ "$rc" -eq 3 ] && echo 0 || echo 1)" "rc=$rc out=$(head -c 200 <<< "$out")"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1
