@@ -740,12 +740,17 @@ chk "13b two job ids arrive as exactly two arguments" \
     "$([ "$argv" = "ARG[123] ARG[456_7] " ] && echo 0 || echo 1)" "argv='$argv' cmd='$CAPTURED'"
 
 # The recorded attack: `rt slurm cancel '123; <command>'`. It must be refused BEFORE any ssh.
-rm -f "$SCRATCH/PWNED"
-CAPTURED="NOTHING_SENT"
+#
+# The "nothing was sent" half is asserted through the capture FILE. Asserting it through the
+# `CAPTURED` variable was vacuous: `_slurm_cancel` runs in a subshell here (it calls `die`), so
+# the variable could not have changed whatever the code did, and the follow-up then executed the
+# parent's untouched placeholder. Both halves passed for no reason.
+rm -f "$SCRATCH/PWNED" "$SCRATCH/captured"
 ( _slurm_cancel "123; touch $SCRATCH/PWNED" ) >/dev/null 2>&1; rc=$?
+sent="$(cat "$SCRATCH/captured" 2>/dev/null || true)"
 chk "13c an id carrying a command separator is REFUSED, and nothing is sent" \
-    "$([ "$rc" != 0 ] && [ "$CAPTURED" = "NOTHING_SENT" ] && echo 0 || echo 1)" "rc=$rc captured='$CAPTURED'"
-( cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$CAPTURED" ) >/dev/null 2>&1
+    "$([ "$rc" != 0 ] && [ -z "$sent" ] && echo 0 || echo 1)" "rc=$rc sent='$sent'"
+( cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$sent" ) >/dev/null 2>&1
 chk "13d ... and no injected command ran" \
     "$([ ! -e "$SCRATCH/PWNED" ] && echo 0 || echo 1)" "PWNED exists"
 
@@ -861,6 +866,26 @@ chk "14f --timeout rejects zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 ( cmd_exec --bg --timeout 5 "echo hi" ) >/dev/null 2>&1
 chk "14g --timeout with --bg is refused (a background job outlives this shell)" \
     "$([ $? -ne 0 ] && echo 0 || echo 1)"
+export PATH="$PATH_SAVE"
+
+# END-TO-END: `cmd_exec --timeout N` must actually ROUTE through the bounded helper. Checks
+# 14e-14g only pin the flag's validation, and all three pass with the whole feature reverted —
+# old `cmd_exec` rejects `--timeout` as an unknown flag, which is also non-zero.
+export PATH="$SCRATCH/bin:$PATH"
+_ssh_test() { return 0; }; _has_sync() { return 1; }; load_config() { :; }
+_sync_status() { echo none; }
+rm -f "$SCRATCH/late-write2"
+cat > "$SCRATCH/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in
+  *SLOWX*) sleep 4; echo LATE >> "$SCRATCH/late-write2" ;;
+  *)       echo REMOTE_OK ;;
+esac
+EOF
+chmod +x "$SCRATCH/bin/ssh"
+t0=$(date +%s); cmd_exec --timeout 1 "SLOWX" >/dev/null 2>&1; rc=$?; t1=$(date +%s)
+chk "14i cmd_exec --timeout routes through the bounded helper (rc 124, bound honoured)" \
+    "$([ "$rc" = 124 ] && [ $((t1-t0)) -lt 4 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
 export PATH="$PATH_SAVE"
 
 # The entry's fallback clause: say so where the bounded-read path is documented.
