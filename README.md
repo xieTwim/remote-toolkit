@@ -129,6 +129,8 @@ Reference templates: `host.conf.example` and `profile.conf.example` in the repo.
 | `rt check` says `mutagen: command not found` | Install Mutagen (see Install section) |
 | SSH connection failed | Check network: `ssh -p PORT user@host "echo ok"` |
 | `rt status` shows `sync=offline` | `rt sync flush` to retry; check network; verify `~/.ssh/config` matches the `host.conf`'s SSH params |
+| `rt status` shows `sync=halted` | Mutagen has a live error and is syncing **nothing** (the error is printed beside the state). `rt connect` cannot recover it — it is not paused, so there is nothing to resume. Fix the cause (usually a heavy dir missing from `MUTAGEN_IGNORE`, or raise `MUTAGEN_MAX_ENTRY_COUNT`), then **recreate**: `rt disconnect && rt connect`. Editing `MUTAGEN_IGNORE` alone does nothing — ignores apply only at session-create time. |
+| `rt status` shows `sync=unknown` | The Mutagen daemon could not be asked, so nothing is claimed about the session either way. `mutagen daemon start`, then retry. |
 | Mutagen connects but files don't sync | `rt sync status` for details; check `MUTAGEN_IGNORE` patterns |
 | Slurm subcommands say "not enabled" | Set `SLURM_ENABLED=1` in `host.conf` (or override in the profile config) |
 | `rt slurm submit` ran old code | Sync may not have flushed; check `rt sync status` and re-run |

@@ -219,6 +219,121 @@ chk "6b ... and SAYS what it is leaving running" \
 KILLED=""; cmd_disconnect --kill-jobs >/dev/null 2>&1
 chk "6c --kill-jobs still kills them" "$([ -n "$KILLED" ] && echo 0 || echo 1)" "KILLED=$KILLED"
 
+# ── 7. the sync classifier has a negative case ───────────────────────────────
+#
+# `_sync_status` decided health from the ABSENCE of two strings in `mutagen sync list` text, so
+# every state Mutagen has that those strings do not name was reported `active`. The one that
+# actually happens is the entry-count circuit breaker: it reports `Connected: Yes` on BOTH
+# endpoints and `Status: Waiting 5 seconds for rescan`, and classified as healthy while
+# synchronising nothing.
+#
+# Blocks 4-6 replaced `_sync_status`/`_run_bounded`/`_ssh` with stubs. Re-source to get the real
+# implementations back before testing them.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; RT_HOST_GROUP="h"; RT_PROFILE_NAME="p"; RT_SESSION_PREFIX="rt_h_p_bg_"
+info() { :; }; warn() { :; }
+
+# Stub the `mutagen` BINARY (a shell function wins over PATH) and feed back the exact template
+# records measured against real Mutagen 0.18.1, so the parse is pinned to observed output rather
+# than to output I invented.
+mutagen() { printf '%s\n' "$FAKE_TEMPLATE_OUT"; return "${FAKE_MUTAGEN_RC:-0}"; }
+FAKE_MUTAGEN_RC=0
+
+# <want> <.Paused>|<.Status>|<.Alpha.Connected>|<.Beta.Connected>|<.LastError>
+# Deliberately NOT column-aligned: the padding would land in the trailing .LastError field and
+# make three of these read as halted. The record is data, so it gets no cosmetics.
+for case in \
+  "active false|Watching|true|true|" \
+  "halted false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count" \
+  "paused true|Disconnected|false|false|" \
+  "offline false|Watching|false|true|" \
+; do
+  want="${case%% *}"; rec="${case#* }"
+  FAKE_TEMPLATE_OUT="$rec"
+  got="$(_sync_status)"
+  chk "7 [$want] a session reporting Status=$(echo "$rec" | cut -d'|' -f2) classifies as $want" \
+      "$([ "$got" = "$want" ] && echo 0 || echo 1)" "classified '$got', want '$want'"
+done
+
+FAKE_TEMPLATE_OUT=""
+chk "7b no session -> none" "$([ "$(_sync_status)" = "none" ] && echo 0 || echo 1)" "got $(_sync_status)"
+
+# POSITIVE FIXTURE for the state that did not exist before: a probe that CANNOT RUN (daemon
+# down, mutagen gone, or a future Mutagen rejecting the template) reported `none` — "there is no
+# sync session", a claim about the remote that nothing established. Without this check the new
+# `unknown` branch could be dead code and nothing would say so.
+FAKE_MUTAGEN_RC=1; FAKE_TEMPLATE_OUT=""
+chk "7c a probe that CANNOT RUN -> unknown, not none" \
+    "$([ "$(_sync_status)" = "unknown" ] && echo 0 || echo 1)" "got $(_sync_status)"
+# 7d is an INVARIANT, not a regression test: `_has_sync` excludes both `none` and `unknown`, so
+# it passes with the `unknown` branch reverted too. It is here to pin that introducing the new
+# state did not accidentally make an unaskable daemon look like a live session.
+chk "7d ... and _has_sync stays false for it" "$(_has_sync; [ $? -ne 0 ] && echo 0 || echo 1)"
+FAKE_MUTAGEN_RC=0
+
+# The error message may itself contain '|'; it is the LAST field, so it must not shift the others.
+FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|scan error: a|b|c'
+chk "7e a '|' inside the error text does not corrupt the classification" \
+    "$([ "$(_sync_status)" = "halted" ] && echo 0 || echo 1)" "got $(_sync_status)"
+chk "7f ... and the full error is recoverable for the message" \
+    "$([ "$(_sync_last_error)" = "scan error: a|b|c" ] && echo 0 || echo 1)" "got '$(_sync_last_error)'"
+
+# A halted session does not FAIL a flush, it HANGS (measured: `mutagen sync flush` still running
+# after 15s on a breaker-halted session). So without a fail-fast it burns RT_FLUSH_TIMEOUT and
+# returns 3 — "the daemon is still syncing" — and `rt exec` continues on 3. That is the
+# fail-open: a command running against stale code behind a reassuring warning.
+FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count'
+_sync_flush >/dev/null 2>&1; rc=$?
+chk "7g a HALTED session -> flush returns 2 (nothing synced), never 3 (still working)" \
+    "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+# 7h also passes with the `unknown` branch reverted — the stubbed mutagen fails inside
+# `_run_bounded` too, so flush reaches 2 by the other road. It pins the OUTCOME (an unaskable
+# daemon is never a benign flush), not the branch; 7c is what pins the branch.
+FAKE_MUTAGEN_RC=1; FAKE_TEMPLATE_OUT=""
+_sync_flush >/dev/null 2>&1; rc=$?
+chk "7h an unaskable daemon -> flush returns 2, not a benign 0" \
+    "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got $rc"
+FAKE_MUTAGEN_RC=0
+unset -f mutagen
+
+# ── 8. the same thing, against the REAL engine ───────────────────────────────
+#
+# Block 7 pins the parse; this pins that the recorded shapes are still what Mutagen emits. It is
+# the check that would have caught the original defect, so when it cannot run it must SAY so —
+# a silently-skipped block is indistinguishable from a passing one.
+if ! command -v mutagen >/dev/null 2>&1; then
+  printf '  SKIP 8 live Mutagen classification (mutagen not installed)\n'
+else
+  LIVE_SEL="rt-host=rtcanary,rt-profile=breaker"
+  mutagen sync terminate --label-selector "$LIVE_SEL" >/dev/null 2>&1
+  mkdir -p "$SCRATCH/live/a" "$SCRATCH/live/b"
+  for i in 1 2 3 4 5 6 7 8; do echo "x$i" > "$SCRATCH/live/a/f$i.txt"; done
+  # --max-entry-count=2 counts the root directory too, so 8 files trips the breaker.
+  if mutagen sync create --name=rt-canary--breaker \
+       --label='rt-host=rtcanary' --label='rt-profile=breaker' \
+       --max-entry-count=2 "$SCRATCH/live/a" "$SCRATCH/live/b" >/dev/null 2>&1; then
+    RT_HOST_GROUP=rtcanary; RT_PROFILE_NAME=breaker
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ "$(_sync_status)" = "halted" ] && break
+      sleep 1
+    done
+    live="$(_sync_status)"
+    chk "8 a REAL breaker-halted session classifies as halted, not active" \
+        "$([ "$live" = "halted" ] && echo 0 || echo 1)" "classified '$live'"
+    chk "8b ... and the live error text is reported" \
+        "$(if [[ "$(_sync_last_error)" == *"entry count"* ]]; then echo 0; else echo 1; fi)" \
+        "got '$(_sync_last_error)'"
+    # Bounded so a regression cannot hang the suite: flush must REFUSE, not wait.
+    t0=$(date +%s); RT_FLUSH_TIMEOUT=3 _sync_flush >/dev/null 2>&1; rc=$?; t1=$(date +%s)
+    chk "8c ... and flush REFUSES it (rc 2) instead of waiting out the bound" \
+        "$([ "$rc" = 2 ] && [ $((t1-t0)) -lt 3 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
+    mutagen sync terminate --label-selector "$LIVE_SEL" >/dev/null 2>&1
+    RT_HOST_GROUP=h; RT_PROFILE_NAME=p
+  else
+    printf '  SKIP 8 live Mutagen classification (could not create a probe session)\n'
+  fi
+fi
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

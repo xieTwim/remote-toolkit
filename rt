@@ -111,30 +111,92 @@ _sync_label_selector() {
   echo "rt-host=${h},rt-profile=${p}"
 }
 
-_has_sync() {
+# ONE structured probe of the daemon, shared by every classifier below.
+#
+# The classification used to be a text grep over `mutagen sync list`: anything carrying
+# `Identifier:` that did not match `Status:.*Paused` and did not match `Connected: No` was
+# called `active`. That is a classifier with no negative case — it decided health from the
+# ABSENCE of two strings, so every state Mutagen has that those two strings do not name was
+# reported as healthy. Measured 2026-08-05 against Mutagen 0.18.1: a session halted by the
+# entry-count circuit breaker reports `Connected: Yes` on both endpoints and
+# `Status: Waiting 5 seconds for rescan`, so it classified `active` while synchronising
+# nothing.
+#
+# Fields verified against 0.18.1 (`--template` reads the same session struct the human
+# rendering does, so it cannot drift from it the way a grep of the rendering can):
+#
+#   state                  .Paused  .Status            .LastError
+#   healthy                false    Watching           (empty)
+#   entry-count halt       false    WaitingForRescan   alpha scan error: exceeded allowed entry count
+#   paused                 true     Disconnected       (nil — see below)
+#
+# `.LastError` lives on the embedded SessionState, which is NIL for a paused session; reading
+# it unguarded makes the whole template error out. Hence `{{if .SessionState}}`.
+# `.LastError` is NOT sticky — measured: over-cap -> halted, then back under cap -> `Watching`
+# with an empty error within one rescan interval. So a non-empty error is a LIVE condition,
+# not a scar from an old one, which is what makes it safe to classify on.
+RT_SYNC_TEMPLATE='{{range .}}{{.Paused}}|{{.Status}}|{{.Alpha.Connected}}|{{.Beta.Connected}}|{{if .SessionState}}{{.LastError}}{{end}}
+{{end}}'
+
+# Echo one '|'-separated record per matching session, or return non-zero if the DAEMON COULD
+# NOT BE ASKED. Those are different facts and the old code encoded both as "no session".
+_sync_probe() {
   local sel
   sel=$(_sync_label_selector "$@")
-  local out
-  out=$(mutagen sync list --label-selector "$sel" 2>/dev/null) || true
-  grep -q '^Identifier:' <<< "$out"
+  mutagen sync list --label-selector "$sel" --template "$RT_SYNC_TEMPLATE" 2>/dev/null
 }
 
+# States: none | paused | halted | offline | active | unknown
+#
+# `unknown` is the one this classifier did not have. A `mutagen sync list` that could not run —
+# daemon down, mutagen missing, or a future Mutagen that rejects the template — used to be
+# reported as `none`, i.e. "there is no sync session", which is a claim about the remote that
+# nothing established. Three states, not two: `unknown` = the probe could not run, `none` = the
+# probe ran and there is no session, everything else = the probe ran and this is the session.
 _sync_status() {
-  local sel
-  sel=$(_sync_label_selector "$@")
-  local out
-  out=$(mutagen sync list --label-selector "$sel" 2>/dev/null) || { echo none; return; }
-  if ! grep -q '^Identifier:' <<< "$out"; then
-    echo none
-    return
-  fi
-  if grep -q 'Status:.*Paused' <<< "$out"; then
+  local out rc=0
+  out=$(_sync_probe "$@") || rc=$?
+  if (( rc != 0 )); then echo unknown; return; fi
+
+  local line=""
+  line=$(grep -m1 . <<< "$out") || true    # first non-empty record
+  [[ -n "$line" ]] || { echo none; return; }
+
+  # `lasterr` is last, so `read` puts the whole remainder there — an error message
+  # containing '|' cannot truncate the field or shift the others.
+  local paused status aconn bconn lasterr
+  IFS='|' read -r paused status aconn bconn lasterr <<< "$line"
+
+  if [[ "$paused" == "true" ]]; then
     echo paused
-  elif grep -q 'Connected: No' <<< "$out"; then
+  elif [[ -n "$lasterr" ]]; then
+    echo halted
+  elif [[ "$aconn" != "true" || "$bconn" != "true" ]]; then
     echo offline
   else
     echo active
   fi
+}
+
+# The live error behind a `halted` classification, for messages that have to say WHY.
+_sync_last_error() {
+  local out
+  out=$(_sync_probe "$@") || return 1
+  local line=""
+  line=$(grep -m1 . <<< "$out") || true
+  [[ -n "$line" ]] || return 1
+  local paused status aconn bconn lasterr
+  IFS='|' read -r paused status aconn bconn lasterr <<< "$line"
+  printf '%s' "$lasterr"
+}
+
+# True iff a session EXISTS. Derived from the one probe above rather than from a second,
+# separately-broken grep: when the daemon cannot be asked this stays false, exactly as the old
+# `|| true`-swallowed grep did, but now the reason is a state the caller can also read.
+_has_sync() {
+  local st
+  st=$(_sync_status "$@")
+  [[ "$st" != "none" && "$st" != "unknown" ]]
 }
 
 # Run a command with a wall-clock bound: kill it past $1 seconds and return 1.
@@ -177,13 +239,31 @@ _run_bounded() {
 _sync_flush() {
   local sel
   sel=$(_sync_label_selector "$@")
-  # A paused session never completes a sync cycle, so flushing it would burn
-  # the full timeout on every command (and before the timeout existed, hang
-  # forever). Fail fast and name the fix instead.
-  if [[ "$(_sync_status "$@")" == "paused" ]]; then
-    warn "Sync session is PAUSED — flush skipped. 'rt -p ${RT_PROFILE} connect' resumes it."
-    return 2
-  fi
+  # Three states in which a flush CANNOT succeed, and returning 3 for any of them would be a
+  # fail-open: `exec` continues on 3 (correctly — 3 means the daemon is still working), so a
+  # session that is never going to converge would let a command run against stale code behind a
+  # "still syncing" warning.
+  #
+  # `halted` is the one that motivated this. Measured 2026-08-05 against Mutagen 0.18.1: a
+  # breaker-halted session does not fail a flush, it HANGS — `mutagen sync flush` was still
+  # running after 15s with the session stuck in a rescan-fail loop. So before this, a halted
+  # session burned the whole RT_FLUSH_TIMEOUT and reported 3, "the daemon is still syncing",
+  # about a daemon that was making no progress and would make none until the ignore list is
+  # fixed and the session RECREATED.
+  local _st
+  _st=$(_sync_status "$@")
+  case "$_st" in
+    paused)
+      warn "Sync session is PAUSED — flush skipped. 'rt -p ${RT_PROFILE} connect' resumes it."
+      return 2 ;;
+    halted)
+      warn "Sync session is HALTED and is synchronising nothing: $(_sync_last_error "$@")"
+      warn "Flush skipped (it would hang, not fail). Fix MUTAGEN_IGNORE or raise MUTAGEN_MAX_ENTRY_COUNT, then 'rt -p ${RT_PROFILE} disconnect && rt -p ${RT_PROFILE} connect' — ignores only apply at session-create time, so editing them does nothing to a live session."
+      return 2 ;;
+    unknown)
+      warn "Could not ask the Mutagen daemon for this session's state, so nothing establishes that a flush would do anything. Check 'mutagen daemon start' and 'rt -p ${RT_PROFILE} sync status'."
+      return 2 ;;
+  esac
   # Bound the wait. `mutagen sync flush` blocks until the daemon finishes one
   # full sync cycle, which on a large or backlogged session takes minutes.
   # The daemon keeps syncing in the background regardless, so past the cap we
@@ -475,9 +555,29 @@ cmd_connect() {
   _mutagen_check
   _mutagen_daemon_ensure
 
+  # One probe, then act on what it says.
+  local _st
+  _st=$(_sync_status)
+
+  # Checked BEFORE the has-session branch: when the daemon cannot be asked, "there is no
+  # session" is not established, and creating a SECOND session for a profile that already has
+  # one is worse than stopping. (The old code could not tell these apart at all — a failed
+  # `mutagen sync list` read as "no session" and fell straight through to create.)
+  if [[ "$_st" == "unknown" ]]; then
+    die "[$RT_PROFILE] Could not ask the Mutagen daemon whether this profile already has a session, so connecting now might create a second one. Check 'mutagen daemon start', then retry."
+  fi
+
   # Idempotent: sync session already exists → resume if paused, flush, exit
-  if _has_sync; then
-    if [[ "$(_sync_status)" == "paused" ]]; then
+  if [[ "$_st" != "none" ]]; then
+    if [[ "$_st" == "halted" ]]; then
+      # Resume is for PAUSED sessions; a halted one is not paused, so resuming it is a no-op
+      # that would be followed by "Already connected". Say plainly that connect cannot fix
+      # this, and name the only thing that does — the session must be RECREATED, because
+      # ignores are applied at create time.
+      warn "[$RT_PROFILE] Sync session is HALTED: $(_sync_last_error)"
+      die "[$RT_PROFILE] 'connect' cannot recover a halted session — it is not paused, so there is nothing to resume, and it is synchronising nothing. Fix the cause (usually a heavy dir missing from MUTAGEN_IGNORE; or raise MUTAGEN_MAX_ENTRY_COUNT), then recreate: 'rt -p $RT_PROFILE disconnect && rt -p $RT_PROFILE connect'. Editing MUTAGEN_IGNORE alone does nothing — ignores only apply at session-create time."
+    fi
+    if [[ "$_st" == "paused" ]]; then
       info "[$RT_PROFILE] Sync session is paused — resuming ..."
       _sync_resume || die "Resume failed. Diagnose with 'rt -p $RT_PROFILE sync status' — a session halted by the entry-count circuit breaker records the error there; fix MUTAGEN_IGNORE (or raise MUTAGEN_MAX_ENTRY_COUNT) before retrying."
     fi
@@ -804,6 +904,9 @@ cmd_status() {
 
     printf '  Profile:     %s\n' "$RT_PROFILE"
     printf '  Sync:        %s\n' "$sync_state"
+    # A halted session is synchronising nothing; the state word alone does not say why, and
+    # the why is what tells you whether recreating it will help.
+    [[ "$sync_state" == "halted" ]] && printf '  Sync error:  %s\n' "$(_sync_last_error)"
     printf '  SSH:         %s\n' "$ssh_ok"
     printf '  Remote host: %s\n' "$host"
     printf '  Remote dir:  %s\n' "$rdir"
