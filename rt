@@ -339,6 +339,53 @@ _sync_terminate() {
   mutagen sync terminate --label-selector "$sel" 2>&1
 }
 
+# THE DEFAULT SYNC SCOPE. Documented in SKILL.md and README.md; those lists and this one have
+# to be read together, because everything here is a path whose contents NEVER reach the local
+# replica — a result written to `outputs/` or `checkpoints/` on the remote does not come back,
+# and nothing in the tool said so.
+RT_DEFAULT_IGNORES=(
+  "__pycache__/" "*.pyc" ".venv/" "venv/" "node_modules/"
+  "wandb/" "outputs/" "checkpoints/" ".ipynb_checkpoints/"
+  ".triton_cache/" ".DS_Store" "*.swp"
+  # Personal / Claude Code harness artifacts. These are LOCAL reasoning aids,
+  # never project deliverables, and must not mirror onto the (often SHARED)
+  # remotes — nor leak into repos that get pushed from the box. Bare names match
+  # at any depth; trailing slash = directory. Bench scaffolding
+  # (bench.py/bench_runner/conftest/bench.sh) is deliberately NOT here — it must
+  # run on the remote GPU.
+  ".claude/" "CLAUDE.md" "HANDOFF.md" "HINTS.md" "ITERATIONS.md"
+  ".local/" "*.local.md"
+)
+
+# The ignore set a session created RIGHT NOW would carry: defaults, then the profile's extras.
+# Shared by `_sync_create` and by the drift check in `sync status`, so the two cannot disagree
+# about what the current config means.
+_ignore_patterns() {
+  printf '%s\n' "${RT_DEFAULT_IGNORES[@]}"
+  if [[ -n "${MUTAGEN_IGNORE+x}" ]]; then
+    printf '%s\n' "${MUTAGEN_IGNORE[@]}"
+  fi
+}
+
+# The ignore set the LIVE session is actually enforcing. Mutagen freezes ignores at session
+# CREATE time, so this and `_ignore_patterns` drift apart the moment someone edits a config —
+# and the config is what everyone reads when asking "why did this file not come back?".
+_sync_live_ignores() {
+  local sel
+  sel=$(_sync_label_selector "$@")
+  mutagen sync list --label-selector "$sel" \
+    --template '{{range .}}{{range .Configuration.Ignore.Paths}}{{.}}
+{{end}}{{end}}' 2>/dev/null
+}
+
+# Whether the live session ignores VCS directories (`.git/`). Same freezing applies.
+_sync_live_vcs() {
+  local sel
+  sel=$(_sync_label_selector "$@")
+  mutagen sync list --label-selector "$sel" \
+    --template '{{range .}}{{.Configuration.Ignore.VCS}}{{end}}' 2>/dev/null
+}
+
 _sync_create() {
   local session_name
   session_name=$(_sync_session_name)
@@ -357,29 +404,10 @@ _sync_create() {
     args+=(--ignore-vcs)
   fi
 
-  local default_ignores=(
-    "__pycache__/" "*.pyc" ".venv/" "venv/" "node_modules/"
-    "wandb/" "outputs/" "checkpoints/" ".ipynb_checkpoints/"
-    ".triton_cache/" ".DS_Store" "*.swp"
-    # Personal / Claude Code harness artifacts. These are LOCAL reasoning aids,
-    # never project deliverables, and must not mirror onto the (often SHARED,
-    # e.g. fact-cluster's haoyu account) remotes — nor leak into repos that get
-    # `gh push`-ed from the box. Bare names match at any depth; trailing slash
-    # = directory. Bench scaffolding (bench.py/bench_runner/conftest/bench.sh)
-    # is deliberately NOT here — it must run on the remote GPU.
-    ".claude/" "CLAUDE.md" "HANDOFF.md" "HINTS.md" "ITERATIONS.md"
-    ".local/" "*.local.md"
-  )
   local pat
-  for pat in "${default_ignores[@]}"; do
-    args+=("--ignore=${pat}")
-  done
-
-  if [[ -n "${MUTAGEN_IGNORE+x}" ]]; then
-    for pat in "${MUTAGEN_IGNORE[@]}"; do
-      args+=("--ignore=${pat}")
-    done
-  fi
+  while IFS= read -r pat; do
+    [[ -n "$pat" ]] && args+=("--ignore=${pat}")
+  done < <(_ignore_patterns)
 
   # Circuit breaker (blast-radius cap). All profiles share ONE Mutagen daemon and
   # (per host) one filesystem mount, so a single profile syncing a runaway tree — a
@@ -1134,6 +1162,7 @@ cmd_sync() {
       ;;
     status)
       info "[$RT_PROFILE] Sync state: $(_sync_status)"
+      _sync_report_ignores
       mutagen sync list --label-selector "$(_sync_label_selector)" 2>&1 || true
       ;;
     "")
@@ -1143,6 +1172,44 @@ cmd_sync() {
       die "Unknown sync subcommand: $sub"
       ;;
   esac
+}
+
+# Print the ignore set the LIVE session is enforcing, and say plainly when the profile's
+# current text no longer matches it.
+#
+# The documented sync scope was materially wider than the implementation: the docs said files
+# sync to and from the remote and never enumerated the exclusions, so a result written to
+# `outputs/`, `checkpoints/` or `wandb/` never reached the local replica and nothing said why.
+# Worse, ignores are applied only at session-CREATE time, so the natural fix — edit
+# MUTAGEN_IGNORE — changes nothing about the running session, and the config file everyone
+# reads to answer "what is excluded?" is then simply wrong about it.
+_sync_report_ignores() {
+  local live want
+  live=$(_sync_live_ignores) || live=""
+  if ! _has_sync; then
+    printf '  Effective ignores: (no live session — these would apply on the next connect)\n'
+    _ignore_patterns | sed 's/^/    /'
+    return
+  fi
+
+  printf '  Effective ignores (LIVE session; frozen at create time):\n'
+  if [[ -z "$live" ]]; then
+    printf '    (none)\n'
+  else
+    printf '%s\n' "$live" | sed '/^$/d; s/^/    /'
+  fi
+  case "$(_sync_live_vcs)" in
+    *Ignore*) printf '    [VCS directories such as .git/ are ignored]\n' ;;
+    *)        printf '    [VCS directories such as .git/ are SYNCED]\n' ;;
+  esac
+
+  want=$(_ignore_patterns)
+  if [[ "$(printf '%s\n' "$live" | sed '/^$/d' | sort)" != "$(printf '%s\n' "$want" | sed '/^$/d' | sort)" ]]; then
+    warn "[$RT_PROFILE] The live session's ignores DIFFER from what this profile's config would create now. Ignores are frozen at session-create time, so editing MUTAGEN_IGNORE has not changed what is being excluded. Recreate to apply: 'rt -p $RT_PROFILE disconnect && rt -p $RT_PROFILE connect'."
+    printf '  Config would create (differences marked):\n'
+    diff <(printf '%s\n' "$live" | sed '/^$/d' | sort) <(printf '%s\n' "$want" | sed '/^$/d' | sort) \
+      | sed -n 's/^</    only LIVE:   /p; s/^>/    only CONFIG: /p'
+  fi
 }
 
 # ── Slurm subcommand (opt-in via SLURM_ENABLED=1) ─────────────────

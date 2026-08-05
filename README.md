@@ -68,6 +68,21 @@ Then refer to it as `hpc/train`:
 
 Disconnecting only terminates the sync session. Your local replica at `~/Work/Remote/hpc/train/` is preserved — say "connect hpc/train" to reconnect. To add another workspace on the same cluster (e.g. `hpc/eval`), CC just creates a new `<profile>.conf` under `~/.config/remote-toolkit/hpc/`; the existing `host.conf` is reused.
 
+### What does not sync
+
+The local replica is **not** a full copy of the remote directory. Every profile is created with this default ignore set, and files under these paths never cross in either direction:
+
+```
+__pycache__/  *.pyc  .venv/  venv/  node_modules/
+wandb/  outputs/  checkpoints/  .ipynb_checkpoints/
+.triton_cache/  .DS_Store  *.swp
+.claude/  CLAUDE.md  HANDOFF.md  HINTS.md  ITERATIONS.md  .local/  *.local.md
+```
+
+…plus `.git/` when `MUTAGEN_IGNORE_VCS=1` (the default), plus anything the profile adds via `MUTAGEN_IGNORE`. So a run that writes results into `outputs/` or `checkpoints/` produces **nothing** locally — that is deliberate (those are large), but it means "it didn't sync" is usually "it was never in scope".
+
+**Ignores are frozen when the session is created.** Editing `MUTAGEN_IGNORE` does not change a running session; `rt disconnect && rt connect` applies it. `rt sync status` prints the **live** session's effective ignores and warns when they no longer match what the config would create — read that, not the config file.
+
 ## Things You May Need to Do Manually
 
 | Scenario | Action |

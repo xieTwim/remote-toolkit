@@ -529,6 +529,65 @@ r="$(_d none 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
 chk "10g no session at all still disconnects cleanly" \
     "$([ "$rc" = 0 ] && [ "$cleared" = "yes" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
 
+# ── 11. the documented sync scope matches the implemented one ────────────────
+#
+# The docs said files sync to and from the remote and never enumerated the exclusions, while the
+# defaults silently drop `outputs/`, `checkpoints/`, `wandb/` and more — so a result written to
+# any of them never reached the local replica and nothing said why. And because Mutagen freezes
+# ignores at session-CREATE time, the natural fix (edit MUTAGEN_IGNORE) changes nothing about
+# the running session, leaving the config file wrong about what is excluded.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; RT_HOST_GROUP="h"; RT_PROFILE_NAME="p"
+info() { :; }; warn() { printf '!! %s\n' "$*" >&2; }
+
+# Every default pattern must appear in BOTH user-facing documents. This is what stops the code
+# array and the prose lists from drifting; a pattern added to `rt` alone now fails here.
+DOCS_DIR="$(dirname "$HERE")"
+missing_doc=""
+for pat in "${RT_DEFAULT_IGNORES[@]}"; do
+  grep -qF -- "$pat" "$DOCS_DIR/SKILL.md"  || missing_doc="$missing_doc SKILL:$pat"
+  grep -qF -- "$pat" "$DOCS_DIR/README.md" || missing_doc="$missing_doc README:$pat"
+done
+chk "11 every default ignore pattern is enumerated in SKILL.md and README.md" \
+    "$([ -z "$missing_doc" ] && echo 0 || echo 1)" "undocumented:$missing_doc"
+# POSITIVE FIXTURE: the check above is only worth having if it can fail. A pattern that is NOT
+# in the docs must make it fire — otherwise it is a structural check matching nothing, which is
+# indistinguishable from a clean tree.
+grep -qF -- "definitely-not-a-documented-ignore-pattern/" "$DOCS_DIR/SKILL.md"
+chk "11a ... and that check can still fire (an undocumented pattern is not found)" \
+    "$([ $? -ne 0 ] && echo 0 || echo 1)"
+
+# `sync status` must report the LIVE session's ignores, and say so when the config has drifted.
+MUTAGEN_IGNORE=("data/")
+_has_sync() { return 0; }
+_sync_live_vcs() { echo IgnoreVCSModeIgnore; }
+
+_sync_live_ignores() { _ignore_patterns; }        # live == config
+out="$(_sync_report_ignores 2>&1)"
+chk "11b with no drift, the live ignore set is printed and nothing is claimed about drift" \
+    "$(grep -q 'LIVE session' <<< "$out" && ! grep -qi 'DIFFER' <<< "$out" && echo 0 || echo 1)" \
+    "$(head -c 200 <<< "$out")"
+chk "11c ... and it lists an actual default pattern" \
+    "$(grep -q 'checkpoints/' <<< "$out" && echo 0 || echo 1)"
+
+# The case that motivated this: someone added a pattern to MUTAGEN_IGNORE and the running
+# session never picked it up. The config now says one thing and the session enforces another.
+_sync_live_ignores() { printf '%s\n' "${RT_DEFAULT_IGNORES[@]}"; }   # live lacks `data/`
+out="$(_sync_report_ignores 2>&1)"
+chk "11d an edited MUTAGEN_IGNORE that the live session never picked up is REPORTED" \
+    "$(grep -qi 'DIFFER' <<< "$out" && echo 0 || echo 1)" "$(head -c 240 <<< "$out")"
+chk "11e ... and the specific pattern that is only in the config is named" \
+    "$(grep -q 'only CONFIG: *data/' <<< "$out" && echo 0 || echo 1)" \
+    "$(grep 'only ' <<< "$out" | head -c 200)"
+
+# With no live session there is nothing to report ON — saying "effective ignores" would claim a
+# session's state. It must say these are what the NEXT connect would apply.
+_has_sync() { return 1; }
+out="$(_sync_report_ignores 2>&1)"
+chk "11f with no session, the list is labelled as prospective, not as live" \
+    "$(grep -q 'next connect' <<< "$out" && ! grep -q 'LIVE session' <<< "$out" && echo 0 || echo 1)" \
+    "$(head -c 200 <<< "$out")"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

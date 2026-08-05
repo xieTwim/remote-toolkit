@@ -128,6 +128,25 @@ These are **regular local directories**, not network mounts. Read / Edit / Write
 
 Mutagen syncs changes to and from the remote in the background (typically < 1s for small files). Use `rt sync flush` to force reconciliation; `rt sync status` for diagnostics.
 
+#### What does NOT sync — read this before looking for a result that never arrived
+
+**Sync is not the whole directory.** Every profile is created with this default ignore set, and a file under any of these paths never becomes part of the local replica in either direction:
+
+```
+__pycache__/  *.pyc  .venv/  venv/  node_modules/
+wandb/  outputs/  checkpoints/  .ipynb_checkpoints/
+.triton_cache/  .DS_Store  *.swp
+.claude/  CLAUDE.md  HANDOFF.md  HINTS.md  ITERATIONS.md  .local/  *.local.md
+```
+
+Plus `.git/` when `MUTAGEN_IGNORE_VCS=1` (the default), plus whatever the profile adds in `MUTAGEN_IGNORE`.
+
+Three consequences that have each cost time:
+
+1. **A training run writing to `outputs/` or `checkpoints/` produces nothing locally.** That is by design — those are large — but it means the local replica is *not* a copy of the remote, and "it did not sync" is usually "it was never in scope". Write results you want back to a path outside the ignore set, or fetch them explicitly with `rt exec 'cat …'`.
+2. **Ignores are frozen when the session is created.** Editing `MUTAGEN_IGNORE` does nothing to a running session. You must `rt disconnect && rt connect` to apply it. `rt sync status` prints the **live** session's effective ignores and warns when they no longer match what the config would create — trust that output, not the config file.
+3. **A growing ignore list is a smell.** It usually means a sync bucket is being used as storage. Prune the bucket instead; see rule 4 below.
+
 ### Remote Command Execution
 
 Short commands (< 30 seconds) — auto-flushes sync first:
