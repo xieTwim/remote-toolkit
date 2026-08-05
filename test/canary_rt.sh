@@ -470,6 +470,65 @@ chk "9f sourcing one profile's config does not leak into the next" \
 rm -rf "$RT_HOME"
 export RT_HOME="$RT_HOME_SAVE"
 
+# ── 10. disconnect must not report success it did not achieve ────────────────
+#
+# `mutagen sync terminate … || true` discarded every failure, `clear_state` then ran
+# unconditionally, and `Disconnected` was printed with rc 0. So a termination that failed left
+# the session running — still propagating deletions — with the only local record of it deleted,
+# and told the caller it was done.
+#
+# `cmd_disconnect` calls `die`, which exits, so each case runs in a subshell; `clear_state` is
+# therefore observed through a MARKER FILE rather than a variable, which would not survive it.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; RT_HOST_GROUP="h"; RT_PROFILE_NAME="p"; RT_SESSION_PREFIX="rt_h_p_bg_"
+LOCAL_DIR="$SCRATCH/local"
+info() { :; }
+# `warn` stays REAL here: 10c is about what the operator is told, and silencing it would make
+# the check pass on an implementation that swallowed mutagen's reason — the same swallowing
+# this block exists to catch.
+warn() { printf '!! %s\n' "$*" >&2; }
+load_config() { :; }
+_ssh_test() { return 1; }                     # isolate: skip the background-job branch
+clear_state() { touch "$SCRATCH/cleared"; }
+
+_d() { # _d <status> <terminate-rc> <still-present-after> -> "<rc>|<cleared>|<output>"
+       # The stub bodies are eval'd so the values are BOUND into them: a `$1` inside a stub
+       # would resolve to the stub's own arguments, not to _d's.
+  rm -f "$SCRATCH/cleared"
+  local st="$1" trc="$2" present="$3" out rc=0
+  out=$(
+    eval "_sync_status() { echo $st; }"
+    eval "_sync_terminate() { echo 'unable to terminate: connection refused'; return $trc; }"
+    eval "_has_sync() { return $present; }"
+    cmd_disconnect 2>&1
+  ) || rc=$?
+  printf '%s|%s|%s' "$rc" "$([ -e "$SCRATCH/cleared" ] && echo yes || echo no)" "$out"
+}
+
+r="$(_d active 1 0)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
+chk "10 a FAILED terminate exits non-zero (was: rc 0, 'Disconnected')" \
+    "$([ "$rc" != 0 ] && echo 0 || echo 1)" "rc=$rc"
+chk "10b ... and does NOT delete the local record of a session that may still be running" \
+    "$([ "$cleared" = "no" ] && echo 0 || echo 1)" "cleared=$cleared"
+chk "10c ... and quotes mutagen's own reason" \
+    "$(grep -q 'connection refused' <<< "$out" && echo 0 || echo 1)" "$(head -c 160 <<< "$out")"
+
+r="$(_d active 0 0)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+chk "10d terminate reporting SUCCESS while the session survives is still a failure" \
+    "$([ "$rc" != 0 ] && [ "$cleared" = "no" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
+
+r="$(_d active 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"; out="${rest#*|}"
+chk "10e a termination that is ESTABLISHED clears state and succeeds" \
+    "$([ "$rc" = 0 ] && [ "$cleared" = "yes" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
+
+r="$(_d unknown 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+chk "10f an unaskable daemon does not license deleting the record either" \
+    "$([ "$rc" != 0 ] && [ "$cleared" = "no" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
+
+r="$(_d none 0 1)"; rc="${r%%|*}"; rest="${r#*|}"; cleared="${rest%%|*}"
+chk "10g no session at all still disconnects cleanly" \
+    "$([ "$rc" = 0 ] && [ "$cleared" = "yes" ] && echo 0 || echo 1)" "rc=$rc cleared=$cleared"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

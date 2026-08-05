@@ -330,10 +330,13 @@ _sync_resume() {
   _run_bounded "${RT_RESUME_TIMEOUT:-60}" mutagen sync resume --label-selector "$sel"
 }
 
+# Echo mutagen's own message and return ITS status. The `>/dev/null 2>&1 || true` that used to
+# be here discarded every failure, and `disconnect` went on to delete the local record and print
+# "Disconnected" over a session that was still running and still propagating deletions.
 _sync_terminate() {
   local sel
   sel=$(_sync_label_selector "$@")
-  mutagen sync terminate --label-selector "$sel" >/dev/null 2>&1 || true
+  mutagen sync terminate --label-selector "$sel" 2>&1
 }
 
 _sync_create() {
@@ -717,12 +720,35 @@ cmd_disconnect() {
     fi
   fi
 
-  if _has_sync; then
-    info "[$RT_PROFILE] Terminating sync session $(_sync_session_name) ..."
-    _sync_terminate
-  else
-    info "[$RT_PROFILE] No active sync session."
-  fi
+  # `disconnect` used to report success whether or not termination worked, and delete the local
+  # record either way: `mutagen sync terminate … || true` discarded the failure, `clear_state`
+  # ran unconditionally, and `Disconnected` was printed with rc 0. The session could still be
+  # running — still propagating deletions — with the only local trace of it gone.
+  #
+  # The state directory is now deleted ONLY after termination is established, and "established"
+  # means re-asking the daemon, not trusting the exit code of the command that was supposed to
+  # do it.
+  local _st
+  _st=$(_sync_status)
+  case "$_st" in
+    unknown)
+      die "[$RT_PROFILE] Could not ask the Mutagen daemon whether a sync session exists, so this cannot terminate one and must not delete the local record of it. Local state left intact. Check 'mutagen daemon start', then retry." ;;
+    none)
+      info "[$RT_PROFILE] No active sync session." ;;
+    *)
+      info "[$RT_PROFILE] Terminating sync session $(_sync_session_name) ..."
+      local _terr="" _trc=0
+      _terr=$(_sync_terminate) || _trc=$?
+      if (( _trc != 0 )); then
+        [[ -n "$_terr" ]] && warn "[$RT_PROFILE] mutagen: $_terr"
+        die "[$RT_PROFILE] Sync session termination FAILED (mutagen exit $_trc). The session may still be running and propagating deletions. Local state has NOT been cleared, so the record of it survives — inspect with 'rt -p $RT_PROFILE sync status'."
+      fi
+      # The exit code says the command succeeded; this says the session is gone. They are
+      # different claims, and this command's whole job is the second one.
+      if _has_sync; then
+        die "[$RT_PROFILE] mutagen reported success but the sync session is still present. Local state has NOT been cleared. Inspect with 'rt -p $RT_PROFILE sync status'."
+      fi ;;
+  esac
 
   clear_state
   info "[$RT_PROFILE] Disconnected. Local replica preserved at $LOCAL_DIR"
