@@ -135,7 +135,17 @@ _sync_label_selector() {
 # `.LastError` is NOT sticky — measured: over-cap -> halted, then back under cap -> `Watching`
 # with an empty error within one rescan interval. So a non-empty error is a LIVE condition,
 # not a scar from an old one, which is what makes it safe to classify on.
-RT_SYNC_TEMPLATE='{{range .}}{{.Paused}}|{{.Status}}|{{.Alpha.Connected}}|{{.Beta.Connected}}|{{if .SessionState}}{{.LastError}}{{end}}
+# The endpoint-size fields ride along in this SAME template so that every caller reads one
+# consistent snapshot of the session rather than several taken at different instants.
+# (Probe cost was measured before assuming it mattered: 11 ms, against 438 ms for a trivial
+# `rt exec` — about 2.5%. Cheap enough that the size check makes its own call rather than
+# threading a cache through every caller.)
+# `.Alpha.EndpointState` is nil while an endpoint is disconnected, so it needs its own guard.
+# `.Scanned` is the SCOPE of the counts: false means the numbers describe nothing.
+#
+# `.LastError` stays LAST. `read` puts the whole remainder in the final field, which is what
+# keeps an error message containing '|' from shifting every column after it.
+RT_SYNC_TEMPLATE='{{range .}}{{.Paused}}|{{.Status}}|{{.Alpha.Connected}}|{{.Beta.Connected}}|{{if .Alpha.EndpointState}}{{.Alpha.EndpointState.Scanned}}|{{.Alpha.EndpointState.Directories}}|{{.Alpha.EndpointState.Files}}|{{.Alpha.EndpointState.TotalFileSize}}{{else}}|||{{end}}|{{if .SessionState}}{{.LastError}}{{end}}
 {{end}}'
 
 # Echo one '|'-separated record per matching session, or return non-zero if the DAEMON COULD
@@ -193,10 +203,8 @@ _sync_status() {
   # created one, and picking the first would report a state over a scope not established.
   if (( records > 1 )); then echo unknown; return; fi
 
-  # `lasterr` is last, so `read` puts the whole remainder there — an error message
-  # containing '|' cannot truncate the field or shift the others.
-  local paused status aconn bconn lasterr
-  IFS='|' read -r paused status aconn bconn lasterr <<< "$(grep -m1 . <<< "$out")"
+  local paused status aconn bconn scanned dirs files bytes lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$(grep -m1 . <<< "$out")"
 
   if [[ "$paused" == "true" ]]; then
     echo paused
@@ -215,16 +223,33 @@ _sync_status() {
   fi
 }
 
-# The live error behind a `halted` classification, for messages that have to say WHY.
+# The live error behind an `erroring` classification, for messages that have to say WHY.
 _sync_last_error() {
   local out
   out=$(_sync_probe "$@") || return 1
   local line=""
   line=$(grep -m1 . <<< "$out") || true
   [[ -n "$line" ]] || return 1
-  local paused status aconn bconn lasterr
-  IFS='|' read -r paused status aconn bconn lasterr <<< "$line"
+  local paused status aconn bconn scanned dirs files bytes lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$line"
   printf '%s' "$lasterr"
+}
+
+# "<files> <bytes>" for the alpha endpoint, or non-zero if the size is NOT ESTABLISHED.
+# `Scanned: false` means the counts describe nothing — a breaker-halted session reports
+# `0|0|0` — so returning them as though they were a measurement would be the same fail-open
+# this tool keeps closing: a zero that means "did not look" rendered as a zero that means
+# "nothing there".
+_sync_counts() {
+  local out
+  out=$(_sync_probe "$@") || return 1
+  local line=""
+  line=$(grep -m1 . <<< "$out") || true
+  [[ -n "$line" ]] || return 1
+  local paused status aconn bconn scanned dirs files bytes lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$line"
+  [[ "$scanned" == "true" ]] || return 1
+  printf '%s %s' "${files:-0}" "${bytes:-0}"
 }
 
 # True iff a session EXISTS. Derived from the one probe above rather than from a second,
@@ -273,9 +298,50 @@ _run_bounded() {
 # submit` aborted. Treating a 10s timeout on a big repo as fatal would make refusal so common
 # that `--no-flush` becomes muscle memory, which turns the protection off entirely; treating a
 # paused session as benign is how a GPU job runs yesterday's code.
+# A courier bucket degrades SILENTLY as finished handoffs pile up, and by the time anyone looks
+# the symptom is latency, not size. Measured 2026-08-01: 10,292 files / 2.6 GB in one bucket put
+# a flush in `Scanning files` for 20+ minutes — a 9 KB push took ~40 minutes and a 2.7 MB pull
+# had not arrived after 25 — while the same bucket at 232 files / 41 MB flushed in 7 seconds.
+# Everything in it was FINISHED transfers nobody cleared.
+#
+# So: say the size BEFORE it becomes latency. Defaults sit between the two measurements and
+# lean early, since the whole point is to warn before the stall.
+#
+# The standing lesson goes in the message, because the intuitive fix is the wrong one: a courier
+# bucket needs PRUNING. A growing MUTAGEN_IGNORE is the tell that the bucket is being used as
+# storage, and it does not even take effect until the session is recreated.
+#
+# RATE-LIMITED to once per RT_BLOAT_WARN_INTERVAL per profile. `rt exec` flushes on every call,
+# and a warning printed hundreds of times is one that gets filtered — this workspace already has
+# a caller that greps `^!! Sync flush` out of its output, which is what a noisy channel earns.
+_sync_warn_if_bloated() {
+  local counts files bytes
+  counts=$(_sync_counts "$@") || return 0     # size not established -> claim nothing
+  files="${counts%% *}"; bytes="${counts##* }"
+
+  # `${VAR-default}`, NOT `${VAR:-default}`: the colon form substitutes the default for an
+  # EMPTY value too, which would have made the documented escape hatch (`RT_SYNC_WARN_FILES=`)
+  # silently do nothing. Caught by check 12i.
+  local max_files="${RT_SYNC_WARN_FILES-2000}"
+  local max_bytes="${RT_SYNC_WARN_BYTES-1073741824}"      # 1 GiB
+  [[ -n "$max_files" && -n "$max_bytes" ]] || return 0    # set either empty to disable
+  if (( files <= max_files )) && (( bytes <= max_bytes )); then return 0; fi
+
+  local stamp="${RT_STATE_DIR}/bloat_warned" now=0 last=0
+  now=$(date +%s)
+  [[ -f "$stamp" ]] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if (( now - last < ${RT_BLOAT_WARN_INTERVAL:-3600} )); then return 0; fi
+  mkdir -p "$RT_STATE_DIR" 2>/dev/null && printf '%s' "$now" > "$stamp" 2>/dev/null || true
+
+  warn "[$RT_PROFILE] Sync set is LARGE: ${files} files, $(( bytes / 1048576 )) MB. Flush latency grows with this, and it degrades quietly — measured, a bucket at ~10k files/2.6 GB stalled a flush for 20+ minutes while the same bucket at ~230 files flushed in 7 seconds."
+  warn "[$RT_PROFILE] If this is a courier bucket, PRUNE it — a growing MUTAGEN_IGNORE is the tell that a sync bucket is being used as storage, and ignores do not take effect until the session is recreated anyway. Silence this with RT_SYNC_WARN_FILES= / RT_SYNC_WARN_BYTES=."
+}
+
 _sync_flush() {
   local sel
   sel=$(_sync_label_selector "$@")
+  _sync_warn_if_bloated "$@"
   # Three states in which a flush CANNOT succeed, and returning 3 for any of them would be a
   # fail-open: `exec` continues on 3 (correctly — 3 means the daemon is still working), so a
   # session that is never going to converge would let a command run against stale code behind a
@@ -1024,6 +1090,14 @@ cmd_status() {
       halted)   printf '  Sync error:  Mutagen safety brake (root emptied/deleted/type-changed) — see '"'"'rt -p %s sync status'"'"'\n' "$RT_PROFILE" ;;
     esac
     printf '  SSH:         %s\n' "$ssh_ok"
+    # Sync-set size, with its SCOPE: an unscanned endpoint reports zeros, and printing those as
+    # "0 files" would be a measurement the session has not made.
+    local _counts
+    if _counts=$(_sync_counts); then
+      printf '  Sync set:    %s files, %s MB\n' "${_counts%% *}" "$(( ${_counts##* } / 1048576 ))"
+    else
+      printf '  Sync set:    (not established — endpoint not scanned yet)\n'
+    fi
     printf '  Remote host: %s\n' "$host"
     printf '  Remote dir:  %s\n' "$rdir"
     printf '  Local dir:   %s\n' "$local_dir"

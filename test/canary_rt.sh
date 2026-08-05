@@ -247,23 +247,27 @@ FAKE_MUTAGEN_RC=0
 # MEASURED against 0.18.1 by driving the condition on local endpoints, and each reports an
 # EMPTY .LastError with BOTH endpoints connected — so a classifier that keys on the error alone
 # calls all three healthy. That is the same defect this entry is about, one state over.
+# Record layout, exactly as RT_SYNC_TEMPLATE emits it (9 fields):
+#   paused|status|alphaConn|betaConn|scanned|dirs|files|bytes|lastError
+# The paused/offline rows carry EMPTY size fields on purpose: `.Alpha.EndpointState` is nil
+# while an endpoint is disconnected, which is what the template's `{{else}}|||{{end}}` produces.
 for case in \
-  "active false|Watching|true|true|" \
-  "active false|WaitingForRescan|true|true|" \
-  "active false|StagingBeta|true|true|" \
-  "erroring false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count" \
-  "halted false|HaltedOnRootEmptied|true|true|" \
-  "halted false|HaltedOnRootDeletion|true|true|" \
-  "halted false|HaltedOnRootTypeChange|true|true|" \
-  "paused true|Disconnected|false|false|" \
-  "offline false|Watching|false|true|" \
-  "offline false|Disconnected|true|true|" \
-  "unknown false|HaltedOnSomethingAddedInAFutureMutagen|true|true|" \
+  "active false|Watching|true|true|true|5|134|3174279|" \
+  "active false|WaitingForRescan|true|true|true|2|20|2048|" \
+  "active false|StagingBeta|true|true|true|2|20|2048|" \
+  "erroring false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count" \
+  "halted false|HaltedOnRootEmptied|true|true|true|1|0|0|" \
+  "halted false|HaltedOnRootDeletion|true|true|true|1|0|0|" \
+  "halted false|HaltedOnRootTypeChange|true|true|true|1|0|0|" \
+  "paused true|Disconnected|false|false|||||" \
+  "offline false|Watching|false|true|||||" \
+  "offline false|Disconnected|true|true|||||" \
+  "unknown false|HaltedOnSomethingAddedInAFutureMutagen|true|true|true|1|1|1|" \
 ; do
   want="${case%% *}"; rec="${case#* }"
   FAKE_TEMPLATE_OUT="$rec"
   got="$(_sync_status)"
-  chk "7 [$want] Status=$(echo "$rec" | cut -d'|' -f2)$([ -n "$(echo "$rec" | cut -d'|' -f5)" ] && echo ' +error') -> $want" \
+  chk "7 [$want] Status=$(echo "$rec" | cut -d'|' -f2)$([ -n "$(echo "$rec" | cut -d'|' -f9)" ] && echo ' +error') -> $want" \
       "$([ "$got" = "$want" ] && echo 0 || echo 1)" "classified '$got', want '$want'"
 done
 
@@ -271,14 +275,14 @@ done
 # pins that an unrecognised one reports `unknown`; this says why it matters. The old classifier
 # called everything it did not recognise `active`, so every state Mutagen has that it did not
 # name read as healthy, and a future Mutagen adding a brake would silently rejoin that set.
-FAKE_TEMPLATE_OUT='false|Watching|true|true|'
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|'
 chk "7a1 ... while a verb the tool DOES recognise as healthy still reads active" \
     "$([ "$(_sync_status)" = "active" ] && echo 0 || echo 1)" "got $(_sync_status)"
 
 # One profile is one session. Two records matching this label pair means something outside `rt`
 # created one, and answering from the first would report a state over a scope not established.
-FAKE_TEMPLATE_OUT='false|Watching|true|true|
-false|HaltedOnRootEmptied|true|true|'
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|
+false|HaltedOnRootEmptied|true|true|true|1|0|0|'
 chk "7a2 two sessions matching one profile's labels -> unknown, not first-one-wins" \
     "$([ "$(_sync_status)" = "unknown" ] && echo 0 || echo 1)" "got $(_sync_status)"
 
@@ -299,7 +303,7 @@ chk "7d ... and _has_sync stays false for it" "$(_has_sync; [ $? -ne 0 ] && echo
 FAKE_MUTAGEN_RC=0
 
 # The error message may itself contain '|'; it is the LAST field, so it must not shift the others.
-FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|scan error: a|b|c'
+FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|false|0|0|0|scan error: a|b|c'
 chk "7e a '|' inside the error text does not corrupt the classification" \
     "$([ "$(_sync_status)" = "erroring" ] && echo 0 || echo 1)" "got $(_sync_status)"
 chk "7f ... and the full error is recoverable for the message" \
@@ -310,8 +314,8 @@ chk "7f ... and the full error is recoverable for the message" \
 # RT_FLUSH_TIMEOUT and returns 3 — "the daemon is still syncing" — and `rt exec` continues on 3.
 # That is the fail-open: a command running against stale code behind a reassuring warning.
 for rec in \
-  'false|WaitingForRescan|true|true|alpha scan error: exceeded allowed entry count' \
-  'false|HaltedOnRootEmptied|true|true|' \
+  'false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count' \
+  'false|HaltedOnRootEmptied|true|true|true|1|0|0|' \
 ; do
   FAKE_TEMPLATE_OUT="$rec"
   _sync_flush >/dev/null 2>&1; rc=$?
@@ -587,6 +591,76 @@ out="$(_sync_report_ignores 2>&1)"
 chk "11f with no session, the list is labelled as prospective, not as live" \
     "$(grep -q 'next connect' <<< "$out" && ! grep -q 'LIVE session' <<< "$out" && echo 0 || echo 1)" \
     "$(head -c 200 <<< "$out")"
+
+# ── 12. a bloated sync set is named BEFORE it becomes latency ────────────────
+#
+# A courier bucket degrades silently as finished handoffs pile up. Measured 2026-08-01: 10,292
+# files / 2.6 GB put a flush in `Scanning files` for 20+ minutes — a 9 KB push took ~40 minutes
+# — while the same bucket at 232 files / 41 MB flushed in 7 seconds. Nothing reported the size
+# until the latency was the symptom.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; RT_HOST_GROUP="h"; RT_PROFILE_NAME="p"
+RT_STATE_DIR="$SCRATCH/state12"
+info() { :; }; warn() { printf '!! %s\n' "$*" >&2; }
+mutagen() { printf '%s\n' "$FAKE_TEMPLATE_OUT"; return 0; }
+
+bloat() {  # bloat <record> -> stderr of one _sync_warn_if_bloated, with the stamp cleared
+  rm -rf "$RT_STATE_DIR"
+  FAKE_TEMPLATE_OUT="$1"
+  _sync_warn_if_bloated 2>&1
+}
+
+#                       paused|status|aconn|bconn|scanned|dirs|files|bytes|err
+BIG='false|Watching|true|true|true|500|10292|2791728742|'
+SMALL='false|Watching|true|true|true|20|232|43000000|'
+UNSCANNED='false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count'
+
+out="$(bloat "$BIG")"
+chk "12 a 10,292-file / 2.6 GB sync set is reported at flush time" \
+    "$(grep -q 'LARGE' <<< "$out" && echo 0 || echo 1)" "$(head -c 200 <<< "$out")"
+chk "12b ... and the message says PRUNE, not 'add another ignore'" \
+    "$(grep -q 'PRUNE' <<< "$out" && echo 0 || echo 1)" "$(head -c 200 <<< "$out")"
+
+out="$(bloat "$SMALL")"
+chk "12c the same bucket at 232 files / 41 MB says nothing" \
+    "$([ -z "$out" ] && echo 0 || echo 1)" "$(head -c 200 <<< "$out")"
+
+# The counts of an UNSCANNED endpoint are zeros that mean "did not look", not "nothing there".
+# Reporting them as a measurement — in either direction — is the fail-open this tool keeps
+# closing, so `_sync_counts` must refuse rather than answer.
+out="$(bloat "$UNSCANNED")"
+chk "12d an endpoint that has not been scanned yields no size CLAIM at all" \
+    "$([ -z "$out" ] && echo 0 || echo 1)" "$(head -c 200 <<< "$out")"
+FAKE_TEMPLATE_OUT="$UNSCANNED"
+_sync_counts >/dev/null 2>&1
+chk "12e ... and _sync_counts REFUSES rather than returning 0 files" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+FAKE_TEMPLATE_OUT="$BIG"
+chk "12f ... while a scanned endpoint does return its counts" \
+    "$([ "$(_sync_counts)" = "10292 2791728742" ] && echo 0 || echo 1)" "got '$(_sync_counts)'"
+
+# Rate limiting: `rt exec` flushes on every call, and a warning printed hundreds of times is one
+# that gets filtered — this workspace already has a caller grepping `^!! Sync flush` out of its
+# output. The second call inside the interval must be silent, and it must come back after it.
+rm -rf "$RT_STATE_DIR"; FAKE_TEMPLATE_OUT="$BIG"
+first="$(_sync_warn_if_bloated 2>&1)"
+second="$(_sync_warn_if_bloated 2>&1)"
+chk "12g the warning is rate-limited (second flush inside the interval is silent)" \
+    "$([ -n "$first" ] && [ -z "$second" ] && echo 0 || echo 1)" "first=${#first} second=${#second}"
+third="$(RT_BLOAT_WARN_INTERVAL=0 _sync_warn_if_bloated 2>&1)"
+chk "12h ... and it returns once the interval has passed (not silenced permanently)" \
+    "$([ -n "$third" ] && echo 0 || echo 1)" "third=${#third}"
+
+out="$(RT_SYNC_WARN_FILES= RT_SYNC_WARN_BYTES= bloat "$BIG")"
+chk "12i the thresholds can be disabled" "$([ -z "$out" ] && echo 0 || echo 1)" "$(head -c 120 <<< "$out")"
+
+# EVERY check above calls `_sync_warn_if_bloated` directly, so all of them pass with the call
+# REMOVED from `_sync_flush` — measured, and the reason this one exists. The entry asks for the
+# warning at FLUSH time; a suite that only tests the function tests the wrong noun.
+rm -rf "$RT_STATE_DIR"; FAKE_TEMPLATE_OUT="$BIG"
+out="$(_sync_flush 2>&1)"
+chk "12j the warning is reached THROUGH _sync_flush, not merely defined" \
+    "$(grep -q 'LARGE' <<< "$out" && echo 0 || echo 1)" "$(head -c 160 <<< "$out")"
+unset -f mutagen
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
