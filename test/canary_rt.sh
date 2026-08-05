@@ -910,6 +910,20 @@ for c in "outputs/res.txt:an ignored path" "/etc/passwd:an absolute path" "../x:
       "$([ $? -eq 2 ] && echo 0 || echo 1)"
 done
 
+# A newline splits one path across two manifest lines on BOTH sides, so the comparison and the
+# per-file mismatch report would describe something other than the file being asked about.
+( cmd_verify --timeout 0 "$(printf 'a\nb')" ) >/dev/null 2>&1
+chk "15f2 a path containing a newline is refused (the manifest is line-oriented)" \
+    "$([ $? -eq 2 ] && echo 0 || echo 1)"
+
+# ORDER: the ignore check reads the LIVE session, so it is meaningless when the daemon cannot be
+# asked. With both an unaskable daemon AND an ignored path, the SESSION must be what is
+# reported — otherwise "not ignored" gets asserted on the strength of an empty answer.
+out=$( FAKE_STATUS=unknown; cmd_verify --timeout 0 outputs/res.txt 2>&1 ); rc=$?
+chk "15f3 an unaskable daemon is reported as such, not silently treated as 'not ignored'" \
+    "$([ "$rc" -eq 2 ] && grep -qi 'could not establish' <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 160 <<< "$out")"
+
 # A remote with no hashing tool is UNVERIFIABLE. Reporting it as a mismatch would be a lie in
 # the dangerous direction; reporting it as arrival would be worse.
 FAKE_REMOTE="RT_NO_SHA_TOOL"

@@ -1516,21 +1516,25 @@ cmd_verify() {
 
   # Every reason a path can never be verified is decided HERE, before any waiting. A caller that
   # waits 60 seconds to be told its path was misspelled has been told the wrong thing slowly.
+  #
+  # Order matters: purely LOCAL facts first (they need nothing and are the most common mistake),
+  # then the session state, then the ignore check — which reads the LIVE session and would be
+  # silently useless if the daemon could not be asked. Checking the session first means that
+  # case is reported as "could not establish", not as "not ignored".
   local p reason
   for p in "${paths[@]}"; do
+    [[ -n "$p" ]]         || die2 "Empty path"
     [[ "$p" != /* ]]      || die2 "verify takes paths RELATIVE to the profile root, got absolute '$p'. (Local root: $LOCAL_DIR)"
     [[ "$p" != *..* ]]    || die2 "Path escapes the profile root: '$p'"
-    [[ -n "$p" ]]         || die2 "Empty path"
+    # A newline would split one path across two manifest lines on BOTH sides, making the
+    # comparison and the per-file mismatch report describe something other than the file.
+    [[ "$p" != *$'\n'* ]] || die2 "Path contains a newline, which the digest manifest is line-oriented about: $(printf '%q' "$p")"
     [[ ! -L "${LOCAL_DIR}/${p}" ]] \
       || die2 "'$p' is a symlink. Hashing the link text would not prove what the remote launches, and following it would not prove the link. Verify the target by its own path."
     [[ ! -d "${LOCAL_DIR}/${p}" ]] \
       || die2 "'$p' is a directory. Verify the files you are about to launch, by name — a recursive manifest brings in ordering, ignored descendants and mid-check mutation, which is a larger decision than this."
     [[ -f "${LOCAL_DIR}/${p}" ]] \
       || die2 "'$p' does not exist locally (looked in $LOCAL_DIR). Local is the authority for what you are staging; there is nothing to assert about."
-    if reason=$(_ignored_reason "$p"); then
-      warn "[$RT_PROFILE] '$p' matches the live session's ignore rule '${reason}'."
-      die2 "That path is excluded from sync, so it can NEVER arrive by syncing and waiting for it would wait forever. Stage it another way, or remove the rule and recreate the session."
-    fi
   done
 
   local st
@@ -1541,6 +1545,13 @@ cmd_verify() {
     paused|halted|erroring)
       die2 "[$RT_PROFILE] Sync is '$st' and is propagating nothing, so these files will not arrive. 'rt -p $RT_PROFILE sync status' says why." ;;
   esac
+
+  for p in "${paths[@]}"; do
+    if reason=$(_ignored_reason "$p"); then
+      warn "[$RT_PROFILE] '$p' matches the live session's ignore rule '${reason}'."
+      die2 "That path is excluded from sync, so it can NEVER arrive by syncing and waiting for it would wait forever. Stage it another way, or remove the rule and recreate the session."
+    fi
+  done
 
   local remote_cmd deadline now
   remote_cmd=$(_remote_digest_cmd "${paths[@]}")
