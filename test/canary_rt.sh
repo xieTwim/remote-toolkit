@@ -875,17 +875,23 @@ export PATH="$SCRATCH/bin:$PATH"
 _ssh_test() { return 0; }; _has_sync() { return 1; }; load_config() { :; }
 _sync_status() { echo none; }
 rm -f "$SCRATCH/late-write2"
+#
+# The stub sleeps far longer than the bound because the output ACCOUNTING added a second, bounded
+# wait after the kill (`_exec_reap`, 2s), so a working bound now costs ~3s here rather than ~1s.
+# Against the original `sleep 4` / `-lt 4` that left no margin on either side — a working bound at
+# 3s and a broken one at 4s — and it flaked once under load. Widening the gap restores what the
+# check is for: ~3s when the bound holds, ~12s when it does not.
 cat > "$SCRATCH/bin/ssh" <<EOF
 #!/bin/sh
 case "\$*" in
-  *SLOWX*) sleep 4; echo LATE >> "$SCRATCH/late-write2" ;;
+  *SLOWX*) sleep 12; echo LATE >> "$SCRATCH/late-write2" ;;
   *)       echo REMOTE_OK ;;
 esac
 EOF
 chmod +x "$SCRATCH/bin/ssh"
 t0=$(date +%s); cmd_exec --timeout 1 "SLOWX" >/dev/null 2>&1; rc=$?; t1=$(date +%s)
 chk "14i cmd_exec --timeout routes through the bounded helper (rc 124, bound honoured)" \
-    "$([ "$rc" = 124 ] && [ $((t1-t0)) -lt 4 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
+    "$([ "$rc" = 124 ] && [ $((t1-t0)) -lt 6 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
 export PATH="$PATH_SAVE"
 
 # The entry's fallback clause: say so where the bounded-read path is documented.
@@ -1158,6 +1164,151 @@ _slurm_submit --assume-staged run.sbatch -- --time=04:00:00 --gres=gpu:2 >/dev/n
 argv="$(cd "$SCRATCH" && PATH="$SCRATCH/bin:$PATH" sh -c "$(cat "$SCRATCH/captured")" 2>/dev/null | grep -c '^SARG\[')"
 chk "16k ordinary sbatch flags still arrive as separate arguments" \
     "$([ "$argv" = "3" ] && echo 0 || echo 1)" "got $argv args (want 3: 2 flags + script)"
+
+# ── 17. `exec` says what it delivered ────────────────────────────────────────
+#
+# A stream carries no statement about its own completeness. Measured 2026-08-06: a multi-file pull
+# through one `exec` returned 1 of 7 files and exited 0; the caller only noticed because it
+# happened to hold a manifest. The remote command now emits a TRAILER on stderr after it exits,
+# and the payload is counted on the way through — so "the stream ended early" stops being
+# indistinguishable from "the command had nothing more to say".
+#
+# `_ssh` is stubbed to RUN the wrapper locally, so what is scored is the real remote text: the
+# trailer really is emitted by a shell, and the filter really has to find it.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="$SCRATCH/proj"; mkdir -p "$REMOTE_DIR"
+info() { printf ':: %s\n' "$*" >&2; }
+warn() { printf '!! %s\n' "$*" >&2; }
+_ssh() { sh -c "$1"; }
+
+O="$SCRATCH/o17"; E="$SCRATCH/e17"
+
+# The trailer is emitted AFTER the command, so it is the last thing the remote shell runs — and
+# the wrapper has to end with an explicit `exit`, or every exec would report printf's status.
+# That is the fail-open this block exists to prevent, one level up from the one it fixes.
+_exec_sync 'exit 7' >"$O" 2>"$E"; rc=$?
+chk "17 a complete stream still returns the COMMAND's status, not the trailer's" \
+    "$([ "$rc" = 7 ] && echo 0 || echo 1)" "rc=$rc"
+# ... and the status alone does not score the SUBSHELL that makes it right. Without one, a literal
+# `exit 7` terminates the remote shell before the trailer is written, the stream is then reported
+# TRUNCATED — and the status is STILL 7, because the transport carried it. Found by a mutation
+# run: dropping the subshell left the check above green. What distinguishes the two is silence.
+chk "17a ... having said nothing, because a literal 'exit' did not outrun the trailer" \
+    "$([ ! -s "$E" ] && echo 0 || echo 1)" "stderr='$(cat "$E")'"
+_exec_sync 'echo hi' >"$O" 2>"$E"; rc=$?
+chk "17b ... and a succeeding command still returns 0 with its output" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$O")" = "hi" ] && echo 0 || echo 1)" "rc=$rc out='$(cat "$O")'"
+
+# BYTE-EXACT, and this is load-bearing rather than tidy: a live caller pipes `tar cf -` through
+# `exec` into `tar xf -`, so one added byte — a newline from a line-oriented filter, an accounting
+# line on the wrong stream — corrupts an archive. NUL bytes and no trailing newline, because those
+# are exactly what a line-oriented implementation would silently change.
+printf 'a\000b\nno-trailing-newline' > "$SCRATCH/bin17.dat"
+_exec_sync "cat '$SCRATCH/bin17.dat'" >"$O" 2>"$E"
+chk "17c the payload passes through byte-exact (NULs, no trailing newline)" \
+    "$(cmp -s "$SCRATCH/bin17.dat" "$O" && echo 0 || echo 1)" "got $(wc -c < "$O") bytes, want $(wc -c < "$SCRATCH/bin17.dat")"
+
+# THE REGRESSION. A stream that ends without the trailer is a PREFIX, and this is the case that
+# used to exit 0 with no marker anywhere. Reverting `_exec_sync` to the old pass-through makes
+# this stub's rc 0 and this check fail.
+_ssh() { printf 'one-of-seven'; return 0; }
+_exec_sync 'pull the seven files' >"$O" 2>"$E"; rc=$?
+chk "17d a stream that ends without the trailer exits non-zero (was: 0)" \
+    "$([ "$rc" = 125 ] && echo 0 || echo 1)" "rc=$rc"
+chk "17e ... and says TRUNCATED, naming what did arrive" \
+    "$(grep -q 'TRUNCATED' "$E" && grep -q '12 bytes' "$E" && echo 0 || echo 1)" "stderr='$(cat "$E")'"
+chk "17f ... while still delivering the prefix it did receive" \
+    "$([ "$(cat "$O")" = "one-of-seven" ] && echo 0 || echo 1)" "out='$(cat "$O")'"
+
+# A transport that failed on its own already carries a status, and 125 must not replace it —
+# 125 means "no outcome was established", which is a different fact from "ssh said 3".
+_ssh() { printf 'x'; return 3; }
+_exec_sync 'anything' >"$O" 2>"$E"; rc=$?
+chk "17g a truncated stream whose transport reported a status keeps THAT status" \
+    "$([ "$rc" = 3 ] && grep -q 'TRUNCATED' "$E" && echo 0 || echo 1)" "rc=$rc"
+
+_ssh() { sh -c "$1"; }
+
+# NEGATIVE CASE, the one that makes the check above worth having: a complete small stream must be
+# silent. Without this, "always warn" would pass every check above and the warning would be
+# filtered out by every caller within a week — which is what happened to a sibling warning here.
+_exec_sync 'echo small' >"$O" 2>"$E"
+chk "17h a complete SMALL output prints no accounting line at all" \
+    "$([ ! -s "$E" ] && echo 0 || echo 1)" "stderr='$(cat "$E")'"
+
+# Above the threshold the size is reported, because that number is the caller's only handle on a
+# cut that happens further downstream than rt can see.
+yes 0123456789abcdefghijklmnopqrstuvwxyz | head -c 70000 > "$SCRATCH/big17.dat"
+_exec_sync "cat '$SCRATCH/big17.dat'" >"$O" 2>"$E"
+chk "17i a complete LARGE output reports the byte count it delivered" \
+    "$(grep -q '70000 bytes' "$E" && echo 0 || echo 1)" "stderr='$(cat "$E")'"
+chk "17j ... and that count is the number of bytes that actually arrived" \
+    "$([ "$(wc -c < "$O" | tr -d ' ')" = "70000" ] && echo 0 || echo 1)" "delivered $(wc -c < "$O") bytes"
+
+# The trailer proves the COMMAND wrote everything it had. It says nothing about whether rt handed
+# all of it on — and a consumer that closes early takes the tail with it while the command may
+# still exit 0. Probed against this commit's own first version: `exec 'cat 400KB' | head -c 5`
+# reported "81920 bytes of stdout, complete", which is the unsupported benign claim this whole
+# block removes, reintroduced one layer out. rc comes through a file because a pipeline reports
+# its LAST stage's status, which is the same reason the docs say not to pipe this.
+#
+# The payload has to be far larger than a pipe buffer, and that is the boundary this check is
+# really about: at 70 KB every byte still reaches rt's stdout — the kernel buffers it and `head`
+# throws it away — so "delivered, complete" is TRUE there and the loss is the consumer's, not
+# rt's. Only once forwarding itself cannot finish does the claim become rt's to get wrong.
+# Measured while writing this check: at 70 KB the defect does not reproduce at all.
+yes 0123456789abcdefghijklmnopqrstuvwxyz | head -c 2000000 > "$SCRATCH/huge17.dat"
+{ _exec_sync "cat '$SCRATCH/huge17.dat'" 2>"$E"; echo $? > "$SCRATCH/rc17"; } | head -c 5 > "$O"
+rc="$(cat "$SCRATCH/rc17")"
+chk "17r a consumer that closes early is reported as a PREFIX, never as complete" \
+    "$([ "$rc" != 0 ] && grep -q 'did NOT deliver the whole payload' "$E" && ! grep -q 'complete' "$E" && echo 0 || echo 1)" \
+    "rc=$rc stderr='$(cat "$E")'"
+
+# The remote's own stderr must still arrive, and the trailer must not. An implementation that
+# passed the trailer through would leak a token into every caller's diagnostics; one that dropped
+# too much would eat the remote's last line, which is silent loss of exactly the kind of message
+# a failure is announced in.
+_exec_sync 'echo out-line; echo err-line >&2' >"$O" 2>"$E"
+chk "17k the remote's stderr still reaches the caller" \
+    "$(grep -q '^err-line$' "$E" && echo 0 || echo 1)" "stderr='$(cat "$E")'"
+chk "17l ... and the trailer token is not in it" \
+    "$(grep -q '__rt_exec_end' "$E" && echo 1 || echo 0)" "stderr='$(cat "$E")'"
+
+# The filter's one hard case: a remote whose last stderr write has no newline, so the trailer is
+# not a record of its own. That line must survive — losing it is the silent-loss shape above.
+_exec_sync 'printf out; printf no-newline-tail >&2' >"$O" 2>"$E"; rc=$?
+chk "17m a stderr line with no trailing newline survives the trailer filter" \
+    "$([ "$rc" = 0 ] && grep -q '^no-newline-tail$' "$E" && echo 0 || echo 1)" "rc=$rc stderr='$(cat "$E")'"
+
+# `_exec_reap` is why the accounting does not reinstate an unbounded wait: the readers see EOF
+# only once EVERY holder of the payload pipe has closed it, and after `--timeout` kills ssh that
+# can include something ssh left behind. Check 14i scores the end-to-end bound; these two score
+# the reaper's own two outcomes, since a reaper that never kills and one that always kills both
+# leave 14i green.
+sleep 6 & slow_pid=$!
+# Grouped with stderr closed: the shell announces the killed job on `wait`, and that notice is
+# not this check's output.
+{ t0=$(date +%s); _exec_reap 1 "$slow_pid"; rr=$?; t1=$(date +%s); wait "$slow_pid"; } 2>/dev/null
+chk "17n the reaper kills a reader that outlives the grace, and returns non-zero" \
+    "$([ "$rr" != 0 ] && [ $((t1-t0)) -lt 4 ] && echo 0 || echo 1)" "rc=$rr after $((t1-t0))s"
+sleep 0 & fast_pid=$!
+_exec_reap 3 "$fast_pid"; rr=$?
+wait "$fast_pid" 2>/dev/null
+chk "17o ... and returns 0 without killing one that finishes inside it" \
+    "$([ "$rr" = 0 ] && echo 0 || echo 1)" "rc=$rr"
+
+# The count is ABSENT, not 0, when it could not be taken — `wc` writes its total only at EOF, so
+# a killed reader leaves no number, and reporting that as zero would be a measurement nobody made.
+out17="$(_exec_account "" "" 0 0 2>&1)"; rc=$?
+chk "17p an uncounted stream is reported as unestablished, not as 0 bytes" \
+    "$([ "$rc" = 125 ] && grep -q 'unestablished' <<< "$out17" && ! grep -q '0 bytes' <<< "$out17" && echo 0 || echo 1)" \
+    "rc=$rc out='$out17'"
+
+# The docs have to carry the new status, or a caller branching on `rt exec` has no way to learn it.
+DOCS_DIR="$(dirname "$HERE")"
+chk "17q the 125 status is documented where exec's exit codes are" \
+    "$(grep -q '125' "$DOCS_DIR/SKILL.md" && grep -q '125' "$DOCS_DIR/README.md" && grep -q '125' "$RT" && echo 0 || echo 1)"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi

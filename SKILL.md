@@ -190,6 +190,13 @@ rt -p fact-cluster/scratch exec --timeout 30 "cat big.log"   # bound the wait
 
 The bound is on the **wait**, not on the work: `rt` kills the local `ssh`, which does not reliably kill the remote process. It says so when it fires. If you need the remote side to stop too, run it with `--bg` and kill the tmux session.
 
+**A large `exec` payload can be cut, and `rt` now says so — but only about the half it can see.** A stream carries no statement about its own completeness: measured 2026-08-06, a multi-file pull through a single `exec` returned 1 of 7 files and exited 0, and the caller noticed only because it happened to hold a manifest of what it had asked for. Two things now make that checkable:
+
+- The remote command is followed by a **trailer** the remote shell writes after it exits. If the stream ends without it, `exec` prints `output is TRUNCATED` and exits **125** — "no outcome established", beside the 124 already used for the bound. A real transport status is never replaced by 125; a genuine `ssh` failure keeps its own.
+- A complete payload at or above **64 KiB** reports its size (`exec delivered N bytes of stdout, complete`). Below that, nothing is printed and the call behaves exactly as before. Tune with `RT_EXEC_REPORT_BYTES`.
+
+**That size line is the part you have to act on.** `rt` does not cap the payload and neither does `ssh`, so a cut at ~100 KB happens in whatever *captures* rt's stdout — an agent's tool-output limit, a harness buffer — which `rt` cannot detect and cannot prevent. Compare the reported number against what you actually hold. For anything large, do not capture the stream at all: redirect it to a file (`rt … exec 'cat big' > local.bin`), or pull with `tar` and check the exit status of the *last* stage. And note that piping `rt exec` into anything discards `rt`'s exit status entirely — the pipeline reports the last command's — so a `TRUNCATED` exit is invisible to `rt … exec 'cat f' | grep …`. Write to a file first, then process the file.
+
 Long commands (builds, training daemons, services):
 ```bash
 rt -p fact-cluster/scratch exec --bg --name build "make all"

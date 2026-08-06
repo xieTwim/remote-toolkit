@@ -982,16 +982,218 @@ cmd_exec() {
   fi
 }
 
+# ── What `exec` actually delivered ─────────────────────────────────────────────
+#
+# A stream carries no statement about its own completeness: a caller that receives half of one
+# receives no signal that it is half. Measured by a project doing a multi-file pull through a
+# single `exec` — 1 of 7 files arrived and the call still exited 0. The loss was caught only
+# because that caller happened to hold a manifest of what it had asked for; an agent doing the
+# same pull without one cannot detect it at all.
+#
+# The defect is the SILENCE, not any particular cap — and note where the cap is NOT: nothing in
+# this script limits the payload, and ssh does not truncate, so the cut happens in whatever
+# captures rt's stdout. `rt` cannot prevent that. What it can do is make the two facts a caller
+# would need in order to notice checkable:
+#
+#   · a TRAILER, written to stderr by the remote shell only AFTER the command has exited. Its
+#     arrival is evidence that the whole of that command's stdout was written to the channel;
+#     its absence means the stream ended early, and that case used to exit 0 and say nothing.
+#   · the payload is COUNTED as it passes through, and the count is reported once it is large
+#     enough for a downstream capture limit to be plausible. That number is what a caller
+#     compares against what it actually holds.
+#
+# Both are additive. stdout stays a byte-exact pass-through — a live caller pipes `tar cf -`
+# through `exec` into `tar xf -`, so one added byte would corrupt an archive — and an output
+# below the report threshold produces exactly what it produced before.
+#
+# Raising a limit is explicitly not the fix: the next payload is always bigger than the new cap.
+# Routing large payloads to a file and returning the path is the larger fix, and is a contract
+# change rather than this.
+
+# The text the remote login shell runs. The command goes in a SUBSHELL for the same reason
+# `_exec_bg` uses one: a command that is literally `exit N` would otherwise terminate the shell
+# before the trailer is written, and since the trailer's absence is this function's failure
+# signal, `rt exec 'exit 7'` would report a truncated stream that was never truncated.
+#
+# CORRECTION, from a mutation run on this commit's own first claim: the trailing `exit` was
+# described here as what keeps `exec`'s status the command's rather than printf's. It is not —
+# `_exec_account` reads the status out of the TRAILER, so removing this line changes no result
+# and the suite stayed green with it gone. It earns its place for a narrower reason: it keeps
+# ssh's own status agreeing with the trailer's, which is what the accounting falls back to when
+# the trailer is absent or malformed.
+_exec_remote_cmd() {  # <token> <command>
+  local token="$1" command="$2"
+  # $command is deliberately shell text — that is what `rt exec` is for. REMOTE_DIR is not.
+  cat <<EOF
+cd $(_shq "$REMOTE_DIR") && ( ${command} )
+__rt_rc=\$?
+printf '%s%s\n' $(_shq "$token") "\$__rt_rc" >&2
+exit \$__rt_rc
+EOF
+}
+
+# Pass the remote's stderr through, minus the trailer, whose status is written to <rcfile>.
+#
+# The token is a per-invocation nonce, so any record carrying it is ours and no line has to be
+# held back to find out — holding one back would delay a long-running command's progress output
+# by a line, which is a behaviour change. `fflush` is there for the same reason: awk block-buffers
+# when its output is not a terminal, and `exec`'s stderr is watched live.
+#
+# `pre` covers the one case where the trailer is not a record of its own: a remote whose last
+# stderr write had no trailing newline. That prefix is re-emitted with one, which is the only byte
+# this filter can add, and only on stderr.
+_exec_trailer_filter() {  # <token> <rcfile>
+  awk -v t="$1" -v f="$2" '
+    {
+      i = index($0, t)
+      if (i > 0) {
+        pre = substr($0, 1, i - 1)
+        if (pre != "") { printf "%s\n", pre; fflush() }
+        rc = substr($0, i + length(t))
+        if (rc ~ /^[0-9]+$/) { printf "%s\n", rc > f; close(f) }
+        next
+      }
+      print; fflush()
+    }'
+}
+
+# Wait for the accounting readers, but not without a bound of its own. `--timeout`'s promise is
+# that the CALLER stops waiting, and the readers only see EOF once EVERY holder of the payload
+# pipe's write end has closed it — which after a kill can include something ssh left behind. Found
+# by this repo's own `--timeout` check the moment the accounting was added: against a stub whose
+# `sleep` outlived the killed ssh, a 1s bound returned after 4s.
+#
+# Past the grace the readers are KILLED and, because `wc` writes its total only at EOF, the byte
+# count is then simply absent. That is reported as unestablished, never as 0: a count that could
+# not be taken is not a small one.
+_exec_reap() {  # <grace-seconds> <pid>...
+  local grace="$1"; shift
+  local waited=0 p alive
+  while [[ "$waited" -lt "$grace" ]]; do
+    alive=0
+    for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [[ "$alive" -eq 0 ]] && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for p in "$@"; do kill "$p" 2>/dev/null || true; done
+  return 1
+}
+
+# Say what was established about the stream, in the order the facts are decided.
+#
+# <trailer-rc> empty means the trailer never arrived — the stream ended before the command did.
+# <bytes> empty means the count could not be taken. <forward-rc> is the PASS-THROUGH's own status,
+# and it is the second way this can fail: the trailer proves the command wrote everything it had,
+# and says nothing about whether rt managed to hand all of it on. Found by probing this commit's
+# own change — `exec 'cat 400KB' | head -c 5` reported "81920 bytes of stdout, complete", which is
+# the exact shape of unsupported benign claim the change exists to remove, reintroduced one layer
+# out.
+_exec_account() {  # <bytes-or-empty> <trailer-rc-or-empty> <transport-rc> <forward-rc>
+  local bytes="$1" trailer="$2" transport="$3" forward="$4"
+  local report="${RT_EXEC_REPORT_BYTES:-65536}"
+  local seen="an unestablished number of bytes"
+  [[ -n "$bytes" ]] && seen="$bytes bytes"
+
+  # The bound is decided first, and on its own message: it fired, so the caller has already been
+  # told the wait ended, and every other reading here would be a consequence of that kill.
+  if [[ "$transport" -eq 124 ]]; then
+    warn "[$RT_PROFILE] exec output is TRUNCATED: $seen arrived before the bound ended the wait. What you have is a PREFIX."
+    return 124
+  fi
+
+  # No trailer: the stream ended before the remote command finished, so nothing establishes that
+  # what came through is the whole of it. Returning 0 here is what let a partial payload parse as
+  # a complete one.
+  if [[ -z "$trailer" ]]; then
+    warn "[$RT_PROFILE] exec output is TRUNCATED: $seen arrived and then the stream ended without the remote command reporting that it had finished. Treat what you received as a PREFIX, not as the answer."
+    if [[ "$transport" -ne 0 ]]; then
+      return "$transport"
+    fi
+    # 125 for "no outcome was established", beside the 124 already used for the bound, and
+    # following timeout(1)/env(1), which reserve it for a failure of the wrapper itself.
+    return 125
+  fi
+
+  # The command finished, but the hand-off did not. A consumer that closed early takes the tail
+  # with it, and the command may still have exited 0 — so this must not fall through to a status
+  # that reads as success.
+  if [[ "$forward" -ne 0 ]]; then
+    warn "[$RT_PROFILE] exec did NOT deliver the whole payload: forwarding stopped after $seen because whatever was reading rt's stdout closed first. The remote command finished; what reached you is a PREFIX. Redirect to a file rather than piping."
+    if [[ "$trailer" -ne 0 ]]; then
+      return "$trailer"
+    fi
+    return 125
+  fi
+
+  # Everything the command wrote reached the channel, and everything on the channel was handed on.
+  # Below the threshold nothing is printed at all: a small output must behave exactly as it did
+  # before. Above it, the size is the caller's only handle on a cut further downstream than rt
+  # can see at all.
+  if [[ -n "$bytes" ]] && [[ "$bytes" -ge "$report" ]]; then
+    info "[$RT_PROFILE] exec delivered $bytes bytes of stdout, complete. If what you captured holds fewer, it was cut AFTER rt — write it to a file instead of capturing the stream."
+  fi
+  return "$trailer"
+}
+
 _exec_sync() {
   local command="$1"
   local limit="${2:-}"
-  # $command is deliberately shell text — that is what `rt exec` is for. REMOTE_DIR is not.
-  local remote="cd $(_shq "$REMOTE_DIR") && ${command}"
+
+  # Everything that can `die` happens BEFORE the readers start. A `die` between mkfifo and the
+  # ssh call would leave them blocked forever on a fifo open that no writer ever reaches.
+  local token remote
+  token="__rt_exec_end_${$}_${RANDOM}__"
+  remote="$(_exec_remote_cmd "$token" "$command")"
+
+  local acct
+  acct="$(mktemp -d "${TMPDIR:-/tmp}/rt-exec.XXXXXX")" \
+    || die "Could not create a temporary directory for exec accounting (TMPDIR=${TMPDIR:-/tmp})."
+  mkfifo "$acct/out" "$acct/dup" "$acct/err" \
+    || { rm -rf "$acct"; die "Could not create the pipes 'exec' uses to account for its own output."; }
+
+  # Readers first, and in this order: opening a fifo blocks until the other end opens, so `wc`
+  # must be waiting before `tee` opens its copy, and `tee` before ssh's redirection opens the
+  # payload end.
+  wc -c < "$acct/dup" > "$acct/bytes" &
+  local wc_pid=$!
+  tee "$acct/dup" < "$acct/out" &                    # the payload's only path to rt's stdout
+  local tee_pid=$!
+  _exec_trailer_filter "$token" "$acct/rc" < "$acct/err" >&2 &
+  local filter_pid=$!
+
+  local transport=0
   if [[ -n "$limit" ]]; then
-    _ssh_bounded "$limit" "$remote"
+    _ssh_bounded "$limit" "$remote" > "$acct/out" 2> "$acct/err" || transport=$?
   else
-    _ssh "$remote"
+    _ssh "$remote" > "$acct/out" 2> "$acct/err" || transport=$?
   fi
+
+  # The redirections above close with the call, so the readers now see EOF. Wait for them rather
+  # than reading their output files: a count read before `wc` has written it is a smaller number
+  # reported with the same confidence, which is the shape of the defect this closes.
+  #
+  # The grace applies only after the bound fired, because that is the only path on which rt has
+  # already promised to stop waiting and the only one that killed ssh. When ssh exits on its own
+  # the channel is closed and nothing further is coming, so waiting there is waiting for a drain.
+  if [[ "$transport" -eq 124 ]]; then
+    # `|| true` because a reap that had to kill returns non-zero, and under `set -e` that would
+    # abort the accounting it exists to make possible. The absent count says the same thing.
+    _exec_reap 2 "$tee_pid" "$wc_pid" "$filter_pid" || true
+  fi
+  # `tee`'s status is the PASS-THROUGH's, and it is a fact in its own right: a consumer that
+  # closed early kills it, and the payload then stops at whatever it had already handed on.
+  local forward=0
+  wait "$tee_pid"    2>/dev/null || forward=$?
+  wait "$wc_pid"     2>/dev/null || true
+  wait "$filter_pid" 2>/dev/null || true
+
+  local bytes trailer
+  bytes="$(cat "$acct/bytes" 2>/dev/null || true)";  bytes="${bytes//[!0-9]/}"
+  trailer="$(cat "$acct/rc" 2>/dev/null || true)";   trailer="${trailer//[!0-9]/}"
+  rm -rf "$acct"
+
+  _exec_account "$bytes" "$trailer" "$transport" "$forward"
 }
 
 # Bound an `_ssh` call in the WRAPPER, in pure Bash.
@@ -1873,7 +2075,13 @@ COMMANDS:
                        Non-interactive key push (requires sshpass)
   connect              Start Mutagen sync; resumes a paused session; ensures daemon is running
   disconnect           Terminate sync; preserves local replica files
-  exec <command>       Run a command on the remote (auto-flushes sync)
+  exec <command>       Run a command on the remote (auto-flushes sync).
+                       Exits 125 and says "output is TRUNCATED" when the stream
+                       ended before the command reported finishing -- what you
+                       have is a PREFIX. A complete payload of 64 KiB or more
+                       reports its size (RT_EXEC_REPORT_BYTES) so you can check
+                       it against what you captured; nothing caps the payload
+                       here, so a cut that big happened downstream of rt.
   exec --no-flush <cmd>
                        Skip sync flush (faster for fast iteration)
   exec --timeout SECS <cmd>
