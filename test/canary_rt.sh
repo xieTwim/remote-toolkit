@@ -1310,6 +1310,123 @@ DOCS_DIR="$(dirname "$HERE")"
 chk "17q the 125 status is documented where exec's exit codes are" \
     "$(grep -q '125' "$DOCS_DIR/SKILL.md" && grep -q '125' "$DOCS_DIR/README.md" && grep -q '125' "$RT" && echo 0 || echo 1)"
 
+# ── 18. verified bulk transfer: `fetch` and `push` ───────────────────────────
+#
+# `exec`'s trailer made truncation VISIBLE and block 17 scores that. This block scores the half
+# 17 cannot: of the four real script callers, NOT ONE branches on `rt exec`'s status — every one
+# pipes stdout into tar/grep/awk, a pipeline reports its LAST stage, and three of the four discard
+# stderr too. So the fix is not a louder signal, it is a destination that is never a partial file.
+#
+# The invariant every check below is an instance of: **on any path that is not a verified
+# success, the destination is not written and no incoming file is left behind.**
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="$SCRATCH/proj"; mkdir -p "$REMOTE_DIR"
+info() { printf ':: %s\n' "$*" >&2; }
+warn() { printf '!! %s\n' "$*" >&2; }
+_sync_preflight_for_exec() { :; }            # offline: reachability/flush are block 4-6's job
+_ssh() { sh -c "$1"; }
+
+D="$SCRATCH/fetch"; mkdir -p "$D"; E18="$SCRATCH/e18"
+printf 'col,val\n1,2\n' > "$REMOTE_DIR/one.csv"
+leftovers() { ls "$D"/*.rt-incoming.* 2>/dev/null | wc -l | tr -d ' '; }
+
+cmd_fetch "$D/got.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18 fetch delivers a verified payload and returns 0" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/got.csv" && echo 0 || echo 1)" "rc=$rc"
+chk "18a ... reporting the digest it verified, not just a byte count" \
+    "$(grep -q 'sha256' "$E18" && echo 0 || echo 1)" "stderr='$(cat "$E18")'"
+chk "18b ... and leaves no incoming file behind" "$([ "$(leftovers)" = 0 ] && echo 0 || echo 1)"
+
+# BYTE-EXACT, for the same reason block 17c is: the real caller fetches a tar.
+printf 'a\000b\nno-trailing-newline' > "$REMOTE_DIR/bin.dat"
+cmd_fetch "$D/bin.out" "cat $REMOTE_DIR/bin.dat" 2>"$E18"
+chk "18c the payload is byte-exact through fetch (NULs, no trailing newline)" \
+    "$(cmp -s "$REMOTE_DIR/bin.dat" "$D/bin.out" && echo 0 || echo 1)"
+
+# THE REGRESSION, and the reason this verb exists. A cut stream reaches no trailer. Under `exec`
+# this is a 125 nobody reads; here the destination must simply not appear.
+printf 'existing\n' > "$D/keep.csv"
+_ssh() { printf 'one-of-seven'; return 0; }
+cmd_fetch "$D/keep.csv" "pull the seven files" 2>"$E18"; rc=$?
+chk "18d a stream that ends without the trailer does NOT write the destination" \
+    "$([ "$rc" = 125 ] && [ "$(cat "$D/keep.csv")" = "existing" ] && echo 0 || echo 1)" "rc=$rc"
+chk "18e ... and removes the incoming file rather than leaving a partial for a later glob" \
+    "$([ "$(leftovers)" = 0 ] && echo 0 || echo 1)"
+
+# DIGEST MISMATCH — the case a byte count cannot catch: the remote reports what it MEANT to send,
+# and something between there and here altered it. Emitted with a correct-length but wrong-content
+# payload, so a length check alone would pass this.
+_ssh() { sh -c "$1" | tr 'a-z' 'A-Z'; }      # same length, different bytes, real trailer
+cmd_fetch "$D/mismatch.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18f a payload altered in transit is a DIGEST MISMATCH, not a short file" \
+    "$([ "$rc" = 3 ] && grep -q 'DIGEST MISMATCH' "$E18" && echo 0 || echo 1)" "rc=$rc"
+chk "18g ... and the destination is not created" \
+    "$([ ! -e "$D/mismatch.csv" ] && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)"
+
+_ssh() { sh -c "$1"; }
+
+# A payload from a command that FAILED is not an artifact, whatever its digest says. `tar cf -`
+# exiting non-zero still writes a valid-looking prefix, which is precisely the opt-dyn caller.
+cmd_fetch "$D/failed.csv" "echo partial; exit 4" 2>"$E18"; rc=$?
+chk "18h a non-zero remote command does not write the destination, and keeps its own status" \
+    "$([ "$rc" = 4 ] && [ ! -e "$D/failed.csv" ] && echo 0 || echo 1)" "rc=$rc"
+
+# UNVERIFIABLE is not MISMATCH — the distinction `rt verify` already draws, and the one that
+# decides whether a human should investigate the file or the host.
+_ssh() { PATH="$SCRATCH/nosha" sh -c "$1"; }
+mkdir -p "$SCRATCH/nosha"
+for b in sh cat awk wc mktemp rm printf dirname tr; do
+  p="$(command -v $b)"; [ -n "$p" ] && ln -sf "$p" "$SCRATCH/nosha/$b"
+done
+cmd_fetch "$D/nosha.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18i a remote with no sha256 tool is UNVERIFIABLE (2), never a mismatch" \
+    "$([ "$rc" = 2 ] && grep -q 'UNVERIFIABLE' "$E18" && ! grep -q 'MISMATCH' "$E18" && echo 0 || echo 1)" "rc=$rc"
+chk "18j ... and still does not write the destination" \
+    "$([ ! -e "$D/nosha.csv" ] && echo 0 || echo 1)"
+
+_ssh() { sh -c "$1"; }
+
+# ── push: the INPUT side, and it is a different incident ─────────────────────
+# `base64 < local | rt exec 'base64 -d > remote'` delivered an EMPTY stdin stream 2 of 3 times.
+# base64 -d succeeded on zero bytes, wrote a 0-byte file, exited 0 — a 0-byte script "deployed"
+# cleanly and a GPU evaluation was consumed running `python3 <empty file>`.
+P="$SCRATCH/push"; mkdir -p "$P"; REMOTE_DIR="$P"
+printf '#!/usr/bin/env python3\nprint("real")\n' > "$SCRATCH/script.py"
+cmd_push "$SCRATCH/script.py" "installed.py" 2>"$E18"; rc=$?
+chk "18k push installs a verified payload and returns 0" \
+    "$([ "$rc" = 0 ] && cmp -s "$SCRATCH/script.py" "$P/installed.py" && echo 0 || echo 1)" "rc=$rc"
+
+# THE INCIDENT: an empty delivery. Under the old pipeline this exited 0 and installed 0 bytes.
+_ssh() { sh -c "$1" < /dev/null; }
+cmd_push "$SCRATCH/script.py" "empty.py" 2>"$E18"; rc=$?
+chk "18l an EMPTY stdin delivery is a digest mismatch, not a successful 0-byte install" \
+    "$([ "$rc" = 3 ] && [ ! -e "$P/empty.py" ] && echo 0 || echo 1)" "rc=$rc"
+
+# ... and it must not damage a file that is already there. The recorded harm was a GPU run on a
+# clean-looking replacement, so overwriting a good script with nothing is the shape to prevent.
+printf 'GOOD\n' > "$P/live.py"
+cmd_push "$SCRATCH/script.py" "live.py" 2>"$E18"
+chk "18m ... leaving an existing destination untouched" \
+    "$([ "$(cat "$P/live.py")" = "GOOD" ] && echo 0 || echo 1)" "got='$(cat "$P/live.py")'"
+chk "18n ... and no incoming file beside it" \
+    "$([ "$(ls "$P"/*.rt-incoming.* 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && echo 0 || echo 1)"
+
+_ssh() { sh -c "$1"; }
+
+# THE FALSE-POSITIVE GUARD. Every check above is satisfied by a `fetch` that never writes
+# anything and a `push` that always refuses. Without this the whole block scores a broken tool
+# as correct — the same guard block 17h exists to be.
+REMOTE_DIR="$SCRATCH/proj"                   # the push checks repointed it
+cmd_fetch "$D/still-works.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18o the happy path still writes, after every refusal above" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/still-works.csv" && echo 0 || echo 1)" "rc=$rc"
+
+# The verbs and their statuses have to be documented, or a caller cannot adopt them.
+chk "18p fetch/push and their exit codes are documented" \
+    "$(grep -q 'rt fetch' "$DOCS_DIR/SKILL.md" && grep -q 'rt fetch' "$DOCS_DIR/README.md" \
+       && grep -q 'rt push' "$DOCS_DIR/SKILL.md" && echo 0 || echo 1)"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

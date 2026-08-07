@@ -195,7 +195,45 @@ The bound is on the **wait**, not on the work: `rt` kills the local `ssh`, which
 - The remote command is followed by a **trailer** the remote shell writes after it exits. If the stream ends without it, `exec` prints `output is TRUNCATED` and exits **125** — "no outcome established", beside the 124 already used for the bound. A real transport status is never replaced by 125; a genuine `ssh` failure keeps its own.
 - A complete payload at or above **64 KiB** reports its size (`exec delivered N bytes of stdout, complete`). Below that, nothing is printed and the call behaves exactly as before. Tune with `RT_EXEC_REPORT_BYTES`.
 
-**That size line is the part you have to act on.** `rt` does not cap the payload and neither does `ssh`, so a cut at ~100 KB happens in whatever *captures* rt's stdout — an agent's tool-output limit, a harness buffer — which `rt` cannot detect and cannot prevent. Compare the reported number against what you actually hold. For anything large, do not capture the stream at all: redirect it to a file (`rt … exec 'cat big' > local.bin`), or pull with `tar` and check the exit status of the *last* stage. And note that piping `rt exec` into anything discards `rt`'s exit status entirely — the pipeline reports the last command's — so a `TRUNCATED` exit is invisible to `rt … exec 'cat f' | grep …`. Write to a file first, then process the file.
+**That size line is the part you have to act on.** `rt` does not cap the payload and neither does `ssh`, so a cut at ~100 KB happens in whatever *captures* rt's stdout — an agent's tool-output limit, a harness buffer — which `rt` cannot detect and cannot prevent. Compare the reported number against what you actually hold. And note that piping `rt exec` into anything discards `rt`'s exit status entirely — the pipeline reports the last command's — so a `TRUNCATED` exit is invisible to `rt … exec 'cat f' | grep …`.
+
+## Moving a payload: `rt fetch` and `rt push`, never a pipe
+
+**For anything you would be upset to receive half of, do not use `exec` at all.** Use these:
+
+```bash
+rt -p host/proj fetch runs.tar 'cd /data/runs && tar cf - *.csv'   # generated payload
+rt -p host/proj fetch one.csv  'cat /data/runs/one.csv'            # an existing file
+rt -p host/proj push ./patched.py scripts/patched.py               # local -> remote
+```
+
+The remote stages the payload, digests it **there**, streams it, and reports the digest in the
+trailer; `rt` digests what actually arrived and renames into place **only on a match**. So a cut
+anywhere — remote, transport, or rt's own stdout — is a digest mismatch, and the destination is
+never a partial file. `push` is the same discipline in the other direction and exists because
+`base64 < local | rt exec 'base64 -d > remote'` delivered an **empty** stdin stream 2 of 3 times:
+`base64 -d` succeeded on zero bytes, a 0-byte script "deployed" cleanly, and a GPU evaluation was
+consumed running `python3 <empty file>` at rc=0.
+
+| exit | meaning |
+|---|---|
+| **0** | delivered and verified; the digest is printed |
+| **2** | **unverifiable** — no `sha256sum`/`shasum` on one side. Not a mismatch; investigate the host |
+| **3** | **digest mismatch** — the payload was cut or altered. Investigate the transfer |
+| **124** | the `--timeout` bound fired |
+| **125** | no outcome established — the stream ended before the remote reported finishing |
+| other | the remote command's own status |
+
+**On every non-zero path the destination is not written and the incoming file is removed**, so a
+partial payload can never be picked up later by a glob and read as an artifact. A payload from a
+command that exited non-zero is not installed either, whatever its digest says.
+
+Two bounds worth knowing: the payload is staged on the **remote**, so it needs free space there
+for one copy — that is the price of digesting before sending, which is the only ordering in which
+the digest describes what the remote meant to send. And `fetch`'s destination temp is a **sibling**
+of the destination, so the final rename stays within one filesystem.
+
+`exec`'s 125 stays as a diagnostic for callers that have not migrated.
 
 Long commands (builds, training daemons, services):
 ```bash

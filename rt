@@ -908,6 +908,47 @@ cmd_disconnect() {
   info "[$RT_PROFILE] Disconnected. Local replica preserved at $LOCAL_DIR"
 }
 
+# Reachability + "does the remote have your latest edits", for every verb that RUNS something
+# there. Extracted from `cmd_exec` when `fetch` arrived rather than copied into it: this is a
+# decision RULE, and this workspace has already paid once for carrying one in two places — the
+# copies agree until the day one is fixed. `fetch` runs an arbitrary remote command, so it needs
+# exactly this gate and needs it to stay the same gate.
+_sync_preflight_for_exec() {  # <no_flush:true|false>
+  local no_flush="${1:-false}"
+
+  # Need SSH; sync state is independent
+  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST. Run 'rt connect' first."
+
+  # Auto-flush sync so the remote sees latest edits before exec.
+  #
+  # The gate used to be `_has_sync`, a BOOLEAN, and a boolean cannot carry "I could not find
+  # out". When the daemon could not be asked, `_has_sync` was false, the whole block was
+  # skipped, and the command ran with no flush and no warning — the most permissive path taken
+  # for the least established state, which is the same fail-open `slurm submit` had for "no
+  # session at all". Found by an independent review of this session's own change.
+  if [[ "$no_flush" == false ]]; then
+    local _sst
+    _sst=$(_sync_status)
+    if [[ "$_sst" == "unknown" ]]; then
+      die "[$RT_PROFILE] Could not establish whether this profile has a sync session (the Mutagen daemon could not be asked, or answered ambiguously), so nothing establishes that the remote has your latest edits. Check 'mutagen daemon start' and 'rt -p $RT_PROFILE sync status', or pass --no-flush if you intend to run against the remote as it stands."
+    fi
+  fi
+
+  if [[ "$no_flush" == false ]] && _has_sync; then
+    # 2 = nothing synchronised. Running now would execute whatever code happens to be on the
+    # remote, and the caller — usually a script or an agent branching on $? — would be told the
+    # command succeeded. That is how a GPU job silently runs yesterday's code. 3 = the 10s bound
+    # elapsed while the daemon kept working; the edits are probably arriving, so it continues,
+    # but it says WHAT it could not establish rather than "had issues".
+    local _frc=0
+    _sync_flush || _frc=$?
+    case "$_frc" in
+      2) die "[$RT_PROFILE] Sync could NOT be flushed (paused session or a mutagen error), so the remote may not have your latest edits and this command would run against unknown code. Fix with 'rt -p $RT_PROFILE connect', or pass --no-flush if you intend to run against the remote as it stands." ;;
+      3) warn "[$RT_PROFILE] Flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s — the daemon is still syncing, so this command may see slightly older files. Raise RT_FLUSH_TIMEOUT, or add the heavy dir to MUTAGEN_IGNORE." ;;
+    esac
+  fi
+}
+
 cmd_exec() {
   load_config
 
@@ -942,37 +983,7 @@ cmd_exec() {
     [[ "$bg" == false ]] || die "--timeout and --bg are contradictory: a background job outlives this shell. Use 'rt logs' to check on it."
   fi
 
-  # Need SSH; sync state is independent
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST. Run 'rt connect' first."
-
-  # Auto-flush sync so the remote sees latest edits before exec.
-  #
-  # The gate used to be `_has_sync`, a BOOLEAN, and a boolean cannot carry "I could not find
-  # out". When the daemon could not be asked, `_has_sync` was false, the whole block was
-  # skipped, and the command ran with no flush and no warning — the most permissive path taken
-  # for the least established state, which is the same fail-open `slurm submit` had for "no
-  # session at all". Found by an independent review of this session's own change.
-  if [[ "$no_flush" == false ]]; then
-    local _sst
-    _sst=$(_sync_status)
-    if [[ "$_sst" == "unknown" ]]; then
-      die "[$RT_PROFILE] Could not establish whether this profile has a sync session (the Mutagen daemon could not be asked, or answered ambiguously), so nothing establishes that the remote has your latest edits. Check 'mutagen daemon start' and 'rt -p $RT_PROFILE sync status', or pass --no-flush if you intend to run against the remote as it stands."
-    fi
-  fi
-
-  if [[ "$no_flush" == false ]] && _has_sync; then
-    # 2 = nothing synchronised. Running now would execute whatever code happens to be on the
-    # remote, and the caller — usually a script or an agent branching on $? — would be told the
-    # command succeeded. That is how a GPU job silently runs yesterday's code. 3 = the 10s bound
-    # elapsed while the daemon kept working; the edits are probably arriving, so it continues,
-    # but it says WHAT it could not establish rather than "had issues".
-    local _frc=0
-    _sync_flush || _frc=$?
-    case "$_frc" in
-      2) die "[$RT_PROFILE] Sync could NOT be flushed (paused session or a mutagen error), so the remote may not have your latest edits and this command would run against unknown code. Fix with 'rt -p $RT_PROFILE connect', or pass --no-flush if you intend to run against the remote as it stands." ;;
-      3) warn "[$RT_PROFILE] Flush did not finish within ${RT_FLUSH_TIMEOUT:-10}s — the daemon is still syncing, so this command may see slightly older files. Raise RT_FLUSH_TIMEOUT, or add the heavy dir to MUTAGEN_IGNORE." ;;
-    esac
-  fi
+  _sync_preflight_for_exec "$no_flush"
 
   local command="${cmd_args[*]}"
   if [[ "$bg" == true ]]; then
@@ -1874,6 +1885,239 @@ cmd_verify() {
   done
 }
 
+# ── Verified bulk transfer: fetch / push ──────────────────────────
+#
+# WHY THIS IS A SEPARATE VERB AND NOT A MODE OF `exec`.
+#
+# `exec` hands its payload back as a STREAM, and the recorded cut is downstream of anything rt
+# can reach: an agent's tool-output limit, a harness buffer, a consumer that closed early. The
+# sibling fix (69be333) made that cut VISIBLE — a nonce trailer, exit 125, a byte count — and
+# then measured why visible is not enough: of the four real script callers, not one branches on
+# `rt exec`'s status. Every one pipes stdout into `tar`/`grep`/`awk`, a pipeline reports its LAST
+# stage, and three of the four discard stderr too. The signal exists and every caller is deaf.
+#
+# The rejected alternative was to make `exec` return a path+manifest above a size threshold. That
+# makes the semantic TYPE of the result depend on a threshold, so every consumer implements two
+# protocols, an implementation limit becomes public semantics, and a payload that grows silently
+# changes the response shape with no caller change. It institutionalises the shape instead of
+# ending it. A separate verb costs the existing callers nothing and is adopted one at a time.
+#
+# THE MECHANISM. The remote stages the payload to a temp file, digests it THERE, streams it, and
+# reports `<rc> <digest> <bytes>` in the same nonce trailer `exec` already uses. Local writes to
+# a sibling temp, digests what actually arrived, and renames into place only on a match. So a cut
+# anywhere between the two — remote, transport, or rt's own stdout — is a digest mismatch and not
+# a short file. `cat` of an existing file is just a command, which is why there is no separate
+# `pull`: one of the two real large-output callers GENERATES its payload with `tar cf -`, and a
+# path-taking `pull` could not have served it.
+#
+# THE BOUND, stated because it decides where this is usable: the payload is staged on the REMOTE,
+# so it needs free space there for one copy. That is the price of digesting before sending, and
+# digesting before sending is the only ordering in which the digest describes what the remote
+# meant to send rather than what happened to arrive.
+_fetch_remote_cmd() {  # <token> <command>
+  local token="$1" command="$2"
+  cat <<EOF
+if command -v sha256sum >/dev/null 2>&1; then RTH=sha256sum;
+elif command -v shasum >/dev/null 2>&1; then RTH="shasum -a 256";
+else RTH=""; fi
+__rt_t=\$(mktemp "\${TMPDIR:-/tmp}/rt-fetch.XXXXXX") || { echo "rt: cannot stage payload remotely" >&2; exit 98; }
+cd $(_shq "$REMOTE_DIR") && ( ${command} ) > "\$__rt_t"
+__rt_rc=\$?
+if [ -n "\$RTH" ]; then __rt_d=\$(\$RTH < "\$__rt_t" | awk '{print \$1}'); else __rt_d=NO_SHA_TOOL; fi
+__rt_n=\$(wc -c < "\$__rt_t" | tr -d ' ')
+cat "\$__rt_t"
+rm -f "\$__rt_t"
+printf '%s%s %s %s\n' $(_shq "$token") "\$__rt_rc" "\$__rt_d" "\$__rt_n" >&2
+exit \$__rt_rc
+EOF
+}
+
+# The trailer now carries three fields, so it gets its own filter rather than a flag on the
+# other one: `exec`'s filter writes a bare rc and its consumers parse it as `${x//[!0-9]/}`,
+# which would silently digest-strip a three-field line into one long number.
+_fetch_trailer_filter() {  # <token> <outfile>
+  awk -v t="$1" -v f="$2" '
+    {
+      i = index($0, t)
+      if (i > 0) {
+        pre = substr($0, 1, i - 1)
+        if (pre != "") { printf "%s\n", pre; fflush() }
+        printf "%s\n", substr($0, i + length(t)) > f; close(f)
+        next
+      }
+      print; fflush()
+    }'
+}
+
+cmd_fetch() {
+  local limit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout) [[ $# -ge 2 ]] || die "Missing argument for --timeout."; limit="$2"; shift 2 ;;
+      --timeout=*) limit="${1#--timeout=}"; shift ;;
+      --) shift; break ;;
+      -*) die "Unknown option for fetch: $1" ;;
+      *) break ;;
+    esac
+  done
+  [[ $# -ge 2 ]] || die "Usage: rt fetch [--timeout N] <local-path> <remote-command>
+  Runs <remote-command> on the remote, verifies the payload by sha256, and writes it to
+  <local-path> ATOMICALLY — the destination is never a partial file.
+    rt fetch runs.tar 'cd /data/runs && tar cf - *.csv'
+    rt fetch one.csv  'cat /data/runs/one.csv'
+  Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH
+        · 124 the --timeout bound fired · 125 no outcome established · otherwise the
+        remote command's own status (and the destination is NOT written)."
+  local dest="$1"; shift
+  local command="$*"
+
+  [[ -e "$dest" && ! -f "$dest" ]] && die "[$RT_PROFILE] fetch destination exists and is not a regular file: $dest"
+  local ddir; ddir="$(dirname "$dest")"
+  [[ -d "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory does not exist: $ddir"
+  [[ -w "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory is not writable: $ddir"
+
+  _sync_preflight_for_exec
+
+  local token remote tmp acct
+  token="__rt_fetch_end_${$}_${RANDOM}__"
+  remote="$(_fetch_remote_cmd "$token" "$command")"
+  # The incoming file is a SIBLING of the destination, never in TMPDIR: the final step must be a
+  # rename within one filesystem, because a cross-device `mv` copies, and a copy interrupted
+  # halfway is exactly the partial destination this verb exists to make impossible.
+  tmp="${dest}.rt-incoming.$$"
+  acct="$(mktemp -d "${TMPDIR:-/tmp}/rt-fetch.XXXXXX")" \
+    || die "Could not create a temporary directory for fetch accounting."
+  mkfifo "$acct/err" || { rm -rf "$acct"; die "Could not create the pipe 'fetch' uses to read its trailer."; }
+
+  _fetch_trailer_filter "$token" "$acct/tr" < "$acct/err" >&2 &
+  local filter_pid=$!
+
+  local transport=0
+  if [[ -n "$limit" ]]; then
+    _ssh_bounded "$limit" "$remote" > "$tmp" 2> "$acct/err" || transport=$?
+  else
+    _ssh "$remote" > "$tmp" 2> "$acct/err" || transport=$?
+  fi
+  [[ "$transport" -eq 124 ]] && { _exec_reap 2 "$filter_pid" || true; }
+  wait "$filter_pid" 2>/dev/null || true
+
+  local trailer; trailer="$(cat "$acct/tr" 2>/dev/null || true)"
+  rm -rf "$acct"
+  local t_rc t_dig t_len
+  read -r t_rc t_dig t_len <<<"$trailer"
+
+  _fetch_settle "$dest" "$tmp" "$transport" "$t_rc" "$t_dig" "$t_len"
+}
+
+# Decide, in the order the facts are decided, and DELETE the incoming file on every path that is
+# not a verified success. Leaving it behind is how a partial payload gets picked up later by a
+# glob and read as an artifact.
+_fetch_settle() {  # <dest> <tmp> <transport> <trailer-rc> <trailer-digest> <trailer-bytes>
+  local dest="$1" tmp="$2" transport="$3" t_rc="$4" t_dig="$5" t_len="$6"
+  local got_len got_dig
+  got_len="$(wc -c < "$tmp" 2>/dev/null | tr -d ' ')"; got_len="${got_len:-0}"
+
+  if [[ "$transport" -eq 124 ]]; then
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch TRUNCATED: $got_len bytes arrived before the --timeout bound ended the wait. $dest was NOT written."
+    return 124
+  fi
+  if [[ -z "$t_rc" ]]; then
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch established NOTHING: $got_len bytes arrived and the stream ended without the remote reporting that it had finished. $dest was NOT written."
+    [[ "$transport" -ne 0 ]] && return "$transport"
+    return 125
+  fi
+  if [[ "$t_rc" -ne 0 ]]; then
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch: the remote command exited $t_rc. $dest was NOT written — a payload from a command that failed is not an artifact, whatever its digest says."
+    return "$t_rc"
+  fi
+  if [[ "$t_dig" == "NO_SHA_TOOL" ]]; then
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch UNVERIFIABLE: the remote has neither sha256sum nor shasum, so nothing can establish that $got_len bytes is the whole payload. $dest was NOT written. This is unverifiable, NOT a mismatch."
+    return 2
+  fi
+  got_dig="$(_sha256_file "$tmp")" || {
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch UNVERIFIABLE: no sha256 tool locally (need sha256sum or shasum). $dest was NOT written."
+    return 2
+  }
+  if [[ "$got_dig" != "$t_dig" ]]; then
+    rm -f "$tmp"
+    warn "[$RT_PROFILE] fetch DIGEST MISMATCH: the remote staged $t_len bytes (sha256 $t_dig) and $got_len bytes arrived (sha256 $got_dig). The payload was cut or altered in transit. $dest was NOT written."
+    return 3
+  fi
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; die "[$RT_PROFILE] fetch verified the payload but could not rename it into place: $dest"; }
+  info "[$RT_PROFILE] fetch verified $got_len bytes -> $dest (sha256 $got_dig)"
+  return 0
+}
+
+# The INPUT side of the same contract, and it is not symmetric with fetch.
+#
+# The recorded incident: `base64 < local | rt exec 'base64 -d > remote'` delivered an EMPTY stdin
+# stream in 2 of 3 invocations. `base64 -d` succeeded on zero bytes, wrote a 0-byte file, exited
+# 0, and the follow-up echo printed — so a 0-byte script "deployed" cleanly and a GPU evaluation
+# was consumed running `python3 <empty file>`, rc=0, no output, indistinguishable from success
+# until someone checked the artifact. Intermittent, not absent, which is why it survived.
+#
+# So push does NOT pipe the payload through the remote shell's stdin. It digests locally, sends
+# the bytes, has the remote digest what it received and stage it, and installs only on a match.
+_push_remote_cmd() {  # <remote-dest> <expected-digest>
+  # A function with a bare heredoc, not `x=$(cat <<EOF …)`: inside a command substitution bash
+  # parses the heredoc body looking for the closing paren, and the `*)` of a `case` arm closes it
+  # early. Same reason `_exec_remote_cmd` and `_fetch_remote_cmd` are written this way.
+  cat <<EOF
+if command -v sha256sum >/dev/null 2>&1; then RTH=sha256sum;
+elif command -v shasum >/dev/null 2>&1; then RTH="shasum -a 256";
+else echo RT_NO_SHA_TOOL >&2; exit 97; fi
+__rt_d=$(_shq "$1")
+case "\$__rt_d" in
+  /*) : ;;
+  *) __rt_d=$(_shq "$REMOTE_DIR")/\$__rt_d ;;
+esac
+__rt_dir=\$(dirname "\$__rt_d")
+[ -d "\$__rt_dir" ] || { echo "RT_NO_DEST_DIR \$__rt_dir" >&2; exit 98; }
+__rt_t="\$__rt_d.rt-incoming.\$\$"
+cat > "\$__rt_t" || { rm -f "\$__rt_t"; echo RT_WRITE_FAILED >&2; exit 99; }
+__rt_got=\$(\$RTH < "\$__rt_t" | awk '{print \$1}')
+__rt_n=\$(wc -c < "\$__rt_t" | tr -d ' ')
+if [ "\$__rt_got" != $(_shq "$2") ]; then
+  rm -f "\$__rt_t"
+  echo "RT_DIGEST_MISMATCH sent=$(_shq "$2") got=\$__rt_got bytes=\$__rt_n" >&2
+  exit 3
+fi
+mv -f "\$__rt_t" "\$__rt_d" || { rm -f "\$__rt_t"; echo RT_INSTALL_FAILED >&2; exit 99; }
+printf 'RT_PUSH_OK %s %s\n' "\$__rt_n" "\$__rt_got" >&2
+EOF
+}
+
+cmd_push() {
+  [[ $# -eq 2 ]] || die "Usage: rt push <local-path> <remote-path>
+  Sends <local-path> to <remote-path>, verified by sha256 and installed ATOMICALLY.
+  A relative <remote-path> is resolved against REMOTE_DIR.
+  Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH."
+  local src="$1" dst="$2"
+  [[ -f "$src" ]] || die "[$RT_PROFILE] push source is not a regular file: $src"
+  local want; want="$(_sha256_file "$src")" \
+    || die2 "[$RT_PROFILE] No sha256 tool locally (need sha256sum or shasum). Cannot verify — unverifiable, not a mismatch."
+  local n; n="$(wc -c < "$src" | tr -d ' ')"
+
+  # The remote reads the payload from ITS stdin into a temp file and digests THAT — the same
+  # stdin path the incident is about, which is the point: an empty or short delivery now fails
+  # the digest instead of installing a plausible file. The bytes are on disk before anything
+  # claims anything about them.
+  local remote rc=0
+  remote="$(_push_remote_cmd "$dst" "$want")"
+  _ssh "$remote" < "$src" || rc=$?
+  case "$rc" in
+    0) info "[$RT_PROFILE] push verified $n bytes -> $dst (sha256 $want)"; return 0 ;;
+    3) warn "[$RT_PROFILE] push DIGEST MISMATCH — see the remote's report above. $dst was NOT written; the incoming file was removed."; return 3 ;;
+    97) warn "[$RT_PROFILE] push UNVERIFIABLE: the remote has neither sha256sum nor shasum. $dst was NOT written. Unverifiable, NOT a mismatch."; return 2 ;;
+    *) warn "[$RT_PROFILE] push FAILED (status $rc). Assume $dst was NOT written."; return "$rc" ;;
+  esac
+}
+
 # ── Slurm subcommand (opt-in via SLURM_ENABLED=1) ─────────────────
 cmd_slurm() {
   load_config
@@ -2192,6 +2436,8 @@ main() {
     connect)       cmd_connect "$@" ;;
     disconnect)    cmd_disconnect "$@" ;;
     exec)          cmd_exec "$@" ;;
+    fetch)         load_config; cmd_fetch "$@" ;;
+    push)          load_config; cmd_push "$@" ;;
     status)        cmd_status "$@" ;;
     logs)          cmd_logs "$@" ;;
     sync)          cmd_sync "$@" ;;
