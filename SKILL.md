@@ -1,6 +1,6 @@
 ---
 name: remote
-description: Remote Toolkit — drives remote servers via Mutagen file sync + SSH through the `rt` CLI; supports multiple servers via profiles, Slurm submission/monitoring on HPC hosts, and tmux-backed background commands. Use this skill whenever the user mentions a remote server, SSH target, HPC cluster, GPU box, the `rt` command, file sync to/from a remote machine, Slurm jobs (submit/queue/logs/cancel), `.sbatch` files, profile setup/connection, or asks to run/move/deploy something on a remote — even if they don't explicitly say "rt" or "remote toolkit". On the first prompt that triggers this skill, run `rt status --all` to enumerate configured profiles before assuming which one to use.
+description: Remote Toolkit — drives remote servers via Mutagen file sync + SSH through the `rt` CLI; multi-server profiles, Slurm submission/monitoring on HPC hosts, tmux-backed background commands. Trigger on any mention of a remote server, SSH target, HPC cluster, GPU box, `rt`, file sync to/from a remote machine, Slurm jobs (submit/queue/logs/cancel), `.sbatch` files, profile setup, or running/moving/deploying something on a remote — even without the words "rt"/"remote toolkit". On the first triggering prompt run `rt status --all` to enumerate profiles before assuming one.
 ---
 
 # Remote Toolkit — Full Guide for Claude Code
