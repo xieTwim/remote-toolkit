@@ -1307,6 +1307,25 @@ _exec_bg() {
       \"{ cd '${REMOTE_DIR}' && ( ${command} ); echo \\\$? > ${log_file}.rc; } 2>&1 | tee ${log_file}; \
         echo \\\"EXIT_CODE=\\\$(cat ${log_file}.rc 2>/dev/null || echo unknown)\\\" >> ${log_file}\""
 
+  # VERIFY, then report. `tmux new-session` returning 0 says the session was CREATED, not that the
+  # payload inside it parsed. A body carrying nested quotes is mangled somewhere in the three
+  # layers of wrapping, the remote shell rejects it, nothing launches and no log is written — and
+  # this function used to print "Background job started" and exit 0 anyway. `rt logs <session>`
+  # then answered "Log not found" and bare `rt logs` did not list it, so the two commands
+  # disagreed about whether the job existed and NEITHER said it had failed to start. Measured
+  # twice on live hosts (2026-08-10 multi-line payload, 2026-08-13 single-line with nested
+  # quotes), each time costing a round trip to establish by hand that nothing had run.
+  #
+  # Two signals, because either alone is a false negative: a job that finishes before this check
+  # leaves no session but DOES leave a log (tee creates it as the pipeline starts), and a live
+  # session proves the launch whatever the log's timing. Only the absence of both is a failure.
+  #
+  # This does not fix the payload mangling — the encoding cause is the entry below this one in
+  # BACKLOG.md. It ends the false statement, which is the part that made the mangling expensive.
+  if ! _ssh "tmux has-session -t '${session}' 2>/dev/null || [ -f ${log_file} ]"; then
+    die "[$RT_PROFILE] Background job '$session' did NOT start: no tmux session and no log file on $REMOTE_HOST. ssh accepted the launch and the remote shell rejected the payload; a body carrying nested quotes is the measured cause. Stage the body as a script and background THAT instead."
+  fi
+
   info "[$RT_PROFILE] Background job started: $session"
   info "  Check output: rt -p $RT_PROFILE logs $session"
 }

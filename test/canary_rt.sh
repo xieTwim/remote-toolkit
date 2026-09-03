@@ -53,7 +53,10 @@ REMOTE_HOST="example-host"; REMOTE_USER="nobody"; LOCAL_DIR="$SCRATCH/local"
 mkdir -p "$REMOTE_DIR"
 
 CAPTURED=""
-_ssh() { CAPTURED="$*"; return 0; }          # capture instead of send
+# Capture the LAUNCH specifically, not simply the last thing handed to _ssh: `_exec_bg` now
+# verifies the session's existence after creating it, so the last call is the probe. The probe
+# answers 0 here; the failure it exists to catch is exercised at 1e/1f below.
+_ssh() { case "$*" in *'tmux new-session'*) CAPTURED="$*" ;; esac; return 0; }
 info() { :; }                                 # quiet
 
 # ── 1. a background job's recorded status is the COMMAND's, not tee's ─────────
@@ -118,6 +121,39 @@ rc_cd="$(run_captured 'echo unreachable')"
 REMOTE_DIR="$REMOTE_DIR_SAVE"
 chk "1d an unreachable REMOTE_DIR records a FAILURE rather than no log at all" \
     "$([ -n "$rc_cd" ] && [ "$rc_cd" != "0" ] && echo 0 || echo 1)" "recorded '$rc_cd'"
+
+# ── 1e/1f a job that never started is REPORTED, not announced ─────────────────
+#
+# `tmux new-session` returning 0 says the session was created, not that the payload inside it
+# parsed. Measured twice live (2026-08-10 multi-line, 2026-08-13 single-line with nested quotes):
+# the remote shell rejected the body, nothing ran, no log was written — and `rt` printed
+# ":: Background job started: <session>" and exited 0, while `rt logs <session>` then answered
+# "Log not found". Two commands disagreeing about whether a job exists, neither saying it failed.
+#
+# The stub answers the two calls independently, exactly as the live host did: the launch
+# SUCCEEDS and the existence probe FAILS. So what is pinned is that the verdict comes from the
+# probe rather than from the launch's own status.
+BG_LOG="$SCRATCH/bg.info"
+info() { printf '%s\n' "$*" >> "$BG_LOG"; }   # a subshell's announcement still reaches the file
+PROBE_OK=1
+_ssh() { case "$*" in *has-session*) return "$((1 - PROBE_OK))" ;; *) return 0 ;; esac; }
+
+: > "$BG_LOG"; PROBE_OK=0
+( _exec_bg 'echo anything' probe ) >/dev/null 2>&1; rc_bg=$?
+chk "1e neither a session nor a log => non-zero, not 'Background job started'" \
+    "$([ "$rc_bg" != "0" ] && ! grep -q 'Background job started' "$BG_LOG" && echo 0 || echo 1)" \
+    "rc=$rc_bg, announced=$(grep -c 'Background job started' "$BG_LOG")"
+
+# THE FALSE-POSITIVE GUARD: 1e is satisfied by an `_exec_bg` that refuses everything.
+: > "$BG_LOG"; PROBE_OK=1
+( _exec_bg 'echo anything' probe ) >/dev/null 2>&1; rc_bg_ok=$?
+chk "1f a launch the probe CONFIRMS still reports started and returns 0" \
+    "$([ "$rc_bg_ok" = "0" ] && grep -q 'Background job started' "$BG_LOG" && echo 0 || echo 1)" \
+    "rc=$rc_bg_ok"
+
+CAPTURED=""
+_ssh() { case "$*" in *'tmux new-session'*) CAPTURED="$*" ;; esac; return 0; }
+info() { :; }
 
 # ── 2. the status the reader is shown ────────────────────────────────────────
 # `rt logs`' sed only matches digits, so a missing marker yielded the empty string and rendered
