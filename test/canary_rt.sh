@@ -293,17 +293,17 @@ FAKE_MUTAGEN_RC=0
 # The paused/offline rows carry EMPTY size fields on purpose: `.Alpha.EndpointState` is nil
 # while an endpoint is disconnected, which is what the template's `{{else}}|||{{end}}` produces.
 for case in \
-  "active false|Watching|true|true|true|5|134|3174279|" \
-  "active false|WaitingForRescan|true|true|true|2|20|2048|" \
+  "active false|Watching|true|true|true|5|134|3174279|412|" \
+  "active false|WaitingForRescan|true|true|true|2|20|2048|7|" \
   "active false|StagingBeta|true|true|true|2|20|2048|" \
-  "erroring false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count" \
-  "halted false|HaltedOnRootEmptied|true|true|true|1|0|0|" \
-  "halted false|HaltedOnRootDeletion|true|true|true|1|0|0|" \
-  "halted false|HaltedOnRootTypeChange|true|true|true|1|0|0|" \
-  "paused true|Disconnected|false|false|||||" \
+  "erroring false|WaitingForRescan|true|true|false|0|0|0|0|alpha scan error: exceeded allowed entry count" \
+  "halted false|HaltedOnRootEmptied|true|true|true|1|0|0|3|" \
+  "halted false|HaltedOnRootDeletion|true|true|true|1|0|0|3|" \
+  "halted false|HaltedOnRootTypeChange|true|true|true|1|0|0|3|" \
+  "paused true|Disconnected|false|false||||||" \
   "offline false|Watching|false|true|||||" \
-  "offline false|Disconnected|true|true|||||" \
-  "unknown false|HaltedOnSomethingAddedInAFutureMutagen|true|true|true|1|1|1|" \
+  "offline false|Disconnected|true|true||||||" \
+  "unknown false|HaltedOnSomethingAddedInAFutureMutagen|true|true|true|1|1|1|9|" \
 ; do
   want="${case%% *}"; rec="${case#* }"
   FAKE_TEMPLATE_OUT="$rec"
@@ -316,14 +316,14 @@ done
 # pins that an unrecognised one reports `unknown`; this says why it matters. The old classifier
 # called everything it did not recognise `active`, so every state Mutagen has that it did not
 # name read as healthy, and a future Mutagen adding a brake would silently rejoin that set.
-FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|'
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|11|'
 chk "7a1 ... while a verb the tool DOES recognise as healthy still reads active" \
     "$([ "$(_sync_status)" = "active" ] && echo 0 || echo 1)" "got $(_sync_status)"
 
 # One profile is one session. Two records matching this label pair means something outside `rt`
 # created one, and answering from the first would report a state over a scope not established.
-FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|
-false|HaltedOnRootEmptied|true|true|true|1|0|0|'
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|1|1|1|11|
+false|HaltedOnRootEmptied|true|true|true|1|0|0|3|'
 chk "7a2 two sessions matching one profile's labels -> unknown, not first-one-wins" \
     "$([ "$(_sync_status)" = "unknown" ] && echo 0 || echo 1)" "got $(_sync_status)"
 
@@ -344,19 +344,57 @@ chk "7d ... and _has_sync stays false for it" "$(_has_sync; [ $? -ne 0 ] && echo
 FAKE_MUTAGEN_RC=0
 
 # The error message may itself contain '|'; it is the LAST field, so it must not shift the others.
-FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|false|0|0|0|scan error: a|b|c'
+FAKE_TEMPLATE_OUT='false|WaitingForRescan|true|true|false|0|0|0|0|scan error: a|b|c'
 chk "7e a '|' inside the error text does not corrupt the classification" \
     "$([ "$(_sync_status)" = "erroring" ] && echo 0 || echo 1)" "got $(_sync_status)"
 chk "7f ... and the full error is recoverable for the message" \
     "$([ "$(_sync_last_error)" = "scan error: a|b|c" ] && echo 0 || echo 1)" "got '$(_sync_last_error)'"
+chk "7f2 ... and the cycle count is read from its own field, not shifted by that '|'" \
+    "$([ "$(_sync_cycles)" = "0" ] && echo 0 || echo 1)" "got '$(_sync_cycles)'"
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|2|20|2048|31337|'
+chk "7f3 a completed-cycle count is reported as itself" \
+    "$([ "$(_sync_cycles)" = "31337" ] && echo 0 || echo 1)" "got '$(_sync_cycles)'"
+# A Mutagen whose record carries no SessionState leaves the field EMPTY. Returning 0 there would
+# say "has never synchronised" about a session nothing was established for — the fail-open this
+# file keeps closing. Not-established is a non-zero return, never a zero count.
+FAKE_TEMPLATE_OUT='false|Watching|true|true|true|2|20|2048||'
+chk "7f4 an unestablished cycle count returns non-zero rather than claiming 0" \
+    "$(_sync_cycles >/dev/null 2>&1; [ $? -ne 0 ] && echo 0 || echo 1)" "got '$(_sync_cycles 2>&1)'"
+
+# A limit THIS TOOL set must be named by the failure it causes. Measured 2026-08-12: a 256 MB
+# staging cap made two large files re-fetch ~2.1 GB every cycle forever, surfacing as an ENOENT
+# on a content-addressed staging path — which reads as a corrupted staging area.
+#
+# NOT in a subshell, deliberately: `chk` increments PASS/FAIL, and a `( ... )` group loses both,
+# so a check written that way runs, prints, and cannot fail the suite. Caught here by the count
+# not moving (189 -> 191 for five added checks) — the same false green this file exists to close.
+MUTAGEN_MAX_STAGING_FILE_SIZE="256MB"
+staging_hint="$(_sync_error_hint 'unable to set staged file permissions: no such file or directory')" || staging_hint=""
+chk "7h a staging-cap failure names the cap and the setting that produced it" \
+    "$(grep -q 'MUTAGEN_MAX_STAGING_FILE_SIZE=256MB' <<< "$staging_hint" && echo 0 || echo 1)" "got '$staging_hint'"
+# The staging path is content-addressed and names no file, so rt cannot have measured one. A hint
+# that claimed it had would send the next operator to raise a cap that was not the cause.
+chk "7i ... and says it did NOT measure anything, rather than asserting the diagnosis" \
+    "$(grep -q 'has NOT measured' <<< "$staging_hint" && echo 0 || echo 1)" "got '$staging_hint'"
+# No cap configured -> the shape cannot be attributed to a cap that does not exist.
+unset MUTAGEN_MAX_STAGING_FILE_SIZE
+_sync_error_hint 'unable to set staged file permissions: no such file or directory' >/dev/null 2>&1; _hrc=$?
+chk "7j the same failure with NO cap configured produces no hint" \
+    "$([ "$_hrc" -ne 0 ] && echo 0 || echo 1)" "rc=$_hrc"
+# NEGATIVE CONTROL: a hint emitted for every error would pass every assertion above.
+_sync_error_hint 'connection reset by peer' >/dev/null 2>&1; _hrc=$?
+chk "7k an unrelated error gets no hint" \
+    "$([ "$_hrc" -ne 0 ] && echo 0 || echo 1)" "rc=$_hrc"
+chk "7l the entry-count breaker names MUTAGEN_MAX_ENTRY_COUNT too" \
+    "$(_sync_error_hint 'alpha scan error: exceeded allowed entry count' 2>/dev/null | grep -q 'MUTAGEN_MAX_ENTRY_COUNT' && echo 0 || echo 1)"
 
 # A non-converging session does not FAIL a flush, it HANGS (measured: `mutagen sync flush` still
 # running after 15s on a breaker-halted session). So without a fail-fast it burns
 # RT_FLUSH_TIMEOUT and returns 3 — "the daemon is still syncing" — and `rt exec` continues on 3.
 # That is the fail-open: a command running against stale code behind a reassuring warning.
 for rec in \
-  'false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count' \
-  'false|HaltedOnRootEmptied|true|true|true|1|0|0|' \
+  'false|WaitingForRescan|true|true|false|0|0|0|0|alpha scan error: exceeded allowed entry count' \
+  'false|HaltedOnRootEmptied|true|true|true|1|0|0|3|' \
 ; do
   FAKE_TEMPLATE_OUT="$rec"
   _sync_flush >/dev/null 2>&1; rc=$?
@@ -511,6 +549,52 @@ chk "9e the enumeration names its own SCOPE (count + where it looked)" \
 chk "9f sourcing one profile's config does not leak into the next" \
     "$(grep -q 'h1/neverconnected.*/remote/never' <<< "$all_out" && echo 0 || echo 1)" \
     "$(grep 'neverconnected' <<< "$all_out")"
+
+# A row that is NOT synchronising must not read like one that is. Measured 2026-08-12: an
+# erroring profile — at least two days without a single completed cycle — was listed among the
+# healthy ones in the same visual form and counted in the "live sync session" total, so it read
+# to an agent as "currently retrying". `erroring` is a statement about NOW; whether the session
+# has EVER worked is a different fact, and Mutagen has been publishing it all along.
+_sync_status() { echo erroring; }
+_sync_cycles() { echo 0; }
+stall_out="$(_status_all 2>&1)"
+chk "9h a profile synchronising nothing is MARKED, not listed like a healthy one" \
+    "$(grep -q 'synchronising nothing' <<< "$stall_out" && echo 0 || echo 1)" \
+    "$(grep 'h1/connected' <<< "$stall_out")"
+chk "9i ... and zero completed cycles is named as NEVER, which is what erroring cannot say" \
+    "$(grep -q 'NEVER completed a cycle' <<< "$stall_out" && echo 0 || echo 1)" \
+    "$(grep 'h1/connected' <<< "$stall_out")"
+chk "9j the summary counts the stalled profiles separately from the live ones" \
+    "$(grep -q 'synchronising NOTHING' <<< "$stall_out" && echo 0 || echo 1)" \
+    "$(grep 'profile(s)' <<< "$stall_out")"
+
+# THE DISTINCTION THE ENTRY IS ABOUT: a breaker that will clear on the next rescan and one that
+# can never clear print the same state word. A session with completed cycles behind it has
+# worked before, so it must be marked stalled and must NOT be called never-synchronised.
+_sync_cycles() { echo 44; }
+worked_out="$(_status_all 2>&1)"
+chk "9k an erroring session that HAS worked before is stalled but not called NEVER" \
+    "$(grep -q 'synchronising nothing' <<< "$worked_out" && ! grep -q 'NEVER completed' <<< "$worked_out" && echo 0 || echo 1)" \
+    "$(grep 'h1/connected' <<< "$worked_out")"
+
+# UNKNOWN IS NOT ZERO. A count that could not be established must never render as "never
+# synchronised" — that is the same fail-open this file keeps closing, pointed the other way.
+_sync_cycles() { return 1; }
+noc_out="$(_status_all 2>&1)"
+chk "9l a cycle count that is NOT ESTABLISHED is never reported as never-synchronised" \
+    "$(grep -q 'synchronising nothing' <<< "$noc_out" && ! grep -q 'NEVER completed' <<< "$noc_out" && echo 0 || echo 1)" \
+    "$(grep 'h1/connected' <<< "$noc_out")"
+
+# NEGATIVE CONTROL: without it, a mark printed on every row would pass every assertion above
+# and distinguish nothing.
+_sync_status() { echo active; }
+_sync_cycles() { echo 0; }
+ok_out="$(_status_all 2>&1)"
+chk "9m a healthy profile carries NEITHER mark" \
+    "$(! grep -q 'synchronising nothing' <<< "$ok_out" && ! grep -q 'NEVER completed' <<< "$ok_out" && ! grep -q 'synchronising NOTHING' <<< "$ok_out" && echo 0 || echo 1)" \
+    "$(grep 'h1/connected' <<< "$ok_out")"
+unset -f _sync_cycles
+_sync_status() { echo none; }
 
 # A FRESH INSTALL: no configs, no state. This is the empty-array expansion path, and macOS ships
 # bash 3.2, where `"${arr[@]}"` on an empty array is an "unbound variable" error under `set -u` —
@@ -677,9 +761,9 @@ bloat() {  # bloat <record> -> stderr of one _sync_warn_if_bloated, with the sta
 }
 
 #                       paused|status|aconn|bconn|scanned|dirs|files|bytes|err
-BIG='false|Watching|true|true|true|500|10292|2791728742|'
-SMALL='false|Watching|true|true|true|20|232|43000000|'
-UNSCANNED='false|WaitingForRescan|true|true|false|0|0|0|alpha scan error: exceeded allowed entry count'
+BIG='false|Watching|true|true|true|500|10292|2791728742|88|'
+SMALL='false|Watching|true|true|true|20|232|43000000|88|'
+UNSCANNED='false|WaitingForRescan|true|true|false|0|0|0|0|alpha scan error: exceeded allowed entry count'
 
 out="$(bloat "$BIG")"
 chk "12 a 10,292-file / 2.6 GB sync set is reported at flush time" \

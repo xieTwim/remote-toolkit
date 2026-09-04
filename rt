@@ -148,7 +148,7 @@ _sync_label_selector() {
 #
 # `.LastError` stays LAST. `read` puts the whole remainder in the final field, which is what
 # keeps an error message containing '|' from shifting every column after it.
-RT_SYNC_TEMPLATE='{{range .}}{{.Paused}}|{{.Status}}|{{.Alpha.Connected}}|{{.Beta.Connected}}|{{if .Alpha.EndpointState}}{{.Alpha.EndpointState.Scanned}}|{{.Alpha.EndpointState.Directories}}|{{.Alpha.EndpointState.Files}}|{{.Alpha.EndpointState.TotalFileSize}}{{else}}|||{{end}}|{{if .SessionState}}{{.LastError}}{{end}}
+RT_SYNC_TEMPLATE='{{range .}}{{.Paused}}|{{.Status}}|{{.Alpha.Connected}}|{{.Beta.Connected}}|{{if .Alpha.EndpointState}}{{.Alpha.EndpointState.Scanned}}|{{.Alpha.EndpointState.Directories}}|{{.Alpha.EndpointState.Files}}|{{.Alpha.EndpointState.TotalFileSize}}{{else}}|||{{end}}|{{if .SessionState}}{{.SuccessfulCycles}}{{end}}|{{if .SessionState}}{{.LastError}}{{end}}
 {{end}}'
 
 # Echo one '|'-separated record per matching session, or return non-zero if the DAEMON COULD
@@ -206,8 +206,8 @@ _sync_status() {
   # created one, and picking the first would report a state over a scope not established.
   if (( records > 1 )); then echo unknown; return; fi
 
-  local paused status aconn bconn scanned dirs files bytes lasterr
-  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$(grep -m1 . <<< "$out")"
+  local paused status aconn bconn scanned dirs files bytes cycles lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes cycles lasterr <<< "$(grep -m1 . <<< "$out")"
 
   if [[ "$paused" == "true" ]]; then
     echo paused
@@ -233,9 +233,58 @@ _sync_last_error() {
   local line=""
   line=$(grep -m1 . <<< "$out") || true
   [[ -n "$line" ]] || return 1
-  local paused status aconn bconn scanned dirs files bytes lasterr
-  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$line"
+  local paused status aconn bconn scanned dirs files bytes cycles lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes cycles lasterr <<< "$line"
   printf '%s' "$lasterr"
+}
+
+# Some failures are caused by a limit THIS TOOL set and say nothing about it. Mutagen reports
+# what broke; only `rt` knows which of its own settings made the break inevitable.
+#
+# Measured 2026-08-12: two files (1.34 GB and 820 MB) against a 256 MB staging cap re-fetched
+# ~2.1 GB every cycle, forever, and surfaced as a `chmod`/ENOENT on a content-addressed staging
+# path — which reads as a corrupted staging area or a permissions problem. Diagnosis took going
+# around the tool entirely.
+#
+# Offered as a match on the failure SHAPE, never as a diagnosis. `rt` has not measured any file
+# here and the staging path names none, so "this IS the cap" would be a claim the error text
+# cannot support. A hint that overstated itself would be worse than no hint: it would send the
+# next operator to raise a cap that was not the cause.
+_sync_error_hint() {
+  local err="${1:-}"
+  case "$err" in
+    *"staged file permissions"*|*"unable to set staged file"*|*"unable to stage file"*)
+      [[ -n "${MUTAGEN_MAX_STAGING_FILE_SIZE:-}" ]] || return 1
+      printf 'consistent with this profile'"'"'s MUTAGEN_MAX_STAGING_FILE_SIZE=%s — a file above the cap is fetched in full, discarded on breach, and then fails exactly here on the staged path that was just removed; the sync re-fetches it every cycle and can never converge. rt has NOT measured any file: check the sync root for files above the cap, then either exclude them via MUTAGEN_IGNORE or raise the cap, and recreate the session (both apply only at create time).' \
+        "$MUTAGEN_MAX_STAGING_FILE_SIZE" ;;
+    *"exceeded allowed entry count"*)
+      printf 'this is the entry-count circuit breaker, against MUTAGEN_MAX_ENTRY_COUNT=%s — it never clears by itself when the cause is the ignore list. Fix MUTAGEN_IGNORE or raise the cap, then recreate the session (both apply only at create time).' \
+        "${MUTAGEN_MAX_ENTRY_COUNT:-<unset, Mutagen default>}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# How many synchronisation cycles this session has COMPLETED, or non-zero if the count is not
+# established (no session, daemon unreachable, or a Mutagen without the field). Zero is a fact
+# and "could not ask" is not — the same distinction `_sync_counts` keeps below, and the reason
+# this returns rather than echoing 0.
+#
+# This is the fact `erroring` alone cannot carry. `erroring` says there is a live error right
+# now; it cannot say whether the session has ever worked, so a breaker that will clear on the
+# next rescan and one that can never clear (the tree is simply larger than the configured
+# limit) read identically. Measured 2026-08-12: a profile sat erroring for at least two days,
+# never completing a single synchronisation, listed among the healthy profiles in the same
+# visual form. `SuccessfulCycles == 0` is exactly "has never once succeeded", and Mutagen has
+# been publishing it in the record this tool already fetches.
+_sync_cycles() {
+  local out line
+  out=$(_sync_probe "$@") || return 1
+  line=$(grep -m1 . <<< "$out") || true
+  [[ -n "$line" ]] || return 1
+  local paused status aconn bconn scanned dirs files bytes cycles lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes cycles lasterr <<< "$line"
+  [[ "$cycles" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$cycles"
 }
 
 # "<files> <bytes>" for the alpha endpoint, or non-zero if the size is NOT ESTABLISHED.
@@ -249,8 +298,8 @@ _sync_counts() {
   local line=""
   line=$(grep -m1 . <<< "$out") || true
   [[ -n "$line" ]] || return 1
-  local paused status aconn bconn scanned dirs files bytes lasterr
-  IFS='|' read -r paused status aconn bconn scanned dirs files bytes lasterr <<< "$line"
+  local paused status aconn bconn scanned dirs files bytes cycles lasterr
+  IFS='|' read -r paused status aconn bconn scanned dirs files bytes cycles lasterr <<< "$line"
   [[ "$scanned" == "true" ]] || return 1
   printf '%s %s' "${files:-0}" "${bytes:-0}"
 }
@@ -367,7 +416,9 @@ _sync_flush() {
       warn "This one needs a human decision — it fires when a root was emptied, deleted, or changed type, and resuming propagates that. Inspect with 'rt -p ${RT_PROFILE} sync status'; recover with 'mutagen sync reset --label-selector=\"$(_sync_label_selector "$@")\"' once you know which side is right. Do NOT recreate the session to clear it."
       return 2 ;;
     erroring)
-      warn "Sync session has a live error and is synchronising nothing: $(_sync_last_error "$@")"
+      _err="$(_sync_last_error "$@")"
+      warn "Sync session has a live error and is synchronising nothing: $_err"
+      if _hint="$(_sync_error_hint "$_err")"; then warn "Cause: $_hint"; fi
       warn "Flush skipped (it would hang, not fail). If this is the entry-count breaker: fix MUTAGEN_IGNORE or raise MUTAGEN_MAX_ENTRY_COUNT, then 'rt -p ${RT_PROFILE} disconnect && rt -p ${RT_PROFILE} connect' — ignores only apply at session-create time, so editing them does nothing to a live session."
       return 2 ;;
     unknown)
@@ -765,7 +816,9 @@ cmd_connect() {
       die "[$RT_PROFILE] Sync session is HALTED by a Mutagen safety brake (a root was emptied, deleted, or changed type) and 'connect' must not clear it — that would decide, silently, which side's contents win. Inspect with 'rt -p $RT_PROFILE sync status', then recover deliberately with 'mutagen sync reset --label-selector=\"$(_sync_label_selector)\"' or by reconciling the roots by hand."
     fi
     if [[ "$_st" == "erroring" ]]; then
-      warn "[$RT_PROFILE] Sync session has a live error: $(_sync_last_error)"
+      _err="$(_sync_last_error)"
+      warn "[$RT_PROFILE] Sync session has a live error: $_err"
+      if _hint="$(_sync_error_hint "$_err")"; then warn "[$RT_PROFILE] Cause: $_hint"; fi
       die "[$RT_PROFILE] 'connect' cannot recover it — it is not paused, so there is nothing to resume, and it is synchronising nothing. If this is the entry-count breaker, fix the cause (usually a heavy dir missing from MUTAGEN_IGNORE; or raise MUTAGEN_MAX_ENTRY_COUNT), then recreate: 'rt -p $RT_PROFILE disconnect && rt -p $RT_PROFILE connect'. Editing MUTAGEN_IGNORE alone does nothing — ignores only apply at session-create time."
     fi
     if [[ "$_st" == "paused" ]]; then
@@ -1448,8 +1501,23 @@ cmd_status() {
     # A session that is not synchronising should say why here; the state word alone does not
     # tell you whether recreating it would help or would decide something for you.
     case "$sync_state" in
-      erroring) printf '  Sync error:  %s\n' "$(_sync_last_error)" ;;
+      erroring)
+        _err="$(_sync_last_error)"
+        printf '  Sync error:  %s\n' "$_err"
+        # The raw error names what broke; this names the SETTING that made it inevitable.
+        if _hint="$(_sync_error_hint "$_err")"; then printf '  Sync cause:  %s\n' "$_hint"; fi ;;
       halted)   printf '  Sync error:  Mutagen safety brake (root emptied/deleted/type-changed) — see '"'"'rt -p %s sync status'"'"'\n' "$RT_PROFILE" ;;
+    esac
+    # Has it ever worked? `erroring` is a statement about NOW: a breaker that clears on the next
+    # rescan and one that can never clear (the tree is larger than the configured limit) print
+    # the same word. A session with zero completed cycles has never once synchronised, which is
+    # the difference. Printed only when the count is established, and only when it is zero — a
+    # healthy session does not need a line saying so.
+    case "$sync_state" in
+      paused|halted|erroring|offline)
+        if _cyc=$(_sync_cycles) && [[ "$_cyc" == "0" ]]; then
+          printf '  Sync cycles: 0 — this session has NEVER completed a synchronisation\n'
+        fi ;;
     esac
     printf '  SSH:         %s\n' "$ssh_ok"
     # Sync-set size, with its SCOPE: an unscanned endpoint reports zeros, and printing those as
@@ -1539,6 +1607,7 @@ _status_all() {
   fi
 
   local key h p sync_state host rdir local_dir tag configured live=0 total=0
+  local stalled=0 stalled_note="" _c=""
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     h="${key%%/*}"; p="${key#*/}"
@@ -1546,6 +1615,24 @@ _status_all() {
 
     sync_state=$(_sync_status "$h" "$p")
     [[ "$sync_state" != "none" && "$sync_state" != "unknown" ]] && live=$((live + 1))
+
+    # A row that is NOT synchronising must not read like one that is. Measured 2026-08-12: an
+    # erroring profile — two days without a single completed cycle — was listed among the
+    # healthy ones in the same visual form, and counted in the "live sync session" total, which
+    # reads to an agent as "currently retrying". `unknown`/`none` are excluded deliberately:
+    # they are absence of knowledge and absence of a session, not a claim that nothing is
+    # synchronising.
+    stalled_note=""
+    case "$sync_state" in
+      paused|halted|erroring|offline)
+        stalled=$((stalled + 1))
+        stalled_note="  ⚠ synchronising nothing"
+        # Never-once-succeeded is the fact that separates a breaker that will clear from one
+        # that cannot. Absent when the count is not established — never guessed as 0.
+        if _c=$(_sync_cycles "$h" "$p") && [[ "$_c" == "0" ]]; then
+          stalled_note="${stalled_note} — has NEVER completed a cycle"
+        fi ;;
+    esac
 
     # The live session's own record wins where it exists — it is what the session was actually
     # created with, and the config may have been edited since. Otherwise fall back to the
@@ -1565,12 +1652,16 @@ _status_all() {
     tag=""
     [[ "$configured" == "no" ]] && tag="  ⚠ no config file — 'rt -p ${h}/${p} <cmd>' will fail"
 
-    printf '  [%s/%s] sync=%s — %s:%s ⇄ %s%s\n' "$h" "$p" "$sync_state" "$host" "$rdir" "$local_dir" "$tag"
+    printf '  [%s/%s] sync=%s — %s:%s ⇄ %s%s%s\n' "$h" "$p" "$sync_state" "$host" "$rdir" "$local_dir" "$tag" "$stalled_note"
   done < <(printf '%s\n' "${keys[@]}" | sort -u)
 
   # Name the scope. A bare list of rows does not say whether "not listed" means "does not
   # exist" or "this command does not look there" — which is the defect being closed.
-  printf '\n  %d profile(s) known to %s; %d with a live sync session.\n\n' "$total" "$RT_HOME" "$live"
+  printf '\n  %d profile(s) known to %s; %d with a live sync session' "$total" "$RT_HOME" "$live"
+  # "live" counts sessions that EXIST. Reporting only that number is what let a dead profile
+  # read as healthy, so the ones synchronising nothing are named beside it rather than folded in.
+  (( stalled > 0 )) && printf ', %d of them synchronising NOTHING (⚠ above)' "$stalled"
+  printf '.\n\n'
 }
 
 # ── Sync subcommand (Mutagen passthroughs) ────────────────────────
