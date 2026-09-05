@@ -1012,6 +1012,29 @@ chmod +x "$SCRATCH/bin/ssh"
 t0=$(date +%s); cmd_exec --timeout 1 "SLOWX" >/dev/null 2>&1; rc=$?; t1=$(date +%s)
 chk "14i cmd_exec --timeout routes through the bounded helper (rc 124, bound honoured)" \
     "$([ "$rc" = 124 ] && [ $((t1-t0)) -lt 6 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
+
+# A stop from THIS side. Measured 2026-08-13: two backgrounded reads were stopped client-side and
+# six orphans were still running on the host until a human asked why — rt had said nothing.
+# Ruled 2026-09-05: `--bg` is the one stoppable lane by design; plain exec SAYS SO when stopped.
+# The subshell gets TERM alone (not the process group), which is the harder case: the handler
+# has to find and kill the ssh itself, and must not report on a run that ended on its own.
+warn() { printf '!! %s\n' "$*" >&2; }; info() { :; }; RT_PROFILE="h/p"
+: > "$SCRATCH/stop14j.err"
+t0=$(date +%s)
+( cmd_exec "SLOWX" >/dev/null 2>"$SCRATCH/stop14j.err" ) &
+sub=$!
+sleep 2; kill -TERM "$sub" 2>/dev/null
+wait "$sub" 2>/dev/null; rc=$?; t1=$(date +%s)
+chk "14j a client-side TERM is reported, naming the REMOTE command as still running" \
+    "$(grep -q 'does NOT stop the REMOTE' "$SCRATCH/stop14j.err" && echo 0 || echo 1)" "$(head -c 200 "$SCRATCH/stop14j.err")"
+chk "14k ... exits 128+15 and returns within the reap bound" \
+    "$([ "$rc" = 143 ] && [ $((t1-t0)) -lt 9 ] && echo 0 || echo 1)" "rc=$rc after $((t1-t0))s"
+chk "14l ... and what arrived is reported as a PREFIX cut by the stop, not by the bound" \
+    "$(grep -q 'before the stop from this side' "$SCRATCH/stop14j.err" && ! grep -q 'bound ended' "$SCRATCH/stop14j.err" && echo 0 || echo 1)" "$(head -c 200 "$SCRATCH/stop14j.err")"
+cmd_exec "quick" >/dev/null 2>"$SCRATCH/stop14m.err"; rc=$?
+chk "14m a run that ends on its own says nothing about a stop" \
+    "$([ "$rc" != 143 ] && ! grep -q 'Stopped from this side' "$SCRATCH/stop14m.err" && echo 0 || echo 1)" "rc=$rc $(head -c 160 "$SCRATCH/stop14m.err")"
+warn() { :; }
 export PATH="$PATH_SAVE"
 
 # The entry's fallback clause: say so where the bounded-read path is documented.
@@ -1546,6 +1569,80 @@ chk "18o the happy path still writes, after every refusal above" \
 chk "18p fetch/push and their exit codes are documented" \
     "$(grep -q 'rt fetch' "$DOCS_DIR/SKILL.md" && grep -q 'rt fetch' "$DOCS_DIR/README.md" \
        && grep -q 'rt push' "$DOCS_DIR/SKILL.md" && echo 0 || echo 1)"
+
+# ── 19. an absent sync ROOT is reported, not folded into `active` ───────────────────
+#
+# Measured 2026-08-12: a ~563 GiB remote tree was deleted out-of-band over 12 hours and the
+# profile read `active` throughout. REPORT half only (ruled 2026-09-05): one stat per endpoint,
+# the remote one only while Mutagen reports that endpoint connected; a host that does not answer
+# is "not established", never "absent"; propagation untouched.
+set +e; source "$RT" 2>/dev/null; set +e
+info() { :; }; warn() { :; }
+RT_HOME="$SCRATCH/conf19"; mkdir -p "$RT_HOME/h" "$SCRATCH/bin19" "$SCRATCH/root19"
+cat > "$RT_HOME/h/host.conf" <<'EOF'
+REMOTE_HOST=example-host
+REMOTE_USER=nobody
+SSH_PORT=2222
+EOF
+cat > "$RT_HOME/h/p.conf" <<EOF
+LOCAL_DIR=$SCRATCH/root19
+REMOTE_DIR=/remote/proj
+EOF
+cat > "$SCRATCH/bin19/ssh" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$SCRATCH/ssh19.calls"
+case "\${FAKE_ROOT:-present}" in
+  present) echo present ;;
+  absent)  echo absent ;;
+  down)    exit 255 ;;
+esac
+EOF
+chmod +x "$SCRATCH/bin19/ssh"
+PATH_SAVE19="$PATH"; export PATH="$SCRATCH/bin19:$PATH"
+mutagen() { printf '%s\n' "$FAKE_TEMPLATE_OUT"; return 0; }
+LIVE19='false|Watching|true|true|true|5|134|3174279|412|'
+OFFLINE19='false|Watching|true|false||||||'
+FAKE_TEMPLATE_OUT="$LIVE19"
+
+export FAKE_ROOT=present; out="$(_status_all 2>&1)"
+chk "19a both roots present: no ABSENT on the row or in the summary" \
+    "$(! grep -q 'ABSENT' <<< "$out" && echo 0 || echo 1)" "$(head -c 240 <<< "$out")"
+chk "19b ... and the remote stat used the profile's own ssh identity (port from host.conf)" \
+    "$(grep -q -- '-p 2222' "$SCRATCH/ssh19.calls" && grep -q 'test -d /remote/proj' "$SCRATCH/ssh19.calls" && echo 0 || echo 1)" "$(tail -1 "$SCRATCH/ssh19.calls" 2>/dev/null)"
+export FAKE_ROOT=absent; out="$(_status_all 2>&1)"
+chk "19c the remote root gone: the row says REMOTE sync root ABSENT and the summary counts it" \
+    "$(grep -q 'REMOTE sync root ABSENT (/remote/proj)' <<< "$out" && grep -q '1 with an ABSENT sync root' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+export FAKE_ROOT=down; out="$(_status_all 2>&1)"
+chk "19d a host that does not answer is NOT ESTABLISHED, never absent" \
+    "$(grep -q 'remote root not established' <<< "$out" && ! grep -q 'ABSENT' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+export FAKE_ROOT=present; rmdir "$SCRATCH/root19"; out="$(_status_all 2>&1)"
+chk "19e the LOCAL root gone: LOCAL sync root ABSENT, counted" \
+    "$(grep -q "LOCAL sync root ABSENT ($SCRATCH/root19)" <<< "$out" && grep -q '1 with an ABSENT sync root' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+mkdir -p "$SCRATCH/root19"
+FAKE_TEMPLATE_OUT="$OFFLINE19"; : > "$SCRATCH/ssh19.calls"; out="$(_status_all 2>&1)"
+chk "19f a disconnected beta endpoint is not probed: no ssh call, no absent claim" \
+    "$(! [ -s "$SCRATCH/ssh19.calls" ] && ! grep -q 'ABSENT' <<< "$out" && echo 0 || echo 1)" "$(head -2 "$SCRATCH/ssh19.calls" 2>/dev/null)"
+export PATH="$PATH_SAVE19"; unset FAKE_ROOT
+# single-profile `status`: the same fact through the loaded profile's _ssh
+load_config() { :; }; RT_PROFILE="h/p"; RT_STATE_DIR="$SCRATCH/state19"; mkdir -p "$RT_STATE_DIR"
+REMOTE_HOST=example-host; REMOTE_DIR=/remote/proj; LOCAL_DIR="$SCRATCH/root19"; SLURM_ENABLED=0
+RT_SESSION_PREFIX="${RT_SESSION_PREFIX:-rt-h-p-}"
+_sync_status() { echo active; }; _sync_counts() { return 1; }; _sync_cycles() { return 1; }
+_ssh_test() { return 0; }
+_ssh() { case "$*" in *"test -d"*) echo absent ;; *) echo 0 ;; esac; }
+out="$(cmd_status 2>&1)"
+chk "19g rt status: an absent remote root gets its own line, and it says rt changed nothing" \
+    "$(grep -q 'Sync root:   ABSENT on the remote' <<< "$out" && grep -q 'changes nothing' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+_ssh() { case "$*" in *"test -d"*) echo present ;; *) echo 0 ;; esac; }
+out="$(cmd_status 2>&1)"
+chk "19h ... a present root prints no such line" \
+    "$(! grep -q 'Sync root:' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+_ssh_test() { return 1; }
+out="$(cmd_status 2>&1)"
+chk "19i ... an unreachable host: not established, not absent" \
+    "$(grep -q 'remote root not established' <<< "$out" && ! grep -q 'ABSENT' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+chk "19j the docs name the absent-root row and the client-side stop" \
+    "$(grep -q 'sync root ABSENT' "$DOCS_DIR/SKILL.md" && grep -q 'does NOT stop the REMOTE\|kills only the local' "$DOCS_DIR/SKILL.md" && grep -q 'sync root ABSENT' "$DOCS_DIR/README.md" && echo 0 || echo 1)"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi

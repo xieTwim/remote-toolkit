@@ -1153,11 +1153,19 @@ _exec_reap() {  # <grace-seconds> <pid>...
 # own change — `exec 'cat 400KB' | head -c 5` reported "81920 bytes of stdout, complete", which is
 # the exact shape of unsupported benign claim the change exists to remove, reintroduced one layer
 # out.
-_exec_account() {  # <bytes-or-empty> <trailer-rc-or-empty> <transport-rc> <forward-rc>
-  local bytes="$1" trailer="$2" transport="$3" forward="$4"
+_exec_account() {  # <bytes-or-empty> <trailer-rc-or-empty> <transport-rc> <forward-rc> [<stopped-by-signal-name>]
+  local bytes="$1" trailer="$2" transport="$3" forward="$4" stopped="${5:-}"
   local report="${RT_EXEC_REPORT_BYTES:-65536}"
   local seen="an unestablished number of bytes"
   [[ -n "$bytes" ]] && seen="$bytes bytes"
+
+  # A stop from this side is decided by the FLAG, not by the status: a remote command killed by a
+  # signal on the host comes back through ssh as the same 128+N. The stop itself was reported
+  # where it happened; here only the stream's completeness is at issue, and it is a prefix.
+  if [[ -n "$stopped" ]]; then
+    warn "[$RT_PROFILE] exec output is TRUNCATED: $seen arrived before the stop from this side ended the wait. What you have is a PREFIX."
+    return "$transport"
+  fi
 
   # The bound is decided first, and on its own message: it fired, so the caller has already been
   # told the wait ended, and every other reading here would be a consequence of that kill.
@@ -1227,11 +1235,10 @@ _exec_sync() {
   local filter_pid=$!
 
   local transport=0
-  if [[ -n "$limit" ]]; then
-    _ssh_bounded "$limit" "$remote" > "$acct/out" 2> "$acct/err" || transport=$?
-  else
-    _ssh "$remote" > "$acct/out" 2> "$acct/err" || transport=$?
-  fi
+  # One path for bounded and unbounded: an empty limit is the unbounded call, and it is watched
+  # for a stop from this side the same way (see `_ssh_bounded` for why that has to be watched).
+  RT_EXEC_STOPPED=""
+  _ssh_bounded "$limit" "$remote" > "$acct/out" 2> "$acct/err" || transport=$?
 
   # The redirections above close with the call, so the readers now see EOF. Wait for them rather
   # than reading their output files: a count read before `wc` has written it is a smaller number
@@ -1240,7 +1247,8 @@ _exec_sync() {
   # The grace applies only after the bound fired, because that is the only path on which rt has
   # already promised to stop waiting and the only one that killed ssh. When ssh exits on its own
   # the channel is closed and nothing further is coming, so waiting there is waiting for a drain.
-  if [[ "$transport" -eq 124 ]]; then
+  # A stop from this side killed ssh exactly the way the bound does, so it reaps the same way.
+  if [[ "$transport" -eq 124 || -n "$RT_EXEC_STOPPED" ]]; then
     # `|| true` because a reap that had to kill returns non-zero, and under `set -e` that would
     # abort the accounting it exists to make possible. The absent count says the same thing.
     _exec_reap 2 "$tee_pid" "$wc_pid" "$filter_pid" || true
@@ -1257,7 +1265,7 @@ _exec_sync() {
   trailer="$(cat "$acct/rc" 2>/dev/null || true)";   trailer="${trailer//[!0-9]/}"
   rm -rf "$acct"
 
-  _exec_account "$bytes" "$trailer" "$transport" "$forward"
+  _exec_account "$bytes" "$trailer" "$transport" "$forward" "$RT_EXEC_STOPPED"
 }
 
 # Bound an `_ssh` call in the WRAPPER, in pure Bash.
@@ -1274,20 +1282,42 @@ _exec_sync() {
 #
 # 124 is timeout(1)'s conventional code, so a caller that already branched on `timeout`'s status
 # does not have to learn a new one. Granularity is 1s, as in `_run_bounded`.
-_ssh_bounded() {
+# Kill a backgrounded job's children before the job: a function call backgrounded is a subshell,
+# and killing only the subshell leaves the ssh it started holding the pipe open.
+_kill_tree() {   # <pid>
+  pkill -P "$1" 2>/dev/null || true
+  kill "$1" 2>/dev/null || true
+}
+
+_ssh_bounded() {   # <limit-seconds, or EMPTY for unbounded> <remote-cmd...>
   local limit="$1"; shift
-  # `ssh` is invoked DIRECTLY rather than through `_ssh`. Backgrounding a shell FUNCTION forks a
-  # subshell, so `$!` would be the subshell's pid and `kill` would leave the real ssh running —
-  # measured: the bound returned at 3s while the remote command's output still arrived at 30s,
-  # because the surviving ssh held the pipe open. The point of the bound is that the caller stops
-  # waiting, so the process that must die is ssh itself.
-  # No redirection: the remote command's stdout/stderr are the point of `exec`.
-  ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@" &
+  # Through `_ssh` (so a test can stand in for the transport), backgrounded — which makes `$!`
+  # the pid of the subshell a FUNCTION call becomes, not of the ssh it starts. Measured when this
+  # was first written: killing that subshell left ssh alive and the bound returned at 3s while
+  # the remote command's output still arrived at 30s. So a kill here is `_kill_tree`: the
+  # subshell's children first, then the subshell — the process that must die is ssh itself.
+  # No redirection of stdout/stderr: the remote command's streams are the point of `exec`. stdin
+  # is passed through explicitly (`<&0`): a backgrounded command gets /dev/null by default, and
+  # the unbounded call this now also carries used to run ssh in the foreground with stdin intact.
+  _ssh "$@" <&0 &
   local pid=$! waited=0
+  # A stop from THIS side — Ctrl-C, a task stop, the HUP of a closing terminal — kills the local
+  # ssh and nothing else: no tty carries the signal across, and plain `exec` has no kill plumbing
+  # by design (ruled 2026-09-05: `exec --bg`, a named tmux session, is the one stoppable lane).
+  # What this tool CAN do is say so at the moment it happens, instead of dying silently and
+  # leaving the caller to believe the remote command died with it. Measured 2026-08-13: two
+  # backgrounded reads were stopped client-side and six orphans were still running on the host
+  # until a human asked why. The handler only sets a flag — bash runs a trap between foreground
+  # commands, and `wait` returns early on one — so the reporting happens below, once, after ssh
+  # is actually dead, and never on a run that ended on its own.
+  RT_EXEC_STOPPED=""
+  trap 'RT_EXEC_STOPPED=INT' INT; trap 'RT_EXEC_STOPPED=TERM' TERM; trap 'RT_EXEC_STOPPED=HUP' HUP
   while kill -0 "$pid" 2>/dev/null; do
-    if (( waited >= limit )); then
-      kill "$pid" 2>/dev/null || true
+    [[ -z "$RT_EXEC_STOPPED" ]] || break
+    if [[ -n "$limit" ]] && (( waited >= limit )); then
+      _kill_tree "$pid"
       wait "$pid" 2>/dev/null || true
+      trap - INT TERM HUP
       # Say what was NOT established. Killing the local ssh client does not reliably kill the
       # remote process — there is no tty to carry a SIGHUP — so the remote command may still be
       # running, and any output it produces after this point is lost rather than absent.
@@ -1297,7 +1327,24 @@ _ssh_bounded() {
     sleep 1
     waited=$((waited + 1))
   done
-  wait "$pid"
+  # A stop seen inside the loop: kill BEFORE waiting, or the wait below is for the remote command
+  # to finish on its own — measured as a 13s return on a 12s stub, i.e. no stop at all.
+  [[ -z "$RT_EXEC_STOPPED" ]] || _kill_tree "$pid"
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  if [[ -n "$RT_EXEC_STOPPED" ]]; then
+    # ...or a stop that arrived during the wait itself, which returns early on a trapped signal:
+    # kill now (idempotent for the first path), and only then say what that did and did not stop.
+    _kill_tree "$pid"
+    wait "$pid" 2>/dev/null || true
+    trap - INT TERM HUP
+    local signum=15
+    case "$RT_EXEC_STOPPED" in INT) signum=2 ;; HUP) signum=1 ;; esac
+    warn "[$RT_PROFILE] Stopped from this side (SIG${RT_EXEC_STOPPED}): the local ssh was killed, and that does NOT stop the REMOTE command — it is still running unless it happened to finish first. Plain 'exec' has no kill plumbing by design; a command you may need to stop belongs in 'exec --bg' (a named tmux session — 'rt logs' lists them), otherwise pgrep/kill it on the host."
+    return $((128 + signum))
+  fi
+  trap - INT TERM HUP
+  return "$rc"
 }
 
 _exec_bg() {
@@ -1519,6 +1566,25 @@ cmd_status() {
           printf '  Sync cycles: 0 — this session has NEVER completed a synchronisation\n'
         fi ;;
     esac
+    # The sync ROOT itself. Mutagen's brakes fire on what is being propagated; nothing asked
+    # whether the directory each endpoint synchronises still EXISTS — and an absent root is the
+    # precondition for a wholesale propagation in whichever direction Mutagen resolves it.
+    # Measured 2026-08-12: a ~563 GiB remote tree was deleted out-of-band over 12 hours and the
+    # profile still read `active`. One stat per endpoint; the remote one only when the host
+    # answered, and never inferred from silence. REPORT only (ruled 2026-09-05): propagation is
+    # untouched, and the line says so.
+    if [[ -n "$local_dir" && ! -d "$local_dir" ]]; then
+      printf '  Sync root:   ABSENT locally — %s does not exist. rt changes nothing about what Mutagen does next; establish which side is authoritative before the next cycle.\n' "$local_dir"
+    fi
+    if [[ "$ssh_ok" == "reachable" ]]; then
+      case "$(_remote_root_state_via_ssh "$rdir")" in
+        absent)  printf '  Sync root:   ABSENT on the remote — %s does not exist there. rt changes nothing about what Mutagen does next; establish which side is authoritative before the next cycle.\n' "$rdir" ;;
+        present) ;;
+        *)       printf '  Sync root:   (remote root not established — the host answered, the stat did not)\n' ;;
+      esac
+    else
+      printf '  Sync root:   (remote root not established — host unreachable)\n'
+    fi
     printf '  SSH:         %s\n' "$ssh_ok"
     # Sync-set size, with its SCOPE: an unscanned endpoint reports zeros, and printing those as
     # "0 files" would be a measurement the session has not made.
@@ -1538,6 +1604,45 @@ cmd_status() {
     printf '  Sync:        none\n'
   fi
   printf '\n'
+}
+
+# Does the sync root exist on the remote? present | absent | unestablished. Decided by what the
+# remote SAID, never by ssh's exit status alone: `test -d` and a dropped connection both exit
+# non-zero, and reading the second as "absent" would be the fail-open this file keeps closing.
+_remote_root_state_via_ssh() {   # <remote-dir>; uses the loaded profile's _ssh
+  local rdir="$1" out
+  [[ -n "$rdir" ]] || { echo unestablished; return; }
+  out=$(_ssh "test -d $(printf '%q' "$rdir") && echo present || echo absent" 2>/dev/null) || { echo unestablished; return; }
+  case "$out" in present|absent) echo "$out" ;; *) echo unestablished ;; esac
+}
+
+# The same question for `status --all`, which loads no profile: the host's ssh identity comes
+# from the config files (subshell, same rule as `_profile_identity`), and the stat is attempted
+# only while Mutagen reports the beta endpoint CONNECTED — a dead host is already an `offline`
+# row, and a ConnectTimeout per dead host would make the skill's first action slow.
+# unprobed | present | absent | unestablished
+_remote_root_state() {   # <host-group> <profile> <remote-dir>
+  local h="$1" p="$2" rdir="$3" out line
+  [[ -n "$rdir" ]] || { echo unprobed; return; }
+  out=$(_sync_probe "$h" "$p") || { echo unprobed; return; }
+  line=$(grep -m1 . <<< "$out") || true
+  [[ -n "$line" ]] || { echo unprobed; return; }
+  local paused status aconn bconn rest
+  IFS='|' read -r paused status aconn bconn rest <<< "$line"
+  [[ "$bconn" == "true" ]] || { echo unprobed; return; }
+  local host port key
+  IFS=$'\t' read -r host port key <<< "$(
+    set +u
+    REMOTE_HOST=""; SSH_PORT=""; SSH_KEY=""
+    [[ -f "${RT_HOME}/${h}/host.conf" ]] && . "${RT_HOME}/${h}/host.conf"
+    [[ -f "${RT_HOME}/${h}/${p}.conf" ]] && . "${RT_HOME}/${h}/${p}.conf"
+    printf '%s\t%s\t%s' "$REMOTE_HOST" "${SSH_PORT:-22}" "$SSH_KEY"
+  )"
+  [[ -n "$host" ]] || { echo unestablished; return; }
+  local -a opts=(-o ConnectTimeout=5 -o BatchMode=yes -p "$port")
+  [[ -n "$key" ]] && opts+=(-i "$key")
+  out=$(ssh "${opts[@]}" "$host" "test -d $(printf '%q' "$rdir") && echo present || echo absent" 2>/dev/null </dev/null) || { echo unestablished; return; }
+  case "$out" in present|absent) echo "$out" ;; *) echo unestablished ;; esac
 }
 
 # Read a profile's identity WITHOUT polluting this shell. Config files are sourced bash, so
@@ -1607,7 +1712,7 @@ _status_all() {
   fi
 
   local key h p sync_state host rdir local_dir tag configured live=0 total=0
-  local stalled=0 stalled_note="" _c=""
+  local stalled=0 stalled_note="" _c="" rootless=0 root_note=""
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     h="${key%%/*}"; p="${key#*/}"
@@ -1652,7 +1757,21 @@ _status_all() {
     tag=""
     [[ "$configured" == "no" ]] && tag="  ⚠ no config file — 'rt -p ${h}/${p} <cmd>' will fail"
 
-    printf '  [%s/%s] sync=%s — %s:%s ⇄ %s%s%s\n' "$h" "$p" "$sync_state" "$host" "$rdir" "$local_dir" "$tag" "$stalled_note"
+    # The sync ROOT on each endpoint (see `cmd_status` for the measured case). Local is one stat
+    # and free; remote is asked only while Mutagen reports that endpoint connected, and a host
+    # that does not answer is "not established", never "absent".
+    root_note=""
+    if [[ -n "$local_dir" && ! -d "$local_dir" ]]; then
+      root_note="  ⚠ LOCAL sync root ABSENT (${local_dir})"; rootless=$((rootless + 1))
+    fi
+    if [[ "$sync_state" != "none" && "$sync_state" != "unknown" ]]; then
+      case "$(_remote_root_state "$h" "$p" "$rdir")" in
+        absent)        root_note="${root_note}  ⚠ REMOTE sync root ABSENT (${rdir})"; rootless=$((rootless + 1)) ;;
+        unestablished) root_note="${root_note}  (remote root not established)" ;;
+      esac
+    fi
+
+    printf '  [%s/%s] sync=%s — %s:%s ⇄ %s%s%s%s\n' "$h" "$p" "$sync_state" "$host" "$rdir" "$local_dir" "$tag" "$stalled_note" "$root_note"
   done < <(printf '%s\n' "${keys[@]}" | sort -u)
 
   # Name the scope. A bare list of rows does not say whether "not listed" means "does not
@@ -1661,6 +1780,9 @@ _status_all() {
   # "live" counts sessions that EXIST. Reporting only that number is what let a dead profile
   # read as healthy, so the ones synchronising nothing are named beside it rather than folded in.
   (( stalled > 0 )) && printf ', %d of them synchronising NOTHING (⚠ above)' "$stalled"
+  # An absent root is the precondition for a wholesale propagation; it is counted on its own so a
+  # reader who stops at the summary line still sees it.
+  (( rootless > 0 )) && printf '; %d with an ABSENT sync root (⚠ above — rt reports it and changes nothing)' "$rootless"
   printf '.\n\n'
 }
 
