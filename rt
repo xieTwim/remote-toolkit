@@ -1760,11 +1760,14 @@ _status_all() {
     # The sync ROOT on each endpoint (see `cmd_status` for the measured case). Local is one stat
     # and free; remote is asked only while Mutagen reports that endpoint connected, and a host
     # that does not answer is "not established", never "absent".
+    # Both only for a profile whose SESSION exists: a configured-never-connected profile has no
+    # local replica yet, and tagging those made the live smoke read "3 ABSENT" over three
+    # `sync=none` rows — noise on the row this tag exists to make unmissable.
     root_note=""
-    if [[ -n "$local_dir" && ! -d "$local_dir" ]]; then
-      root_note="  ⚠ LOCAL sync root ABSENT (${local_dir})"; rootless=$((rootless + 1))
-    fi
     if [[ "$sync_state" != "none" && "$sync_state" != "unknown" ]]; then
+      if [[ -n "$local_dir" && ! -d "$local_dir" ]]; then
+        root_note="  ⚠ LOCAL sync root ABSENT (${local_dir})"; rootless=$((rootless + 1))
+      fi
       case "$(_remote_root_state "$h" "$p" "$rdir")" in
         absent)        root_note="${root_note}  ⚠ REMOTE sync root ABSENT (${rdir})"; rootless=$((rootless + 1)) ;;
         unestablished) root_note="${root_note}  (remote root not established)" ;;

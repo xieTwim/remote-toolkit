@@ -1622,6 +1622,10 @@ mkdir -p "$SCRATCH/root19"
 FAKE_TEMPLATE_OUT="$OFFLINE19"; : > "$SCRATCH/ssh19.calls"; out="$(_status_all 2>&1)"
 chk "19f a disconnected beta endpoint is not probed: no ssh call, no absent claim" \
     "$(! [ -s "$SCRATCH/ssh19.calls" ] && ! grep -q 'ABSENT' <<< "$out" && echo 0 || echo 1)" "$(head -2 "$SCRATCH/ssh19.calls" 2>/dev/null)"
+FAKE_TEMPLATE_OUT=""; rmdir "$SCRATCH/root19"; : > "$SCRATCH/ssh19.calls"; out="$(_status_all 2>&1)"
+chk "19k a profile with NO session says nothing about roots (no replica exists yet, nothing can propagate)" \
+    "$(! grep -q 'ABSENT' <<< "$out" && ! [ -s "$SCRATCH/ssh19.calls" ] && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+mkdir -p "$SCRATCH/root19"
 export PATH="$PATH_SAVE19"; unset FAKE_ROOT
 # single-profile `status`: the same fact through the loaded profile's _ssh
 load_config() { :; }; RT_PROFILE="h/p"; RT_STATE_DIR="$SCRATCH/state19"; mkdir -p "$RT_STATE_DIR"
