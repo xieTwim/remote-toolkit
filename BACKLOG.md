@@ -148,3 +148,16 @@ around `exec --bg` and `slurm submit` — copy a deterministic input snapshot to
 directory, verify its manifest digest, launch THERE, write outputs there, and fetch them with a
 verified manifest. Mutagen stays a browsing convenience and stops being the correctness boundary.
 That is a design change to a shared tool and belongs to a human.
+
+- [open · needs-routing] **No single-file push/pull that bypasses the Mutagen sync.** `rt exec`
+  auto-flushes; `--no-flush` skips the flush but there is still no way to move ONE file. When a
+  long-running remote job appends inside the sync root, a flush can take minutes or never return
+  (measured 2026-09-08: 3.4 min typical, one 900 s flush unreturned), which blocks iterating on a
+  producer that must run remotely. Working workaround, used ~6× with a sha256 check on every push:
+  `rt -p P exec --no-flush "cat > REMOTE <<'TAG'\n$(cat LOCAL)\nTAG\nsha256sum REMOTE"` — the local
+  shell interpolates, so the bytes never touch the agent's context. Reverse:
+  `exec --no-flush "gzip -c REMOTE | base64 -w0"` piped through
+  `grep -oE '^[A-Za-z0-9+/=]{200,}$' | base64 -d | gunzip`; the grep is REQUIRED to strip rt's SSH
+  `Warning: Permanently added ...` banner, which otherwise corrupts the stream. Proposed:
+  `rt push <local> <remote>` / `rt pull <remote> <local>`, sha256-verified, sync-independent.
+  Reporter: fast-matmul-compiler WAKE 127.
