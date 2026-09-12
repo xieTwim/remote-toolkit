@@ -2186,8 +2186,10 @@ _fetch_trailer_filter() {  # <token> <outfile>
 
 cmd_fetch() {
   local limit=""
+  local no_flush=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --no-flush) no_flush=true; shift ;;
       --timeout) [[ $# -ge 2 ]] || die "Missing argument for --timeout."; limit="$2"; shift 2 ;;
       --timeout=*) limit="${1#--timeout=}"; shift ;;
       --) shift; break ;;
@@ -2195,9 +2197,10 @@ cmd_fetch() {
       *) break ;;
     esac
   done
-  [[ $# -ge 2 ]] || die "Usage: rt fetch [--timeout N] <local-path> <remote-command>
+  [[ $# -ge 2 ]] || die "Usage: rt fetch [--no-flush] [--timeout N] <local-path> <remote-command>
   Runs <remote-command> on the remote, verifies the payload by sha256, and writes it to
   <local-path> ATOMICALLY — the destination is never a partial file.
+  Flushes sync first by default; --no-flush uses the remote files as they stand.
     rt fetch runs.tar 'cd /data/runs && tar cf - *.csv'
     rt fetch one.csv  'cat /data/runs/one.csv'
   Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH
@@ -2211,7 +2214,7 @@ cmd_fetch() {
   [[ -d "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory does not exist: $ddir"
   [[ -w "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory is not writable: $ddir"
 
-  _sync_preflight_for_exec
+  _sync_preflight_for_exec "$no_flush"
 
   local token remote tmp acct
   token="__rt_fetch_end_${$}_${RANDOM}__"
@@ -2570,6 +2573,14 @@ COMMANDS:
                        The bound is on the WAIT: the remote process may survive.
   exec --bg [--name N] <cmd>
                        Run in background (tmux), survives disconnection
+  fetch [--no-flush] [--timeout N] <local-path> <remote-command>
+                       Run a remote command and save its output atomically after
+                       SHA-256 verification. Flushes sync first by default;
+                       --no-flush uses remote files as they stand, retaining
+                       SSH reachability and digest checks.
+  push <local-path> <remote-path>
+                       Upload and install atomically after SHA-256 verification.
+                       Bypasses Mutagen sync; relative targets use REMOTE_DIR.
   logs                 List background jobs for this profile
   logs <job_id>        Show output of a background job
   logs <job_id> -f     Follow (tail -f) a background job's output

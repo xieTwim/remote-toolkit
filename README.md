@@ -88,6 +88,22 @@ stable, `2` = blocked or unverifiable (bad/ignored path, sync not propagating, n
 `3` = still different at the deadline. A `3` means non-arrival; it is **not** a promise that sync
 is still working on it.
 
+### Transfer a file directly
+
+`rt push` uploads a local file; `rt fetch` saves a remote command's output. Both verify SHA-256
+before installing the destination atomically; a failed transfer leaves the destination unchanged.
+
+```bash
+rt -p hpc/train push ./patched.py scripts/patched.py
+rt -p hpc/train fetch one.csv 'cat /data/runs/one.csv'
+rt -p hpc/train fetch --no-flush one.csv 'cat /data/runs/one.csv'
+```
+
+`push` bypasses Mutagen. `fetch` flushes sync first by default; `--no-flush` skips the Mutagen
+preflight even when sync is paused or unknown, and runs against the remote files as they stand.
+SSH reachability and digest checks still apply. Use this when the remote inputs are already
+correct; it does not establish that local edits have arrived. `fetch --timeout N` bounds the wait.
+
 ### What does not sync
 
 The local replica is **not** a full copy of the remote directory. Every profile is created with this default ignore set, and files under these paths never cross in either direction:

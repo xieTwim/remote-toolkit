@@ -204,8 +204,14 @@ The bound is on the **wait**, not on the work: `rt` kills the local `ssh`, which
 ```bash
 rt -p host/proj fetch runs.tar 'cd /data/runs && tar cf - *.csv'   # generated payload
 rt -p host/proj fetch one.csv  'cat /data/runs/one.csv'            # an existing file
+rt -p host/proj fetch --no-flush one.csv 'cat /data/runs/one.csv'  # use remote files as they stand
 rt -p host/proj push ./patched.py scripts/patched.py               # local -> remote
 ```
+
+`fetch` flushes sync before running its remote command by default. Use `--no-flush` when the
+remote files are already the intended inputs: it skips the Mutagen preflight, including paused
+or unknown sync state, while retaining SSH reachability and SHA-256 verification. It does not
+establish that local edits have arrived. `push` already bypasses Mutagen and needs no flag.
 
 The remote stages the payload, digests it **there**, streams it, and reports the digest in the
 trailer; `rt` digests what actually arrived and renames into place **only on a match**. So a cut

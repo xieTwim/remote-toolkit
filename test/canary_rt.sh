@@ -1570,6 +1570,80 @@ chk "18p fetch/push and their exit codes are documented" \
     "$(grep -q 'rt fetch' "$DOCS_DIR/SKILL.md" && grep -q 'rt fetch' "$DOCS_DIR/README.md" \
        && grep -q 'rt push' "$DOCS_DIR/SKILL.md" && echo 0 || echo 1)"
 
+# Restore the REAL preflight, classifiers and transfer path. Only the SSH and Mutagen
+# boundaries are fake: the remote command, trailer, digest and final rename all run locally.
+# This covers the owner-approved 2026-09-12 override without certifying stale local edits.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="$SCRATCH/proj"
+C18="$SCRATCH/calls18"; FAKE_SYNC18=active; FAKE_SSH18=up
+mutagen() {
+  printf 'mutagen %s\n' "$1 $2" >> "$C18"
+  case "$1 $2" in
+    'sync list')
+      case "$FAKE_SYNC18" in
+        active) printf 'false|Watching|true|true|true|1|1|10|1|\n' ;;
+        paused) printf 'true|Disconnected|false|false||||||\n' ;;
+        unknown) return 1 ;;
+      esac ;;
+    'sync flush') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_ssh() {
+  if [[ "$1" == 'echo ok' ]]; then
+    printf 'ssh probe\n' >> "$C18"
+    [[ "$FAKE_SSH18" == up ]]
+  else
+    printf 'ssh payload\n' >> "$C18"
+    sh -c "$1"
+  fi
+}
+: > "$C18"
+cmd_fetch "$D/default.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18q fetch still flushes by default before delivering a verified payload" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/default.csv" \
+       && awk '/^mutagen sync flush$/{flushed=1} /^ssh payload$/{if(flushed) ok=1} END{exit !ok}' "$C18" \
+       && echo 0 || echo 1)" "rc=$rc calls='$(cat "$C18")'"
+
+for FAKE_SYNC18 in paused unknown; do
+  : > "$C18"
+  (cmd_fetch "$D/blocked-$FAKE_SYNC18.csv" "cat $REMOTE_DIR/one.csv") 2>"$E18"; rc=$?
+  chk "18r fetch still refuses $FAKE_SYNC18 sync without an override" \
+      "$([ "$rc" != 0 ] && [ ! -e "$D/blocked-$FAKE_SYNC18.csv" ] \
+         && ! grep -q '^ssh payload$' "$C18" && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc"
+
+  : > "$C18"
+  cmd_fetch --no-flush "$D/skipped-$FAKE_SYNC18.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+  chk "18s fetch --no-flush delivers under $FAKE_SYNC18 sync without asking Mutagen" \
+      "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/skipped-$FAKE_SYNC18.csv" \
+         && ! grep -q '^mutagen ' "$C18" && grep -q '^ssh probe$' "$C18" \
+         && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc calls='$(cat "$C18")'"
+done
+
+printf 'existing\n' > "$D/skip-keep.csv"
+FAKE_SSH18=down; : > "$C18"
+(cmd_fetch --no-flush "$D/skip-keep.csv" "cat $REMOTE_DIR/one.csv") 2>"$E18"; rc=$?
+chk "18t --no-flush still refuses an unreachable SSH host without touching the destination" \
+    "$([ "$rc" != 0 ] && [ "$(cat "$D/skip-keep.csv")" = existing ] \
+       && ! grep -q '^ssh payload$' "$C18" && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc"
+
+_ssh() {
+  [[ "$1" == 'echo ok' ]] && return 0
+  sh -c "$1" | tr 'a-z' 'A-Z'       # same byte count; only a digest detects the alteration
+}
+cmd_fetch --no-flush "$D/skip-keep.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18u --no-flush still rejects altered bytes and preserves the existing destination" \
+    "$([ "$rc" = 3 ] && grep -q 'DIGEST MISMATCH' "$E18" \
+       && [ "$(cat "$D/skip-keep.csv")" = existing ] && [ "$(leftovers)" = 0 ] \
+       && echo 0 || echo 1)" "rc=$rc"
+
+_ssh() { sh -c "$1"; }
+cmd_fetch --no-flush "$D/skip-keep.csv" 'printf partial; exit 4' 2>"$E18"; rc=$?
+chk "18v --no-flush keeps remote command failures nonzero without installing their payload" \
+    "$([ "$rc" = 4 ] && [ "$(cat "$D/skip-keep.csv")" = existing ] \
+       && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc"
+
 # ── 19. an absent sync ROOT is reported, not folded into `active` ───────────────────
 #
 # Measured 2026-08-12: a ~563 GiB remote tree was deleted out-of-band over 12 hours and the
