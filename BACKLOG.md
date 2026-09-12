@@ -161,3 +161,4 @@ That is a design change to a shared tool and belongs to a human.
   `Warning: Permanently added ...` banner, which otherwise corrupts the stream. Proposed:
   `rt push <local> <remote>` / `rt pull <remote> <local>`, sha256-verified, sync-independent.
   Reporter: fast-matmul-compiler WAKE 127.
+  blocked-on: owner approval of a sync-independent download interface; recommend adding `rt fetch --no-flush <local> <command>` using the existing exec preflight override, retaining default flush and digest checks. `push` already bypasses sync; `fetch` currently calls `_sync_preflight_for_exec` without an override (verified 2026-09-12).
