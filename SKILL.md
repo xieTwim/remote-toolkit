@@ -249,9 +249,10 @@ rt -p fact-cluster/ako exec --bg --name train "python3 train.py"
 
 `--bg` VERIFIES the session before reporting it: after `tmux new-session` it checks that the
 session exists or its log does, and exits non-zero naming the job when neither is there. A
-"Background job started" line is now a claim the tool checked. The failure it catches is a
-payload body carrying nested quotes — the remote shell rejects it, nothing launches — and the
-answer is to stage the body as a script and background that.
+"Background job started" line is now a claim the tool checked. The payload travels base64-encoded
+into `~/.rt_logs/<session>.sh` and runs exactly as written — variables, `$(...)` and nested quotes
+are no longer expanded or mangled on the way (fixed 7142ac0). What the check still catches is a
+payload that does not parse (`bash -n` it) or a failed decode/tmux step on the host.
 
 Check background tasks:
 ```bash
