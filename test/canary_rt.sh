@@ -71,13 +71,25 @@ info() { :; }                                 # quiet
 # whose last argv element is the payload — rather than by peeling quotes with string surgery.
 # That is exactly what the remote shell does with the string ssh hands it, so what runs below is
 # what would run there. Surgery on the quotes would be a test of my own peeling.
+#
+# That shell is a FRESH `sh` with the stub `tmux` on PATH, not an `eval` in this runner: an eval
+# expands the payload's variables against the RUNNER's own (`$cmd`, `$r`), which hides exactly
+# the early expansion 1g pins. It runs in the scratch HOME because the launch line writes the job
+# script under `~` before tmux starts, and that must never be the real ~/.rt_logs.
 TMUX_PAYLOAD=""
-tmux() { TMUX_PAYLOAD="${!#}"; }
+mkdir -p "$SCRATCH/bgbin"
+cat > "$SCRATCH/bgbin/tmux" <<EOF
+#!/bin/sh
+for a; do last=\$a; done
+printf '%s' "\$last" > '$SCRATCH/tmux_payload'
+EOF
+chmod +x "$SCRATCH/bgbin/tmux"
 
 emit() { # emit <command> -> sets TMUX_PAYLOAD to what the remote shell would run
-  CAPTURED=""; TMUX_PAYLOAD=""
+  CAPTURED=""; TMUX_PAYLOAD=""; rm -f "$SCRATCH/tmux_payload"
   _exec_bg "$1" "probe" >/dev/null 2>&1
-  eval "$CAPTURED"
+  ( cd "$SCRATCH/home" && HOME="$SCRATCH/home" PATH="$SCRATCH/bgbin:$PATH" sh -c "$CAPTURED" ) >/dev/null 2>&1
+  TMUX_PAYLOAD="$(cat "$SCRATCH/tmux_payload" 2>/dev/null)"
 }
 
 run_captured() { # run_captured <command> -> prints the recorded EXIT_CODE
@@ -121,6 +133,32 @@ rc_cd="$(run_captured 'echo unreachable')"
 REMOTE_DIR="$REMOTE_DIR_SAVE"
 chk "1d an unreachable REMOTE_DIR records a FAILURE rather than no log at all" \
     "$([ -n "$rc_cd" ] && [ "$rc_cd" != "0" ] && echo 0 || echo 1)" "recorded '$rc_cd'"
+
+# ── 1g/1h the payload runs AS WRITTEN ─────────────────────────────────────────
+#
+# The payload used to be spliced into a double-quoted string inside the ssh argument, and double
+# quotes do not stop `$`: the login shell parsing the ssh line expanded `$r` one layer before
+# tmux started the shell meant to run it, so an unset-there variable became "". Silent — the
+# payload still parses, so the start probe (1e) cannot see it. Hit twice live; the second time
+# (2026-09-27) a checkpoint-download loop fetched the default revision five times, exit 0.
+# Both checks fail with the fix reverted.
+run_captured 'for r in a b; do echo "x$r"; done' >/dev/null
+loop_out="$(grep '^x' "$SCRATCH/home/.rt_logs/rt_h_p_bg_probe.log" 2>/dev/null | tr '\n' ' ')"
+chk "1g a loop variable is expanded by the job's shell, not the ssh one (logs xa xb)" \
+    "$([ "$loop_out" = "xa xb " ] && echo 0 || echo 1)" "logged '$loop_out'"
+
+# `$(pwd)` distinguishes WHERE a substitution runs (the ssh shell sits in HOME, the job has
+# already cd'd), the quotes are the 2026-08-13 mangling, and the trailing comment would swallow
+# a closing `)` written on the payload's own line.
+IFS= read -r payload_h <<'EOF'
+echo "pwd=$(pwd)"; echo "it's \"nested\" \$HOME" # trailing comment
+EOF
+run_captured "$payload_h" >/dev/null
+bg_logf="$SCRATCH/home/.rt_logs/rt_h_p_bg_probe.log"
+grep -qxF "pwd=$REMOTE_DIR" "$bg_logf" 2>/dev/null \
+  && grep -qxF "it's \"nested\" \$HOME" "$bg_logf" 2>/dev/null
+chk "1h \$(...), nested quotes and a trailing comment run as written, in REMOTE_DIR" "$?" \
+    "log: $(tr '\n' '|' 2>/dev/null < "$bg_logf")"
 
 # ── 1e/1f a job that never started is REPORTED, not announced ─────────────────
 #

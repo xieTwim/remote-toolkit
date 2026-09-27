@@ -1401,11 +1401,26 @@ _exec_bg() {
   # cd's status. So a failed cd was the ONE case the old form recorded correctly. Moving `cd`
   # inside the group is still right — it keeps one path for every failure instead of two — but it
   # fixes a uniformity problem, not a lost-log one.
+  #
+  # The wrapper travels as a FILE, not as quoted text. It used to be spliced into a double-quoted
+  # string inside the ssh argument, and double quotes do not stop `$`: the login shell parsing the
+  # ssh line expanded the payload's variables one layer before tmux started the shell meant to
+  # run it — `for r in a b; do echo "x$r"; done` logged `x` twice, and a download loop fetched
+  # the default revision five times, exit 0 (2026-09-27). Nested quotes were the same layers
+  # failing loudly. Now the script is base64'd here (its alphabet is inert inside single quotes),
+  # decoded to ~/.rt_logs/<session>.sh, and tmux's shell sources it with `.` — the same login
+  # shell as before, reading the payload byte for byte. The closing `)` sits on its own line so a
+  # payload ending in a comment or a heredoc cannot swallow it.
   local log_file="~/.rt_logs/${session}.log"
-  _ssh \
-    "tmux new-session -d -s '${session}' -x 200 -y 50 \
-      \"{ cd '${REMOTE_DIR}' && ( ${command} ); echo \\\$? > ${log_file}.rc; } 2>&1 | tee ${log_file}; \
-        echo \\\"EXIT_CODE=\\\$(cat ${log_file}.rc 2>/dev/null || echo unknown)\\\" >> ${log_file}\""
+  local script_file="~/.rt_logs/${session}.sh"
+  local script="{ cd $(_shq "$REMOTE_DIR") && (
+${command}
+); echo \$? > ${log_file}.rc; } 2>&1 | tee ${log_file}
+echo \"EXIT_CODE=\$(cat ${log_file}.rc 2>/dev/null || echo unknown)\" >> ${log_file}"
+  local encoded
+  encoded="$(printf '%s\n' "$script" | base64 | tr -d '\n')"
+  _ssh "printf %s '${encoded}' | base64 -d > ${script_file} && \
+    tmux new-session -d -s '${session}' -x 200 -y 50 '. ${script_file}'"
 
   # VERIFY, then report. `tmux new-session` returning 0 says the session was CREATED, not that the
   # payload inside it parsed. A body carrying nested quotes is mangled somewhere in the three
@@ -1420,10 +1435,10 @@ _exec_bg() {
   # leaves no session but DOES leave a log (tee creates it as the pipeline starts), and a live
   # session proves the launch whatever the log's timing. Only the absence of both is a failure.
   #
-  # This does not fix the payload mangling — the encoding cause is the entry below this one in
-  # BACKLOG.md. It ends the false statement, which is the part that made the mangling expensive.
+  # The mangling itself is gone since the wrapper travels as a file (above). What still lands here
+  # is a payload that does not parse even as written, or the decode/tmux step failing on the host.
   if ! _ssh "tmux has-session -t '${session}' 2>/dev/null || [ -f ${log_file} ]"; then
-    die "[$RT_PROFILE] Background job '$session' did NOT start: no tmux session and no log file on $REMOTE_HOST. ssh accepted the launch and the remote shell rejected the payload; a body carrying nested quotes is the measured cause. Stage the body as a script and background THAT instead."
+    die "[$RT_PROFILE] Background job '$session' did NOT start: no tmux session and no log file on $REMOTE_HOST. ssh accepted the launch, so either the payload does not parse as shell even as written (check it with 'bash -n') or decoding ~/.rt_logs/$session.sh / starting tmux failed on the host."
   fi
 
   info "[$RT_PROFILE] Background job started: $session"
