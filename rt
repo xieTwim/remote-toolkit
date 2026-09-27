@@ -2352,6 +2352,7 @@ cmd_push() {
     0) info "[$RT_PROFILE] push verified $n bytes -> $dst (sha256 $want)"; return 0 ;;
     3) warn "[$RT_PROFILE] push DIGEST MISMATCH — see the remote's report above. $dst was NOT written; the incoming file was removed."; return 3 ;;
     97) warn "[$RT_PROFILE] push UNVERIFIABLE: the remote has neither sha256sum nor shasum. $dst was NOT written. Unverifiable, NOT a mismatch."; return 2 ;;
+    98) warn "[$RT_PROFILE] push FAILED: the destination's parent directory does not exist on the remote (push never creates directories). $dst was NOT written — create the directory first (rt exec \"mkdir -p …\"), then push again."; return 98 ;;
     *) warn "[$RT_PROFILE] push FAILED (status $rc). Assume $dst was NOT written."; return "$rc" ;;
   esac
 }
