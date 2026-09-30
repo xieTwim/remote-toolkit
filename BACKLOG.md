@@ -11,6 +11,9 @@ reporting project's own `ISSUES.md`.
 
 Seeded 2026-08-01 from the second migration lane.
 
+- [open] id: remote-toolkit#new-profile-cannot-create-its-root 2026-09-30 attn-quant: **a freshly written session-less profile cannot bootstrap its own `REMOTE_DIR`: every `exec` form runs `cd REMOTE_DIR && (…)` first and dies with "No such file or directory" before the payload runs, and `push` refuses to create directories by design — so neither verb can make the root both of them depend on.** Worked around with a one-off plain `ssh` to the same host/port running `mkdir -p` on the new root. → fix shape (a contract CHOICE, not taken here): a documented bootstrap step where new profiles are described, or `exec` running from the parent when `REMOTE_DIR` is missing and the payload only creates it.
+  repro: write a profile whose `REMOTE_DIR` does not exist yet; `rt -p <p> exec --no-flush 'mkdir -p <REMOTE_DIR>'` → `cd: …: No such file or directory`, the mkdir never runs.
+
 - [fixed remote-toolkit@7142ac003002] id: remote-toolkit#bg-payload-expands-variables-early 2026-09-27 quant-robust: **`exec --bg` expanded the payload's `$var` / `$(...)` in the login shell that parses the ssh argument, one layer before tmux started the job's shell — a silent wrong command.** `_exec_bg` now builds the wrapper locally, base64s it, decodes it to `~/.rt_logs/<session>.sh` on the host and has tmux's shell source it with `.`, so the payload runs byte for byte (which also ends the nested-quote mangling named in the start-verification tombstone); canary 1g (loop variable logs `xa xb`) and 1h (`$(pwd)`, nested quotes, trailing comment) pin it and fail on the old `rt`; 219/219. +1 2026-09-27 quant-robust, second hit: a checkpoint-download loop fetched the default revision five times, exit 0.
 
 Extended 2026-08-02 by this tool's FIRST audit — a de-correlated read of `rt`, `SKILL.md`,
