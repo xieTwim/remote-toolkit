@@ -1088,8 +1088,11 @@ cmd_exec() {
 _exec_remote_cmd() {  # <token> <command>
   local token="$1" command="$2"
   # $command is deliberately shell text — that is what `rt exec` is for. REMOTE_DIR is not.
+  # It sits on lines of its own: a heredoc or a trailing `# comment` would swallow a `)` on its line.
   cat <<EOF
-cd $(_shq "$REMOTE_DIR") && ( ${command} )
+cd $(_shq "$REMOTE_DIR") && (
+${command}
+)
 __rt_rc=\$?
 printf '%s%s\n' $(_shq "$token") "\$__rt_rc" >&2
 exit \$__rt_rc
@@ -2171,7 +2174,9 @@ if command -v sha256sum >/dev/null 2>&1; then RTH=sha256sum;
 elif command -v shasum >/dev/null 2>&1; then RTH="shasum -a 256";
 else RTH=""; fi
 __rt_t=\$(mktemp "\${TMPDIR:-/tmp}/rt-fetch.XXXXXX") || { echo "rt: cannot stage payload remotely" >&2; exit 98; }
-cd $(_shq "$REMOTE_DIR") && ( ${command} ) > "\$__rt_t"
+cd $(_shq "$REMOTE_DIR") && (
+${command}
+) > "\$__rt_t"
 __rt_rc=\$?
 if [ -n "\$RTH" ]; then __rt_d=\$(\$RTH < "\$__rt_t" | awk '{print \$1}'); else __rt_d=NO_SHA_TOOL; fi
 __rt_n=\$(wc -c < "\$__rt_t" | tr -d ' ')

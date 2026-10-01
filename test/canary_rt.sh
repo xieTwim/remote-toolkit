@@ -1491,6 +1491,18 @@ DOCS_DIR="$(dirname "$HERE")"
 chk "17q the 125 status is documented where exec's exit codes are" \
     "$(grep -q '125' "$DOCS_DIR/SKILL.md" && grep -q '125' "$DOCS_DIR/README.md" && grep -q '125' "$RT" && echo 0 || echo 1)"
 
+# A command is shell text, so the wrapper must close its subshell on a line of its own. Seen
+# 2026-10-01 on a live read: `( ${command} )` on one line turned a heredoc's terminator into
+# `EOF )`, the heredoc ran to end of input, the remote shell died on a syntax error before the
+# trailer, and exec reported a 0-byte TRUNCATED stream. A trailing `# comment` ate the `)` too.
+_exec_sync "$(printf 'cat <<"EOT"\nheredoc-body\nEOT')" >"$O" 2>"$E"; rc=$?
+chk "17s a command that ENDS in a heredoc runs (was: syntax error, 0 bytes, TRUNCATED)" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$O")" = "heredoc-body" ] && [ ! -s "$E" ] && echo 0 || echo 1)" \
+    "rc=$rc out='$(cat "$O")' stderr='$(cat "$E")'"
+_exec_sync 'echo kept # a trailing comment' >"$O" 2>"$E"; rc=$?
+chk "17t ... and so does one that ends in a comment" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$O")" = "kept" ] && echo 0 || echo 1)" "rc=$rc out='$(cat "$O")' stderr='$(cat "$E")'"
+
 # ── 18. verified bulk transfer: `fetch` and `push` ───────────────────────────
 #
 # `exec`'s trailer made truncation VISIBLE and block 17 scores that. This block scores the half
@@ -1681,6 +1693,12 @@ cmd_fetch --no-flush "$D/skip-keep.csv" 'printf partial; exit 4' 2>"$E18"; rc=$?
 chk "18v --no-flush keeps remote command failures nonzero without installing their payload" \
     "$([ "$rc" = 4 ] && [ "$(cat "$D/skip-keep.csv")" = existing ] \
        && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc"
+
+# fetch wraps the command the same way exec does (17s), so it carries the same defect and fix.
+cmd_fetch --no-flush "$D/heredoc.csv" "$(printf 'cat <<"EOT"\ncol,val\nEOT')" 2>"$E18"; rc=$?
+chk "18w fetch runs a command that ends in a heredoc" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$D/heredoc.csv" 2>/dev/null)" = "col,val" ] && echo 0 || echo 1)" \
+    "rc=$rc stderr='$(cat "$E18")'"
 
 # ── 19. an absent sync ROOT is reported, not folded into `active` ───────────────────
 #
