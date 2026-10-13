@@ -70,6 +70,8 @@ REMOTE_DIR="/home/user/scratch"
 
 Profile names must be in `<host>/<profile>` form (no bare-name fallback). Each segment is alphanumeric with single dashes between alphanumerics (no leading/trailing dash, no `--`, no `_` or `.`), max 32 chars — keeps the name unambiguous when `--` separates segments in the Mutagen session name and `_` separates them in tmux session names.
 
+**A session-less profile cannot create its own `REMOTE_DIR`.** Mutagen creates a synced profile's root on its first sync, but a profile that is never `connect`ed has no such step: every `exec` and `fetch` form starts with `cd REMOTE_DIR`, and `push` never creates directories, so a missing root fails before the payload runs. Create it once from another profile on the same host — `rt -p <host>/<other> exec --no-flush 'mkdir -p <REMOTE_DIR>'` — or with a plain `ssh` to `REMOTE_HOST`.
+
 #### One host, several storage backends
 
 A host group is a *login*, not a filesystem. If the same host mounts more than one storage backend (two network filesystems, a fast scratch tier plus bulk storage, two regions of the same cluster), give each backend **its own profile** — one profile is one `REMOTE_DIR`, and that is the whole mechanism. Suggested naming: `<project>` for the default backend and `<project>-<backend>` for the other, e.g.
