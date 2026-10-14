@@ -92,6 +92,8 @@ is still working on it.
 
 `rt push` uploads a local file; `rt fetch` saves a remote command's output. Both verify SHA-256
 before installing the destination atomically; a failed transfer leaves the destination unchanged.
+`push` sets modes as `cp` does: a replaced file keeps its mode, a new file takes the local mode
+under the remote umask.
 
 ```bash
 rt -p hpc/train push ./patched.py scripts/patched.py

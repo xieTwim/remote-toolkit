@@ -1605,6 +1605,29 @@ chk "18m ... leaving an existing destination untouched" \
 chk "18n ... and no incoming file beside it" \
     "$([ "$(ls "$P"/*.rt-incoming.* 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && echo 0 || echo 1)"
 
+# Modes follow cp/scp (owner ruling 2026-10-14). The install used the remote default mode, so a
+# pushed helper lost +x — and re-pushing an UNCHANGED live helper stripped it too, leaving two PATH
+# helpers non-executable for ~16 s under a running job (2026-10-10).
+modeof() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$1"; }
+_ssh() { sh -c "umask 022; $1"; }
+printf '#!/bin/sh\necho tool\n' > "$SCRATCH/tool.sh"; chmod 755 "$SCRATCH/tool.sh"
+cmd_push "$SCRATCH/tool.sh" "tool.sh" 2>"$E18"; rc=$?
+chk "18x a NEW file takes the local mode under the remote umask (an executable stays one)" \
+    "$([ "$rc" = 0 ] && [ "$(modeof "$P/tool.sh")" = 755 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/tool.sh")"
+cmd_push "$SCRATCH/tool.sh" "tool.sh" 2>"$E18"; rc=$?
+chk "18y re-pushing an unchanged executable keeps it executable" \
+    "$([ "$rc" = 0 ] && [ "$(modeof "$P/tool.sh")" = 755 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/tool.sh")"
+printf 'old\n' > "$P/tight.sh"; chmod 750 "$P/tight.sh"
+printf 'new\n' > "$SCRATCH/plain.txt"; chmod 644 "$SCRATCH/plain.txt"
+cmd_push "$SCRATCH/plain.txt" "tight.sh" 2>"$E18"; rc=$?
+chk "18z a REPLACED file keeps its own mode, neither loosened nor stripped" \
+    "$([ "$rc" = 0 ] && [ "$(modeof "$P/tight.sh")" = 750 ] && [ "$(cat "$P/tight.sh")" = new ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/tight.sh")"
+chmod 600 "$SCRATCH/plain.txt"
+cmd_push "$SCRATCH/plain.txt" "private.txt" 2>"$E18"; rc=$?
+chk "18z2 ... and a new file never comes out looser than its local copy" \
+    "$([ "$rc" = 0 ] && [ "$(modeof "$P/private.txt")" = 600 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/private.txt")"
+_ssh() { sh -c "$1"; }
+
 _ssh() { sh -c "$1"; }
 
 # THE FALSE-POSITIVE GUARD. Every check above is satisfied by a `fetch` that never writes

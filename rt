@@ -2321,7 +2321,12 @@ _fetch_settle() {  # <dest> <tmp> <transport> <trailer-rc> <trailer-digest> <tra
 #
 # So push does NOT pipe the payload through the remote shell's stdin. It digests locally, sends
 # the bytes, has the remote digest what it received and stage it, and installs only on a match.
-_push_remote_cmd() {  # <remote-dest> <expected-digest>
+#
+# Modes follow cp/scp (owner ruling 2026-10-14): a replaced file keeps its own mode, a new file
+# takes the local file's mode under the remote umask. `cat >` alone gave every install the
+# remote default, so a pushed helper lost its +x, and re-pushing an unchanged live one did too
+# (two PATH helpers non-executable for ~16 s under a running job, 2026-10-10).
+_push_remote_cmd() {  # <remote-dest> <expected-digest> <local mode, octal digits>
   # A function with a bare heredoc, not `x=$(cat <<EOF …)`: inside a command substitution bash
   # parses the heredoc body looking for the closing paren, and the `*)` of a `case` arm closes it
   # early. Same reason `_exec_remote_cmd` and `_fetch_remote_cmd` are written this way.
@@ -2345,28 +2350,45 @@ if [ "\$__rt_got" != $(_shq "$2") ]; then
   echo "RT_DIGEST_MISMATCH sent=$(_shq "$2") got=\$__rt_got bytes=\$__rt_n" >&2
   exit 3
 fi
+if [ -e "\$__rt_d" ]; then
+  __rt_m=\$(stat -L -c %a "\$__rt_d" 2>/dev/null || stat -L -f %Lp "\$__rt_d" 2>/dev/null)
+else
+  __rt_m=\$(printf '%o' "\$(( 0$3 & ~0\$(umask) ))")
+fi
+if [ -n "\$__rt_m" ]; then
+  chmod "\$__rt_m" "\$__rt_t" || { rm -f "\$__rt_t"; echo RT_MODE_FAILED >&2; exit 99; }
+else
+  echo "rt push: the replaced file's mode could not be read; installing with the remote default mode" >&2
+fi
 mv -f "\$__rt_t" "\$__rt_d" || { rm -f "\$__rt_t"; echo RT_INSTALL_FAILED >&2; exit 99; }
-printf 'RT_PUSH_OK %s %s\n' "\$__rt_n" "\$__rt_got" >&2
+printf 'RT_PUSH_OK %s %s %s\n' "\$__rt_n" "\$__rt_got" "\$__rt_m" >&2
 EOF
+}
+
+_mode_of() {  # <path> — permission bits as octal digits (GNU stat, then BSD stat)
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
 cmd_push() {
   [[ $# -eq 2 ]] || die "Usage: rt push <local-path> <remote-path>
   Sends <local-path> to <remote-path>, verified by sha256 and installed ATOMICALLY.
-  A relative <remote-path> is resolved against REMOTE_DIR.
+  A relative <remote-path> is resolved against REMOTE_DIR. Modes follow cp: a replaced file
+  keeps its own mode; a new file takes the local file's mode under the remote umask.
   Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH."
   local src="$1" dst="$2"
   [[ -f "$src" ]] || die "[$RT_PROFILE] push source is not a regular file: $src"
   local want; want="$(_sha256_file "$src")" \
     || die2 "[$RT_PROFILE] No sha256 tool locally (need sha256sum or shasum). Cannot verify — unverifiable, not a mismatch."
   local n; n="$(wc -c < "$src" | tr -d ' ')"
+  local mode; mode="$(_mode_of "$src")"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "[$RT_PROFILE] push cannot read the mode of $src (got '$mode')"
 
   # The remote reads the payload from ITS stdin into a temp file and digests THAT — the same
   # stdin path the incident is about, which is the point: an empty or short delivery now fails
   # the digest instead of installing a plausible file. The bytes are on disk before anything
   # claims anything about them.
   local remote rc=0
-  remote="$(_push_remote_cmd "$dst" "$want")"
+  remote="$(_push_remote_cmd "$dst" "$want" "$mode")"
   _ssh "$remote" < "$src" || rc=$?
   case "$rc" in
     0) info "[$RT_PROFILE] push verified $n bytes -> $dst (sha256 $want)"; return 0 ;;
@@ -2602,6 +2624,8 @@ COMMANDS:
   push <local-path> <remote-path>
                        Upload and install atomically after SHA-256 verification.
                        Bypasses Mutagen sync; relative targets use REMOTE_DIR.
+                       Modes as cp: a replaced file keeps its mode; a new one
+                       takes the local mode under the remote umask.
   logs                 List background jobs for this profile
   logs <job_id>        Show output of a background job
   logs <job_id> -f     Follow (tail -f) a background job's output

@@ -214,6 +214,8 @@ rt -p host/proj push ./patched.py scripts/patched.py               # local -> re
 remote files are already the intended inputs: it skips the Mutagen preflight, including paused
 or unknown sync state, while retaining SSH reachability and SHA-256 verification. It does not
 establish that local edits have arrived. `push` already bypasses Mutagen and needs no flag.
+`push` sets modes as `cp` does: a replaced file keeps its own mode, and a new file takes the
+local file's mode under the remote umask, so an executable stays executable (since 2026-10-14).
 
 The remote stages the payload, digests it **there**, streams it, and reports the digest in the
 trailer; `rt` digests what actually arrived and renames into place **only on a match**. So a cut
