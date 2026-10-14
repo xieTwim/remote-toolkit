@@ -2365,8 +2365,8 @@ printf 'RT_PUSH_OK %s %s %s\n' "\$__rt_n" "\$__rt_got" "\$__rt_m" >&2
 EOF
 }
 
-_mode_of() {  # <path> — permission bits as octal digits (GNU stat, then BSD stat)
-  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
+_mode_of() {  # <path> — the permission bits push reads its bytes from: a symlink's TARGET
+  stat -L -c %a "$1" 2>/dev/null || stat -L -f %Lp "$1" 2>/dev/null
 }
 
 cmd_push() {

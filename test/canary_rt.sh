@@ -1626,6 +1626,10 @@ chmod 600 "$SCRATCH/plain.txt"
 cmd_push "$SCRATCH/plain.txt" "private.txt" 2>"$E18"; rc=$?
 chk "18z2 ... and a new file never comes out looser than its local copy" \
     "$([ "$rc" = 0 ] && [ "$(modeof "$P/private.txt")" = 600 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/private.txt")"
+ln -sf "$SCRATCH/plain.txt" "$SCRATCH/link.txt"     # a 0600 target behind a symlink
+cmd_push "$SCRATCH/link.txt" "via-link.txt" 2>"$E18"; rc=$?
+chk "18z3 ... including through a symlink, which carries its TARGET's mode" \
+    "$([ "$rc" = 0 ] && [ "$(modeof "$P/via-link.txt")" = 600 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/via-link.txt")"
 _ssh() { sh -c "$1"; }
 
 _ssh() { sh -c "$1"; }
