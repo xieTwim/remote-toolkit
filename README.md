@@ -170,6 +170,8 @@ REMOTE_DIR="/home/user/project"               # required
 # MUTAGEN_SYNC_MODE="two-way-resolved"
 # MUTAGEN_IGNORE_VCS=1
 # MUTAGEN_IGNORE=("data/" "*.bin")
+#   ^ a bash ARRAY, one pattern per element. A space-separated string is split on whitespace since 2026-10-18;
+#     before that it reached Mutagen as one dead pattern (see BACKLOG remote-toolkit#scalar-ignore-is-one-pattern).
 # SLURM_LOG_DIR="$REMOTE_DIR"                  # where slurm-<id>.out lands
 ```
 

@@ -483,7 +483,18 @@ RT_DEFAULT_IGNORES=(
 _ignore_patterns() {
   printf '%s\n' "${RT_DEFAULT_IGNORES[@]}"
   if [[ -n "${MUTAGEN_IGNORE+x}" ]]; then
-    printf '%s\n' "${MUTAGEN_IGNORE[@]}"
+    # The documented form is a bash ARRAY (`MUTAGEN_IGNORE=("data/" "*.pt")`). A profile written as a
+    # space-separated SCALAR (`MUTAGEN_IGNORE="data/ jobs/"`) used to reach Mutagen as ONE pattern
+    # containing spaces, which matches nothing — the whole list was silently dead, and a 24k-file
+    # conda env started syncing to a laptop (measured 2026-10-18). A Mutagen ignore pattern never
+    # legitimately contains whitespace, so a scalar is split on it; the array form is unchanged.
+    if [[ "$(declare -p MUTAGEN_IGNORE 2>/dev/null)" == "declare -a"* ]]; then
+      printf '%s\n' "${MUTAGEN_IGNORE[@]}"
+    else
+      local _pats=()
+      read -r -a _pats <<< "${MUTAGEN_IGNORE}"      # read, not an unquoted expansion: `*.pt` must stay literal
+      printf '%s\n' ${_pats[@]+"${_pats[@]}"}
+    fi
   fi
 }
 

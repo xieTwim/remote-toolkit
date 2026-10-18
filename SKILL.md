@@ -172,6 +172,14 @@ wandb/  outputs/  checkpoints/  .ipynb_checkpoints/
 
 Plus `.git/` when `MUTAGEN_IGNORE_VCS=1` (the default), plus whatever the profile adds in `MUTAGEN_IGNORE`.
 
+**`MUTAGEN_IGNORE` is a bash array, one pattern per element**: `MUTAGEN_IGNORE=("data/" "*.pt")`. A profile written
+as a space-separated string (`MUTAGEN_IGNORE="data/ jobs/"`) used to reach Mutagen as ONE pattern containing spaces,
+which matches nothing — every ignore in it was silently dead, and `rt sync status` printed the whole string on one
+line as if it were a pattern. Since 2026-10-18 `rt` splits a scalar on whitespace (no ignore pattern legitimately
+contains a space), so both spellings work for a NEW session; a live session created from the scalar form still
+carries the dead pattern until `rt disconnect && rt connect`. The tell: one "pattern" with spaces in
+`rt sync status`, or `mutagen sync list` counting the files you meant to exclude.
+
 Three consequences that have each cost time:
 
 1. **A training run writing to `outputs/` or `checkpoints/` produces nothing locally.** That is by design — those are large — but it means the local replica is *not* a copy of the remote, and "it did not sync" is usually "it was never in scope". Write results you want back to a path outside the ignore set, or fetch them explicitly with `rt exec 'cat …'`.

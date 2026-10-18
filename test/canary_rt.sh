@@ -780,6 +780,25 @@ chk "11f with no session, the list is labelled as prospective, not as live" \
     "$(grep -q 'next connect' <<< "$out" && ! grep -q 'LIVE session' <<< "$out" && echo 0 || echo 1)" \
     "$(head -c 200 <<< "$out")"
 
+# A profile written as a space-separated STRING (`MUTAGEN_IGNORE="data/ jobs/"`) reached Mutagen as ONE
+# pattern containing spaces, which matches nothing — measured 2026-10-18: a 24k-file / 7 GB conda env began
+# syncing to a laptop while `sync status` printed the whole string on one line as if it were a pattern. A
+# scalar is now split on whitespace; the documented array form is untouched; a glob stays literal.
+_has_sync() { return 0; }
+unset MUTAGEN_IGNORE; MUTAGEN_IGNORE="envs/ code/ *.pt"
+mkdir -p "$SCRATCH/glob11" && : > "$SCRATCH/glob11/weights.pt"
+out="$(cd "$SCRATCH/glob11" && _ignore_patterns)"
+chk "11g a space-separated SCALAR MUTAGEN_IGNORE yields one pattern per word, globs kept literal" \
+    "$(grep -qx 'envs/' <<< "$out" && grep -qx 'code/' <<< "$out" && grep -qx '[*].pt' <<< "$out" \
+       && ! grep -q ' ' <<< "$out" && ! grep -q 'weights.pt' <<< "$out" && echo 0 || echo 1)" \
+    "$(tail -4 <<< "$out" | tr '\n' '|')"
+unset MUTAGEN_IGNORE; MUTAGEN_IGNORE=("data/" "runs/*/raw/")
+out="$(_ignore_patterns)"
+chk "11h ... and the documented ARRAY form still yields exactly its elements" \
+    "$(grep -qx 'data/' <<< "$out" && grep -qx 'runs/[*]/raw/' <<< "$out" \
+       && [ "$(wc -l <<< "$out" | tr -d ' ')" -eq $(( ${#RT_DEFAULT_IGNORES[@]} + 2 )) ] && echo 0 || echo 1)" \
+    "lines=$(wc -l <<< "$out" | tr -d ' ') expected=$(( ${#RT_DEFAULT_IGNORES[@]} + 2 ))"
+
 # ── 12. a bloated sync set is named BEFORE it becomes latency ────────────────
 #
 # A courier bucket degrades silently as finished handoffs pile up. Measured 2026-08-01: 10,292
