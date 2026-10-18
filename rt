@@ -1370,6 +1370,18 @@ _exec_bg() {
   if [[ -n "$name" ]]; then
     _require_jobname "$name"
     session="${RT_SESSION_PREFIX}${name}"
+    # A NAME is a launch id: re-issuing a launch (a retry, a new session after a crash) must not
+    # start the job twice. tmux used to refuse the duplicate session only after the wrapper file of
+    # the RUNNING job had been overwritten, and rt then exited 1 with no message. An unreachable
+    # host answers neither, and the launch below goes ahead and reports for itself.
+    local _seen
+    _seen="$(_ssh "tmux has-session -t '${session}' 2>/dev/null && echo running || { [ -f ~/.rt_logs/${session}.log ] && echo done; } || true" 2>/dev/null || true)"
+    case "$_seen" in
+      running) printf 'ERROR: [%s] job %s is already running; not launched again. Output: rt -p %s logs %s\n' \
+                 "$RT_PROFILE" "$name" "$RT_PROFILE" "$session" >&2; exit 3 ;;
+      done)    printf 'ERROR: [%s] a job named %s already ran (rt -p %s logs %s); not launched again. Use a new --name to run it again.\n' \
+                 "$RT_PROFILE" "$name" "$RT_PROFILE" "$session" >&2; exit 3 ;;
+    esac
   else
     session="${RT_SESSION_PREFIX}$(date +%s)_$$"
   fi
@@ -2616,7 +2628,9 @@ COMMANDS:
                        macOS has no timeout(1), only gtimeout from coreutils.
                        The bound is on the WAIT: the remote process may survive.
   exec --bg [--name N] <cmd>
-                       Run in background (tmux), survives disconnection
+                       Run in background (tmux), survives disconnection. A
+                       --name is a launch id: if that job is running or ran
+                       before, nothing starts and rt exits 3.
   fetch [--no-flush] [--timeout N] <local-path> <remote-command>
                        Run a remote command and save its output atomically after
                        SHA-256 verification. Flushes sync first by default;

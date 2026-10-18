@@ -1836,6 +1836,21 @@ chk "20g rt help <command> prints that command's lines" \
 out="$( (main help no-such-command) 2>&1 )"
 chk "20h an unknown name falls back to the whole help" "$(grep -q '^COMMANDS:' <<< "$out" && echo 0 || echo 1)"
 
+# ── 21. a background job's --name is a launch id ─────────────────────────────
+# Re-issuing a launch must not start it twice: the session that lost track of a job asks rt.
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) echo running ;; *'tmux new-session'*) CAPTURED="LAUNCHED" ;; esac; return 0; }
+CAPTURED=""; out="$( (_exec_bg 'echo x' job1) 2>&1 )"; rc=$?
+chk "21a a running job with that name: exit 3, nothing launched" \
+    "$([ $rc = 3 ] && grep -q 'already running' <<< "$out" && [ -z "$CAPTURED" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) echo done ;; *'tmux new-session'*) echo LAUNCHED > "$SCRATCH/launched" ;; esac; return 0; }
+rm -f "$SCRATCH/launched"; out="$( (_exec_bg 'echo x' job1) 2>&1 )"; rc=$?
+chk "21b a finished job with that name: exit 3, told to pick a new name" \
+    "$([ $rc = 3 ] && grep -q 'already ran' <<< "$out" && [ ! -e "$SCRATCH/launched" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) : ;; *'tmux new-session'*) echo LAUNCHED > "$SCRATCH/launched" ;; esac; return 0; }
+rm -f "$SCRATCH/launched"; ( _exec_bg 'echo x' job2 ) >/dev/null 2>&1; rc=$?
+chk "21c a new name launches as before" "$([ $rc = 0 ] && [ -e "$SCRATCH/launched" ] && echo 0 || echo 1)" "rc=$rc"
+_ssh() { case "$*" in *'tmux new-session'*) CAPTURED="$*" ;; esac; return 0; }
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1
