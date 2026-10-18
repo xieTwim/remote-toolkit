@@ -254,6 +254,10 @@ rt -p fact-cluster/scratch exec --bg --name build "make all"
 rt -p fact-cluster/ako exec --bg --name train "python3 train.py"
 ```
 
+A `--name` is a launch id: if a job of that name is running or already ran, nothing starts and
+`rt` exits 3 saying which. So a retry, or a fresh session that lost track, can re-issue the same
+launch safely; record the name in the project's notes, and use a new name to run it again.
+
 `--bg` VERIFIES the session before reporting it: after `tmux new-session` it checks that the
 session exists or its log does, and exits non-zero naming the job when neither is there. A
 "Background job started" line is now a claim the tool checked. The payload travels base64-encoded
