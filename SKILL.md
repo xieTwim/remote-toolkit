@@ -110,6 +110,9 @@ rt -p fact-cluster/scratch connect
 
 ## Daily Usage
 
+`rt <command> --help` (or `rt help <command>`) prints that command's options; `-p HOST/PROFILE` may
+come before or after the command, and `rt flush` is `rt sync flush`.
+
 ### Connection Management
 
 ```bash

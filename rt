@@ -2591,6 +2591,7 @@ GLOBAL FLAGS:
                        (no leading/trailing dash, no '--', no '_' or '.'), max 32 chars.
                        Config: \$RT_HOME/<host>/host.conf + <host>/<profile>.conf
                        Local replica: ~/Work/Remote/<host>/<profile>/
+                       May also follow the command: rt status -p HOST/PROFILE
 
 COMMANDS:
   init                 Create config directory and default config
@@ -2639,6 +2640,7 @@ COMMANDS:
   verify --timeout N --interval N <path>...
                        Bound the wait (default 60s, polling every 2s)
   sync flush           Force sync to reconcile now
+  flush                Same as 'sync flush'
   sync status          Detailed Mutagen sync state for this profile
   slurm submit <script> [-- sbatch_args...]
                        Flush sync, then sbatch (requires SLURM_ENABLED=1)
@@ -2648,6 +2650,7 @@ COMMANDS:
   slurm logs <id> [-f] [--err]
                        Cat or tail slurm-<id>.out (--err for .err)
   help                 Show this help
+  help <command>       Help for one command (also: rt <command> --help)
 
 EXAMPLES:
   # First-time setup for a new host group + profile
@@ -2701,8 +2704,21 @@ HELP
 }
 
 # ── Main dispatch ──────────────────────────────────────────────────
+# Help for one subcommand: its own lines of the COMMANDS block in `rt help`, so the two cannot
+# drift. Prints the whole help when the name matches nothing.
+_sub_help() {
+  local text
+  text="$(cmd_help | awk -v s="$1" '
+    /^COMMANDS:/ { on = 1; next }
+    on && /^[A-Z][A-Z ]*:/ { exit }
+    on && index($0, "  " s) == 1 && (length($0) == length(s) + 2 || substr($0, length(s) + 3, 1) == " ") { p = 1; print; next }
+    on && p && /^                   / { print; next }
+    on { p = 0 }')"
+  if [[ -n "$text" ]]; then printf 'Usage: rt -p HOST/PROFILE %s ...\n%s\n' "$1" "$text"; else cmd_help; fi
+}
+
 main() {
-  # Parse global --profile / -p flag before subcommand
+  # The profile flag, before the subcommand or among its leading options
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -p|--profile)
@@ -2711,14 +2727,40 @@ main() {
         shift 2
         ;;
       --profile=*)  RT_PROFILE="${1#--profile=}"; shift ;;
+      -h|--help)    cmd_help; return 0 ;;
       *)            break ;;
     esac
   done
 
-  _init_profile
-
   local subcmd="${1:-help}"
   shift || true
+
+  # After the subcommand, `-p HOST/PROFILE` and `-h`/`--help` are taken from the leading options,
+  # in whatever order they come: `rt status -p h/p` and `rt fetch --help` are what callers type.
+  # The scan stops at `--`, and for exec/fetch at the first positional word, because what follows
+  # there is a remote command whose own `-p` or `--help` belongs to it.
+  local rest=() stop=false
+  while [[ $# -gt 0 ]]; do
+    if [[ "$stop" == true ]]; then rest+=("$1"); shift; continue; fi
+    case "$1" in
+      -h|--help)    _sub_help "$subcmd"; return 0 ;;
+      -p|--profile)
+        [[ $# -ge 2 ]] || die "Missing argument for $1. Use: rt -p <host>/<profile> <command> ..."
+        RT_PROFILE="$2"; shift 2; continue ;;
+      --profile=*)  RT_PROFILE="${1#--profile=}"; shift; continue ;;
+      --)           stop=true ;;
+      --name|--timeout|--interval|--password)
+        rest+=("$1"); shift
+        [[ $# -gt 0 ]] && { rest+=("$1"); shift; }
+        continue ;;
+      -*)           ;;
+      *)            case "$subcmd" in exec|fetch) stop=true ;; esac ;;
+    esac
+    rest+=("$1"); shift
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+
+  _init_profile
 
   case "$subcmd" in
     init)          cmd_init "$@" ;;
@@ -2734,7 +2776,8 @@ main() {
     sync)          cmd_sync "$@" ;;
     verify)        cmd_verify "$@" ;;
     slurm)         cmd_slurm "$@" ;;
-    help|--help|-h) cmd_help ;;
+    flush)         cmd_sync flush "$@" ;;
+    help|--help|-h) if [[ -n "${1:-}" ]]; then _sub_help "$1"; else cmd_help; fi ;;
     *)             die "Unknown command: $subcmd. Run 'rt help' for usage." ;;
   esac
 }
