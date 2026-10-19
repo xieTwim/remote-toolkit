@@ -661,8 +661,11 @@ _ssh() {
   ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@"
 }
 
+# stdin closed: ssh forwards its stdin whether or not the remote reads it, so this probe ate the
+# input piped into `rt exec` before the command ran (`echo 'print(1)' | rt exec 'python3 -'` printed
+# nothing, rc 0, 3 of 3 on 2026-10-19).
 _ssh_test() {
-  _ssh "echo ok" >/dev/null 2>&1
+  _ssh "echo ok" </dev/null >/dev/null 2>&1
 }
 
 # ── Subcommands ────────────────────────────────────────────────────

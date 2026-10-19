@@ -1851,6 +1851,18 @@ rm -f "$SCRATCH/launched"; ( _exec_bg 'echo x' job2 ) >/dev/null 2>&1; rc=$?
 chk "21c a new name launches as before" "$([ $rc = 0 ] && [ -e "$SCRATCH/launched" ] && echo 0 || echo 1)" "rc=$rc"
 _ssh() { case "$*" in *'tmux new-session'*) CAPTURED="$*" ;; esac; return 0; }
 
+# ── 22. stdin piped into `exec` reaches the command ──────────────────────────
+# Real ssh forwards its stdin even when the remote never reads it, so the reachability probe ate
+# the piped script and `python3 -` ran on nothing, rc 0 (2026-10-19). The stub reads stdin eagerly.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="$SCRATCH/proj22"; mkdir -p "$REMOTE_DIR"
+load_config() { :; }
+_ssh() { local in; in="$(cat)"; printf '%s\n' "$in" | sh -c "$1"; }
+out="$(echo 'piped-line' | cmd_exec --no-flush cat 2>/dev/null)"; rc=$?
+chk "22 piped stdin reaches the exec'd command" \
+    "$([ "$rc" = 0 ] && [ "$out" = "piped-line" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1
