@@ -1824,6 +1824,64 @@ chk "19i ... an unreachable host: not established, not absent" \
 chk "19j the docs name the absent-root row and the client-side stop" \
     "$(grep -q 'sync root ABSENT' "$DOCS_DIR/SKILL.md" && grep -q 'does NOT stop the REMOTE\|kills only the local' "$DOCS_DIR/SKILL.md" && grep -q 'sync root ABSENT' "$DOCS_DIR/README.md" && echo 0 || echo 1)"
 
+# ── 20. natural invocation: -p and --help after the subcommand ───────────────
+# 2026-09-17..10-18: 129 "Profile required" and ~40 usage errors came from `rt status -p X`,
+# `rt fetch --help`, `rt -p X exec --help` and `rt -p X flush`. main() now takes -p/--help from a
+# subcommand's leading options; for exec/fetch the scan stops at the first word of the remote
+# command, whose own flags are not rt's.
+cmd_status() { echo "status profile=$RT_PROFILE args=$*"; }
+cmd_exec()   { echo "exec profile=$RT_PROFILE args=$*"; }
+cmd_fetch()  { echo "fetch profile=$RT_PROFILE args=$*"; }
+cmd_sync()   { echo "sync profile=$RT_PROFILE args=$*"; }
+load_config() { :; }
+out="$( (RT_PROFILE=""; main status -p h/p --all) 2>&1 )"
+chk "20a a profile after the subcommand selects it" "$([ "$out" = "status profile=h/p args=--all" ] && echo 0 || echo 1)" "$out"
+out="$( (RT_PROFILE=""; main exec --bg --profile=h/p --name job "ls -p /x" --help) 2>&1 )"
+chk "20b exec: rt's leading options are taken, the remote command keeps its own -p/--help" \
+    "$([ "$out" = "exec profile=h/p args=--bg --name job ls -p /x --help" ] && echo 0 || echo 1)" "$out"
+out="$( (RT_PROFILE=""; main exec -- -p h/p) 2>&1 )"
+chk "20c everything after -- belongs to the remote command" "$([ "$out" = "exec profile= args=-- -p h/p" ] && echo 0 || echo 1)" "$out"
+out="$( (RT_PROFILE=""; main fetch --help) 2>&1 )"; rc=$?
+chk "20d rt fetch --help needs no profile and prints fetch's own lines" \
+    "$([ $rc = 0 ] && grep -q '^  fetch \[--no-flush\]' <<< "$out" && ! grep -q '^  push ' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+out="$( (main -p h/p exec --help) 2>&1 )"; rc=$?
+chk "20e rt -p X exec --help prints help instead of 'Unknown flag'" \
+    "$([ $rc = 0 ] && grep -q '^  exec --timeout SECS' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+out="$( (main -p h/p flush) 2>&1 )"
+chk "20f rt flush is sync flush" "$([ "$out" = "sync profile=h/p args=flush" ] && echo 0 || echo 1)" "$out"
+out="$( (main help push) 2>&1 )"
+chk "20g rt help <command> prints that command's lines" \
+    "$(grep -q '^  push <local-path>' <<< "$out" && ! grep -q '^  exec ' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+out="$( (main help no-such-command) 2>&1 )"
+chk "20h an unknown name falls back to the whole help" "$(grep -q '^COMMANDS:' <<< "$out" && echo 0 || echo 1)"
+
+# ── 21. a background job's --name is a launch id ─────────────────────────────
+# Re-issuing a launch must not start it twice: the session that lost track of a job asks rt.
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) echo running ;; *'tmux new-session'*) CAPTURED="LAUNCHED" ;; esac; return 0; }
+CAPTURED=""; out="$( (_exec_bg 'echo x' job1) 2>&1 )"; rc=$?
+chk "21a a running job with that name: exit 3, nothing launched" \
+    "$([ $rc = 3 ] && grep -q 'already running' <<< "$out" && [ -z "$CAPTURED" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) echo done ;; *'tmux new-session'*) echo LAUNCHED > "$SCRATCH/launched" ;; esac; return 0; }
+rm -f "$SCRATCH/launched"; out="$( (_exec_bg 'echo x' job1) 2>&1 )"; rc=$?
+chk "21b a finished job with that name: exit 3, told to pick a new name" \
+    "$([ $rc = 3 ] && grep -q 'already ran' <<< "$out" && [ ! -e "$SCRATCH/launched" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+_ssh() { case "$*" in *'tmux has-session'*'echo running'*) : ;; *'tmux new-session'*) echo LAUNCHED > "$SCRATCH/launched" ;; esac; return 0; }
+rm -f "$SCRATCH/launched"; ( _exec_bg 'echo x' job2 ) >/dev/null 2>&1; rc=$?
+chk "21c a new name launches as before" "$([ $rc = 0 ] && [ -e "$SCRATCH/launched" ] && echo 0 || echo 1)" "rc=$rc"
+_ssh() { case "$*" in *'tmux new-session'*) CAPTURED="$*" ;; esac; return 0; }
+
+# ── 22. stdin piped into `exec` reaches the command ──────────────────────────
+# Real ssh forwards its stdin even when the remote never reads it, so the reachability probe ate
+# the piped script and `python3 -` ran on nothing, rc 0 (2026-10-19). The stub reads stdin eagerly.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"; REMOTE_DIR="$SCRATCH/proj22"; mkdir -p "$REMOTE_DIR"
+load_config() { :; }
+_ssh() { local in; in="$(cat)"; printf '%s\n' "$in" | sh -c "$1"; }
+out="$(echo 'piped-line' | cmd_exec --no-flush cat 2>/dev/null)"; rc=$?
+chk "22 piped stdin reaches the exec'd command" \
+    "$([ "$rc" = 0 ] && [ "$out" = "piped-line" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

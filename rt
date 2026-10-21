@@ -672,8 +672,11 @@ _ssh() {
   ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "$@"
 }
 
+# stdin closed: ssh forwards its stdin whether or not the remote reads it, so this probe ate the
+# input piped into `rt exec` before the command ran (`echo 'print(1)' | rt exec 'python3 -'` printed
+# nothing, rc 0, 3 of 3 on 2026-10-19).
 _ssh_test() {
-  _ssh "echo ok" >/dev/null 2>&1
+  _ssh "echo ok" </dev/null >/dev/null 2>&1
 }
 
 # ── Subcommands ────────────────────────────────────────────────────
@@ -1381,6 +1384,18 @@ _exec_bg() {
   if [[ -n "$name" ]]; then
     _require_jobname "$name"
     session="${RT_SESSION_PREFIX}${name}"
+    # A NAME is a launch id: re-issuing a launch (a retry, a new session after a crash) must not
+    # start the job twice. tmux used to refuse the duplicate session only after the wrapper file of
+    # the RUNNING job had been overwritten, and rt then exited 1 with no message. An unreachable
+    # host answers neither, and the launch below goes ahead and reports for itself.
+    local _seen
+    _seen="$(_ssh "tmux has-session -t '${session}' 2>/dev/null && echo running || { [ -f ~/.rt_logs/${session}.log ] && echo done; } || true" 2>/dev/null || true)"
+    case "$_seen" in
+      running) printf 'ERROR: [%s] job %s is already running; not launched again. Output: rt -p %s logs %s\n' \
+                 "$RT_PROFILE" "$name" "$RT_PROFILE" "$session" >&2; exit 3 ;;
+      done)    printf 'ERROR: [%s] a job named %s already ran (rt -p %s logs %s); not launched again. Use a new --name to run it again.\n' \
+                 "$RT_PROFILE" "$name" "$RT_PROFILE" "$session" >&2; exit 3 ;;
+    esac
   else
     session="${RT_SESSION_PREFIX}$(date +%s)_$$"
   fi
@@ -2602,6 +2617,7 @@ GLOBAL FLAGS:
                        (no leading/trailing dash, no '--', no '_' or '.'), max 32 chars.
                        Config: \$RT_HOME/<host>/host.conf + <host>/<profile>.conf
                        Local replica: ~/Work/Remote/<host>/<profile>/
+                       May also follow the command: rt status -p HOST/PROFILE
 
 COMMANDS:
   init                 Create config directory and default config
@@ -2626,7 +2642,9 @@ COMMANDS:
                        macOS has no timeout(1), only gtimeout from coreutils.
                        The bound is on the WAIT: the remote process may survive.
   exec --bg [--name N] <cmd>
-                       Run in background (tmux), survives disconnection
+                       Run in background (tmux), survives disconnection. A
+                       --name is a launch id: if that job is running or ran
+                       before, nothing starts and rt exits 3.
   fetch [--no-flush] [--timeout N] <local-path> <remote-command>
                        Run a remote command and save its output atomically after
                        SHA-256 verification. Flushes sync first by default;
@@ -2650,6 +2668,7 @@ COMMANDS:
   verify --timeout N --interval N <path>...
                        Bound the wait (default 60s, polling every 2s)
   sync flush           Force sync to reconcile now
+  flush                Same as 'sync flush'
   sync status          Detailed Mutagen sync state for this profile
   slurm submit <script> [-- sbatch_args...]
                        Flush sync, then sbatch (requires SLURM_ENABLED=1)
@@ -2659,6 +2678,7 @@ COMMANDS:
   slurm logs <id> [-f] [--err]
                        Cat or tail slurm-<id>.out (--err for .err)
   help                 Show this help
+  help <command>       Help for one command (also: rt <command> --help)
 
 EXAMPLES:
   # First-time setup for a new host group + profile
@@ -2712,8 +2732,21 @@ HELP
 }
 
 # ── Main dispatch ──────────────────────────────────────────────────
+# Help for one subcommand: its own lines of the COMMANDS block in `rt help`, so the two cannot
+# drift. Prints the whole help when the name matches nothing.
+_sub_help() {
+  local text
+  text="$(cmd_help | awk -v s="$1" '
+    /^COMMANDS:/ { on = 1; next }
+    on && /^[A-Z][A-Z ]*:/ { exit }
+    on && index($0, "  " s) == 1 && (length($0) == length(s) + 2 || substr($0, length(s) + 3, 1) == " ") { p = 1; print; next }
+    on && p && /^                   / { print; next }
+    on { p = 0 }')"
+  if [[ -n "$text" ]]; then printf 'Usage: rt -p HOST/PROFILE %s ...\n%s\n' "$1" "$text"; else cmd_help; fi
+}
+
 main() {
-  # Parse global --profile / -p flag before subcommand
+  # The profile flag, before the subcommand or among its leading options
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -p|--profile)
@@ -2722,14 +2755,40 @@ main() {
         shift 2
         ;;
       --profile=*)  RT_PROFILE="${1#--profile=}"; shift ;;
+      -h|--help)    cmd_help; return 0 ;;
       *)            break ;;
     esac
   done
 
-  _init_profile
-
   local subcmd="${1:-help}"
   shift || true
+
+  # After the subcommand, `-p HOST/PROFILE` and `-h`/`--help` are taken from the leading options,
+  # in whatever order they come: `rt status -p h/p` and `rt fetch --help` are what callers type.
+  # The scan stops at `--`, and for exec/fetch at the first positional word, because what follows
+  # there is a remote command whose own `-p` or `--help` belongs to it.
+  local rest=() stop=false
+  while [[ $# -gt 0 ]]; do
+    if [[ "$stop" == true ]]; then rest+=("$1"); shift; continue; fi
+    case "$1" in
+      -h|--help)    _sub_help "$subcmd"; return 0 ;;
+      -p|--profile)
+        [[ $# -ge 2 ]] || die "Missing argument for $1. Use: rt -p <host>/<profile> <command> ..."
+        RT_PROFILE="$2"; shift 2; continue ;;
+      --profile=*)  RT_PROFILE="${1#--profile=}"; shift; continue ;;
+      --)           stop=true ;;
+      --name|--timeout|--interval|--password)
+        rest+=("$1"); shift
+        [[ $# -gt 0 ]] && { rest+=("$1"); shift; }
+        continue ;;
+      -*)           ;;
+      *)            case "$subcmd" in exec|fetch) stop=true ;; esac ;;
+    esac
+    rest+=("$1"); shift
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+
+  _init_profile
 
   case "$subcmd" in
     init)          cmd_init "$@" ;;
@@ -2745,7 +2804,8 @@ main() {
     sync)          cmd_sync "$@" ;;
     verify)        cmd_verify "$@" ;;
     slurm)         cmd_slurm "$@" ;;
-    help|--help|-h) cmd_help ;;
+    flush)         cmd_sync flush "$@" ;;
+    help|--help|-h) if [[ -n "${1:-}" ]]; then _sub_help "$1"; else cmd_help; fi ;;
     *)             die "Unknown command: $subcmd. Run 'rt help' for usage." ;;
   esac
 }
