@@ -1649,6 +1649,34 @@ ln -sf "$SCRATCH/plain.txt" "$SCRATCH/link.txt"     # a 0600 target behind a sym
 cmd_push "$SCRATCH/link.txt" "via-link.txt" 2>"$E18"; rc=$?
 chk "18z3 ... including through a symlink, which carries its TARGET's mode" \
     "$([ "$rc" = 0 ] && [ "$(modeof "$P/via-link.txt")" = 600 ] && echo 0 || echo 1)" "rc=$rc mode=$(modeof "$P/via-link.txt")"
+
+# SSH executes the payload in the remote login shell, not necessarily sh. zsh's
+# default arithmetic treats 0644 as decimal, producing a write-only destination.
+# Run the actual payload across shells and masks, including deliberately unreadable
+# modes: cp semantics must be preserved rather than silently adding owner read.
+for push_shell in sh bash zsh; do
+  if ! command -v "$push_shell" >/dev/null 2>&1; then
+    printf '  SKIP 18z4 push modes under %s (not installed)\n' "$push_shell"
+    continue
+  fi
+  _ssh() { "$push_shell" -f -c "umask $push_mask; $1"; }
+  for push_case in 644:022:644 755:027:750 600:000:600 644:222:444 644:077:600; do
+    IFS=: read -r push_mode push_mask push_expected <<< "$push_case"
+    chmod "$push_mode" "$SCRATCH/plain.txt"
+    push_dest="mode-$push_shell-$push_mode-$push_mask"
+    cmd_push "$SCRATCH/plain.txt" "$push_dest" 2>"$E18"; rc=$?
+    chk "18z4 $push_shell new $push_mode masked by $push_mask -> $push_expected" \
+        "$([ "$rc" = 0 ] && [ "$(modeof "$P/$push_dest")" = "$push_expected" ] && echo 0 || echo 1)" \
+        "rc=$rc mode=$(modeof "$P/$push_dest")"
+  done
+  push_mask=077
+  push_dest="replace-$push_shell"
+  printf 'old\n' > "$P/$push_dest"; chmod 750 "$P/$push_dest"
+  cmd_push "$SCRATCH/plain.txt" "$push_dest" 2>"$E18"; rc=$?
+  chk "18z5 $push_shell replacement preserves destination mode despite umask" \
+      "$([ "$rc" = 0 ] && [ "$(modeof "$P/$push_dest")" = 750 ] && cmp -s "$SCRATCH/plain.txt" "$P/$push_dest" && echo 0 || echo 1)" \
+      "rc=$rc mode=$(modeof "$P/$push_dest")"
+done
 _ssh() { sh -c "$1"; }
 
 _ssh() { sh -c "$1"; }

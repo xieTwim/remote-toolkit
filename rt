@@ -2379,7 +2379,9 @@ fi
 if [ -e "\$__rt_d" ]; then
   __rt_m=\$(stat -L -c %a "\$__rt_d" 2>/dev/null || stat -L -f %Lp "\$__rt_d" 2>/dev/null)
 else
-  __rt_m=\$(printf '%o' "\$(( 0$3 & ~0\$(umask) ))")
+  # SSH may use zsh, which reads leading-zero arithmetic as decimal by default.
+  # Evaluate only the mode calculation in a POSIX shell; keep the caller's umask.
+  __rt_m=\$(sh -c 'printf "%o" "\$(( 0\$1 & ~0\$2 ))"' sh "$3" "\$(umask)")
 fi
 if [ -n "\$__rt_m" ]; then
   chmod "\$__rt_m" "\$__rt_t" || { rm -f "\$__rt_t"; echo RT_MODE_FAILED >&2; exit 99; }
