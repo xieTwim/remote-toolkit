@@ -1745,6 +1745,107 @@ chk "18x12 ... with --timeout too" \
 _ssh() { sh -c "$1"; }
 REMOTE_DIR="$P"
 
+# ── 18y. fetch --detached: the command outlives the connection ───────────────
+# A foreground fetch is one ssh session; on a host that closes sessions after a minute, or over
+# a tree that takes minutes to list, nothing arrived (about twenty reports, 2026-10-19..11-14).
+# Detached, the job runs on the remote and its payload is asked for in pieces. The stubs play
+# the remote: `_exec_bg` runs the job text as tmux's shell would, `_ssh` runs each short call.
+DH="$SCRATCH/dhome"; mkdir -p "$DH/.rt_logs"
+REMOTE_DIR="$SCRATCH/proj"
+_exec_bg() { ( cd "$REMOTE_DIR" && HOME="$DH" sh -c "$1" ) > "$DH/.rt_logs/job.log" 2>&1; return 0; }
+_ssh() { HOME="$DH" sh -c "$1"; }
+staged() { ls "$DH/.rt_logs" 2>/dev/null | grep -c -e '\.out$' -e '\.trailer$' | tr -d ' '; }
+head -c 100000 /dev/urandom > "$REMOTE_DIR/big.bin"
+
+RT_FETCH_POLL=0 cmd_fetch --detached "$D/det.bin" "cat $REMOTE_DIR/bin.dat" 2>"$E18"; rc=$?
+chk "18y1 a detached fetch delivers a verified, byte-exact payload" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/bin.dat" "$D/det.bin" && grep -q 'sha256' "$E18" && echo 0 || echo 1)" "rc=$rc $(cat "$E18")"
+chk "18y2 ... and leaves nothing staged on the remote or beside the destination" \
+    "$([ "$(staged)" = 0 ] && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "staged=$(staged) leftovers=$(leftovers)"
+
+: > "$SCRATCH/pieces"
+_ssh() { case "$1" in *'tail -c'*) echo piece >> "$SCRATCH/pieces" ;; esac; HOME="$DH" sh -c "$1"; }
+RT_FETCH_POLL=0 RT_FETCH_CHUNK_BYTES=30000 cmd_fetch --detached "$D/det-big.bin" "cat $REMOTE_DIR/big.bin" 2>"$E18"; rc=$?
+chk "18y3 a payload larger than one piece is assembled from several, byte-exact" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/big.bin" "$D/det-big.bin" && [ "$(wc -l < "$SCRATCH/pieces" | tr -d ' ')" = 4 ] && echo 0 || echo 1)" \
+    "rc=$rc pieces=$(wc -l < "$SCRATCH/pieces" | tr -d ' ')"
+
+# The connection drops mid-piece: the piece is asked for again, and what arrives is still whole.
+: > "$SCRATCH/pieces"
+_ssh() {
+  case "$1" in *'tail -c'*)
+    echo piece >> "$SCRATCH/pieces"
+    if [ "$(wc -l < "$SCRATCH/pieces" | tr -d ' ')" = 2 ]; then HOME="$DH" sh -c "$1" | head -c 1000; return 255; fi ;;
+  esac
+  HOME="$DH" sh -c "$1"
+}
+RT_FETCH_POLL=0 RT_FETCH_RETRY_WAIT=0 RT_FETCH_CHUNK_BYTES=30000 cmd_fetch --detached "$D/det-cut.bin" "cat $REMOTE_DIR/big.bin" 2>"$E18"; rc=$?
+chk "18y4 a piece cut in transit is fetched again, and the payload still verifies" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/big.bin" "$D/det-cut.bin" && echo 0 || echo 1)" "rc=$rc $(cat "$E18")"
+
+# A piece that arrives short while ssh still reports success is counted, not appended.
+: > "$SCRATCH/pieces"
+_ssh() {
+  case "$1" in *'tail -c'*)
+    echo piece >> "$SCRATCH/pieces"
+    if [ "$(wc -l < "$SCRATCH/pieces" | tr -d ' ')" = 2 ]; then HOME="$DH" sh -c "$1" | head -c 1000; return 0; fi ;;
+  esac
+  HOME="$DH" sh -c "$1"
+}
+RT_FETCH_POLL=0 RT_FETCH_RETRY_WAIT=0 RT_FETCH_CHUNK_BYTES=30000 cmd_fetch --detached "$D/det-short.bin" "cat $REMOTE_DIR/big.bin" 2>"$E18"; rc=$?
+chk "18y4b a piece that arrives short under a zero status is fetched again too" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/big.bin" "$D/det-short.bin" && echo 0 || echo 1)" "rc=$rc $(cat "$E18")"
+
+# ... and a transfer that is cut every time ends without a destination, keeping the staged file.
+_ssh() { case "$1" in *'tail -c'*) HOME="$DH" sh -c "$1" | head -c 10; return 255 ;; esac; HOME="$DH" sh -c "$1"; }
+printf 'existing\n' > "$D/det-keep.bin"
+RT_FETCH_POLL=0 RT_FETCH_RETRY_WAIT=0 cmd_fetch --detached "$D/det-keep.bin" "cat $REMOTE_DIR/big.bin" 2>"$E18"; rc=$?
+chk "18y5 a transfer cut every time writes nothing (125) and says where the payload is kept" \
+    "$([ "$rc" = 125 ] && [ "$(cat "$D/det-keep.bin")" = existing ] && [ "$(leftovers)" = 0 ] \
+       && grep -q 'is kept on' "$E18" && [ "$(staged)" = 2 ] && echo 0 || echo 1)" "rc=$rc staged=$(staged)"
+rm -f "$DH"/.rt_logs/*
+
+# An unreachable host is not "not done": failed checks are waited out, not read as an answer.
+: > "$SCRATCH/checks"
+_ssh() {
+  case "$1" in *'.trailer 2>/dev/null; true')
+    echo check >> "$SCRATCH/checks"
+    [ "$(wc -l < "$SCRATCH/checks" | tr -d ' ')" -gt 3 ] || return 255 ;;
+  esac
+  HOME="$DH" sh -c "$1"
+}
+RT_FETCH_POLL=0 cmd_fetch --detached "$D/det-unreach.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18y6 three unanswered checks are said, waited out, and the payload still arrives" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/det-unreach.csv" && grep -q 'three checks in a row' "$E18" && echo 0 || echo 1)" "rc=$rc $(cat "$E18")"
+_ssh() { HOME="$DH" sh -c "$1"; }
+
+RT_FETCH_POLL=0 cmd_fetch --detached "$D/det-failed.csv" "echo partial; exit 4" 2>"$E18"; rc=$?
+chk "18y7 a failed remote command keeps its status and writes no destination" \
+    "$([ "$rc" = 4 ] && [ ! -e "$D/det-failed.csv" ] && [ "$(staged)" = 0 ] && echo 0 || echo 1)" "rc=$rc staged=$(staged)"
+
+# A job still running at the bound: the wait ends, nothing is written, the job is named.
+_exec_bg() { return 0; }
+t0=$(date +%s); RT_FETCH_POLL=1 cmd_fetch --detached --timeout 1 "$D/det-late.csv" "sleep 600" 2>"$E18"; rc=$?; t1=$(date +%s)
+chk "18y8 --timeout ends the wait (124) on a job that has not finished, and names it" \
+    "$([ "$rc" = 124 ] && [ ! -e "$D/det-late.csv" ] && [ $((t1 - t0)) -le 5 ] && grep -q 'left running' "$E18" && echo 0 || echo 1)" "rc=$rc after $((t1 - t0))s"
+_exec_bg() { ( cd "$REMOTE_DIR" && HOME="$DH" sh -c "$1" ) > "$DH/.rt_logs/job.log" 2>&1; return 0; }
+
+# Altered in transit: every piece has the right length, and only the digest can tell.
+_ssh() { case "$1" in *'tail -c'*) HOME="$DH" sh -c "$1" | tr 'a-z' 'A-Z'; return 0 ;; esac; HOME="$DH" sh -c "$1"; }
+RT_FETCH_POLL=0 cmd_fetch --detached "$D/det-mismatch.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18y9 a payload altered in transit is a DIGEST MISMATCH and is not written" \
+    "$([ "$rc" = 3 ] && grep -q 'DIGEST MISMATCH' "$E18" && [ ! -e "$D/det-mismatch.csv" ] && [ "$(leftovers)" = 0 ] && echo 0 || echo 1)" "rc=$rc"
+rm -f "$DH"/.rt_logs/*
+_ssh() { sh -c "$1"; }
+set +e; source "$RT" 2>/dev/null; set +e          # the real _exec_bg back
+RT_PROFILE="h/p"; _init_profile
+REMOTE_HOST="stub-host"
+info() { printf ':: %s\n' "$*" >&2; }
+warn() { printf '!! %s\n' "$*" >&2; }
+_sync_preflight_for_exec() { :; }
+_ssh() { sh -c "$1"; }
+REMOTE_DIR="$P"
+
 # THE FALSE-POSITIVE GUARD. Every check above is satisfied by a `fetch` that never writes
 # anything and a `push` that always refuses. Without this the whole block scores a broken tool
 # as correct — the same guard block 17h exists to be.

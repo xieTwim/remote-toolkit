@@ -218,6 +218,7 @@ rt -p host/proj fetch one.csv  'cat /data/runs/one.csv'            # an existing
 rt -p host/proj fetch --no-flush one.csv 'cat /data/runs/one.csv'  # use remote files as they stand
 rt -p host/proj push ./patched.py scripts/patched.py               # local -> remote
 rt -p host/proj push --mkdir ./patched.py runs/new/patched.py      # ... creating runs/new/ there
+rt -p host/proj fetch --detached counts.txt 'find runs -name done.json | wc -l'   # slow command, or a link that drops
 ```
 
 `fetch` takes the local path to write first and a remote *command* second (`'cat <file>'`, never a
@@ -231,6 +232,14 @@ or unknown sync state, while retaining SSH reachability and SHA-256 verification
 establish that local edits have arrived. `push` already bypasses Mutagen and needs no flag.
 `push` sets modes as `cp` does: a replaced file keeps its own mode, and a new file takes the
 local file's mode under the remote umask, so an executable stays executable.
+
+**A read that outlasts the connection: `fetch --detached`.** A foreground `exec` or `fetch` is one
+ssh session. When the command walks thousands of files on a slow filesystem, or the host closes
+sessions after a minute, the session ends first: 0 bytes, "Connection closed by remote host", exit
+125 or 255. `fetch --detached` runs the command as a background job on the remote (it shows in
+`rt logs`), asks in short calls whether it has finished, and copies its output back in pieces,
+asking again for a piece that was cut. Verification and exit codes are `fetch`'s. `--timeout`
+bounds the wait and leaves the job running; a stop from this side kills the job.
 
 The remote stages the payload, digests it **there**, streams it, and reports the digest in the
 trailer; `rt` digests what actually arrived and renames into place **only on a match**. So a cut

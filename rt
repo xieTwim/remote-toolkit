@@ -1206,7 +1206,7 @@ _exec_account() {  # <bytes-or-empty> <trailer-rc-or-empty> <transport-rc> <forw
   # what came through is the whole of it. Returning 0 here is what let a partial payload parse as
   # a complete one.
   if [[ -z "$trailer" ]]; then
-    warn "[$RT_PROFILE] exec output is TRUNCATED: $seen arrived and then the stream ended without the remote command reporting that it had finished. Treat what you received as a PREFIX, not as the answer."
+    warn "[$RT_PROFILE] exec output is TRUNCATED: $seen arrived and then the stream ended without the remote command reporting that it had finished. Treat what you received as a PREFIX, not as the answer. For a read that outlasts the connection, 'rt fetch --detached <local-file> <command>' runs it as a background job and survives the drop."
     if [[ "$transport" -ne 0 ]]; then
       return "$transport"
     fi
@@ -2250,9 +2250,11 @@ _fetch_trailer_filter() {  # <token> <outfile>
 cmd_fetch() {
   local limit=""
   local no_flush=false
+  local detached=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-flush) no_flush=true; shift ;;
+      --detached) detached=true; shift ;;
       --timeout) [[ $# -ge 2 ]] || die "Missing argument for --timeout."; limit="$2"; shift 2 ;;
       --timeout=*) limit="${1#--timeout=}"; shift ;;
       --) shift; break ;;
@@ -2260,12 +2262,15 @@ cmd_fetch() {
       *) break ;;
     esac
   done
-  [[ $# -ge 2 ]] || die "Usage: rt fetch [--no-flush] [--timeout N] <local-path> <remote-command>
+  [[ $# -ge 2 ]] || die "Usage: rt fetch [--no-flush] [--detached] [--timeout N] <local-path> <remote-command>
   Runs <remote-command> on the remote, verifies the payload by sha256, and writes it to
   <local-path> ATOMICALLY — the destination is never a partial file.
   Flushes sync first by default; --no-flush uses the remote files as they stand.
+  --detached runs the command as a background job on the remote and copies its output back
+  in pieces, so neither a slow command nor a dropped connection loses it.
     rt fetch runs.tar 'cd /data/runs && tar cf - *.csv'
     rt fetch one.csv  'cat /data/runs/one.csv'
+    rt fetch --detached counts.txt 'find /data/runs -name done.json | wc -l'
   Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH
         · 124 the --timeout bound fired · 125 no outcome established · otherwise the
         remote command's own status (and the destination is NOT written)."
@@ -2277,7 +2282,7 @@ cmd_fetch() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      --no-flush) die "[$RT_PROFILE] fetch: '--no-flush' after the local path would be sent to the remote as part of the command. Options go first: rt fetch --no-flush <local-path> <remote-command>" ;;
+      --no-flush|--detached) die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch $arg <local-path> <remote-command>" ;;
       --timeout|--timeout=*)
         [[ "$1" != --timeout* && "$1" != *[[:space:]]* ]] \
           || die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch --timeout N <local-path> <remote-command>" ;;
@@ -2295,6 +2300,13 @@ cmd_fetch() {
   [[ -w "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory is not writable: $ddir"
 
   _sync_preflight_for_exec "$no_flush"
+
+  if [[ "$detached" == true ]]; then
+    [[ -z "$limit" || "$limit" =~ ^[1-9][0-9]*$ ]] \
+      || die "--timeout takes whole seconds greater than zero, got '$limit'."
+    _fetch_detached "$dest" "$command" "$limit"
+    return
+  fi
 
   local token remote tmp acct
   token="__rt_fetch_end_${$}_${RANDOM}__"
@@ -2330,6 +2342,140 @@ cmd_fetch() {
   _fetch_settle "$dest" "$tmp" "$transport" "$t_rc" "$t_dig" "$t_len"
 }
 
+# ── fetch --detached: the remote command outlives the connection that started it ─────────────
+#
+# A foreground fetch is ONE ssh session, from the remote command's first byte to its last. On a
+# host that closes sessions after about a minute, or over a tree that takes minutes to list, the
+# session ends first and nothing arrives: 0 bytes, "Connection closed by remote host", a
+# many-file pull that could never finish (about twenty reports, 2026-10-19..11-14). Detached, the
+# command runs as a background job on the remote (`exec --bg`'s tmux lane, so `rt logs` lists it)
+# and writes its payload to a file beside the job's log. This side only asks, in short calls
+# that may fail and be repeated, whether the job has finished, then copies the file in pieces
+# and repeats a piece that was cut. Verification is fetch's: the remote digests the whole payload
+# once, and the destination is written only when what was assembled here matches it.
+_fetch_detached_job() {  # <stage path prefix on the remote> <command>
+  cat <<EOF
+if command -v sha256sum >/dev/null 2>&1; then RTH=sha256sum;
+elif command -v shasum >/dev/null 2>&1; then RTH="shasum -a 256";
+else RTH=""; fi
+(
+${2}
+) > ${1}.out
+__rt_rc=\$?
+if [ -n "\$RTH" ]; then __rt_d=\$(\$RTH < ${1}.out | awk '{print \$1}'); else __rt_d=NO_SHA_TOOL; fi
+__rt_n=\$(wc -c < ${1}.out | tr -d ' ')
+printf '%s %s %s\n' "\$__rt_rc" "\$__rt_d" "\$__rt_n" > ${1}.trailer.tmp && mv ${1}.trailer.tmp ${1}.trailer
+exit \$__rt_rc
+EOF
+}
+
+_fetch_detached() {  # <dest> <command> <limit-seconds or EMPTY>
+  local dest="$1" command="$2" limit="$3"
+  local name="fetch-$(date +%s)-$$"
+  local session="${RT_SESSION_PREFIX}${name}"
+  # Unquoted on the remote on purpose, like `_exec_bg`'s log path: the tilde must expand there,
+  # and the profile grammar plus digits leave nothing in the name for a shell to act on.
+  local stage="~/.rt_logs/${session}"
+  local deadline=""
+  [[ -z "$limit" ]] || deadline=$(( $(date +%s) + limit ))
+  local tmp="${dest}.rt-incoming.$$"
+
+  _exec_bg "$(_fetch_detached_job "$stage" "$command")" "$name"
+
+  # A stop from this side is acted on between calls. Unlike a foreground fetch there IS something
+  # to stop it with: the job is a tmux session.
+  local stopped="" rc=0
+  trap 'stopped=INT' INT; trap 'stopped=TERM' TERM
+  _fetch_detached_wait "$dest" "$tmp" "$session" "$stage" "$deadline" || rc=$?
+  trap - INT TERM
+  rm -f "$tmp" "${tmp}.part"
+  return "$rc"
+}
+
+# Wait for the job, copy its payload, settle. Runs under `_fetch_detached`'s traps and reads its
+# `stopped`; split out so every early return passes the one place that clears them.
+_fetch_detached_wait() {  # <dest> <tmp> <session> <stage> <deadline or EMPTY>
+  local dest="$1" tmp="$2" session="$3" stage="$4" deadline="$5"
+  local poll="${RT_FETCH_POLL:-5}" trailer="" misses=0
+
+  _fd_interrupted() {   # 0 when the wait must end now; says why and leaves the remote tidy
+    if [[ -n "$stopped" ]]; then
+      if _ssh "tmux kill-session -t '${session}' 2>/dev/null; rm -f ${stage}.out ${stage}.trailer ${stage}.trailer.tmp" </dev/null >/dev/null 2>&1; then
+        warn "[$RT_PROFILE] fetch --detached stopped from this side (SIG${stopped}): the remote job was killed and its staged payload removed. $dest was NOT written."
+      else
+        warn "[$RT_PROFILE] fetch --detached stopped from this side (SIG${stopped}), and $REMOTE_HOST could not be reached to stop the job: it may still be running as $session ('rt -p $RT_PROFILE logs' lists it). $dest was NOT written."
+      fi
+      [[ "$stopped" == INT ]] && return 130
+      return 143
+    fi
+    if [[ -n "$deadline" ]] && (( $(date +%s) >= deadline )); then
+      warn "[$RT_PROFILE] fetch --detached: the --timeout bound ended the wait. $dest was NOT written. The remote job $session was left running ('rt -p $RT_PROFILE logs' lists it); once it is done its payload is ${stage}.out on $REMOTE_HOST."
+      return 124
+    fi
+    return 0
+  }
+
+  # Unreachable is not "not done": a failed check is counted and said, never read as an answer.
+  while :; do
+    if trailer="$(_ssh "cat ${stage}.trailer 2>/dev/null; true" </dev/null 2>/dev/null)"; then
+      misses=0
+      [[ -z "$trailer" ]] || break
+    else
+      misses=$((misses + 1))
+      (( misses != 3 )) || warn "[$RT_PROFILE] $REMOTE_HOST has not answered three checks in a row. The job runs on the remote regardless; still waiting for it."
+    fi
+    _fd_interrupted || return $?
+    sleep "$poll"
+  done
+
+  local t_rc t_dig t_len
+  read -r t_rc t_dig t_len <<<"$trailer"
+  if [[ ! "$t_rc" =~ ^[0-9]+$ || ! "$t_len" =~ ^[0-9]+$ || -z "$t_dig" ]]; then
+    warn "[$RT_PROFILE] fetch --detached established NOTHING: the job's status line is unreadable ('$trailer'). $dest was NOT written; see 'rt -p $RT_PROFILE logs $session'."
+    return 125
+  fi
+  if (( t_rc != 0 )); then
+    _ssh "rm -f ${stage}.out ${stage}.trailer" </dev/null >/dev/null 2>&1 || true
+    warn "[$RT_PROFILE] fetch: the remote command exited $t_rc. $dest was NOT written — a payload from a command that failed is not an artifact. Its stderr: rt -p $RT_PROFILE logs $session"
+    return "$t_rc"
+  fi
+
+  # The payload is a finished file on the remote now, so a piece can be asked for again. A cut
+  # piece halves the next request (a session that dies after a fixed time passes a smaller one)
+  # and five cuts in a row end the attempt, leaving the staged file for another.
+  local off=0 chunk="${RT_FETCH_CHUNK_BYTES:-4194304}" fails=0 want got
+  : > "$tmp" || { warn "[$RT_PROFILE] fetch --detached cannot write beside $dest."; return 1; }
+  while (( off < t_len )); do
+    _fd_interrupted || return $?
+    want=$(( t_len - off )); (( want <= chunk )) || want=$chunk
+    got=0
+    if _ssh "tail -c +$((off + 1)) ${stage}.out | head -c ${want}" </dev/null > "${tmp}.part" 2>/dev/null; then
+      got="$(wc -c < "${tmp}.part" | tr -d ' ')"
+    fi
+    if [[ "$got" -eq "$want" ]]; then
+      cat "${tmp}.part" >> "$tmp"; off=$((off + want)); fails=0
+    else
+      fails=$((fails + 1))
+      if (( fails > 5 )); then
+        warn "[$RT_PROFILE] fetch --detached could not copy the payload: the transfer was cut $fails times in a row at byte $off of $t_len. $dest was NOT written. The finished payload is kept on $REMOTE_HOST as ${stage}.out; fetch it again with: rt -p $RT_PROFILE fetch --no-flush $dest 'cat ${stage}.out'"
+        return 125
+      fi
+      (( chunk <= 262144 )) || chunk=$((chunk / 2))
+      sleep "${RT_FETCH_RETRY_WAIT:-2}"
+    fi
+  done
+  rm -f "${tmp}.part"
+
+  local settle=0
+  _fetch_settle "$dest" "$tmp" 0 "$t_rc" "$t_dig" "$t_len" || settle=$?
+  if (( settle == 0 )); then
+    # Delivered: the job leaves nothing behind. A failure keeps its log for `rt logs`.
+    _ssh "rm -f ${stage}.out ${stage}.trailer ${stage}.log ${stage}.log.rc ${stage}.sh" </dev/null >/dev/null 2>&1 \
+      || warn "[$RT_PROFILE] fetch delivered $dest, but $REMOTE_HOST could not be reached to remove the staged copy (${stage}.out)."
+  fi
+  return "$settle"
+}
+
 # Decide, in the order the facts are decided, and DELETE the incoming file on every path that is
 # not a verified success. Leaving it behind is how a partial payload gets picked up later by a
 # glob and read as an artifact.
@@ -2345,7 +2491,7 @@ _fetch_settle() {  # <dest> <tmp> <transport> <trailer-rc> <trailer-digest> <tra
   fi
   if [[ -z "$t_rc" ]]; then
     rm -f "$tmp"
-    warn "[$RT_PROFILE] fetch established NOTHING: $got_len bytes arrived and the stream ended without the remote reporting that it had finished. $dest was NOT written."
+    warn "[$RT_PROFILE] fetch established NOTHING: $got_len bytes arrived and the stream ended without the remote reporting that it had finished. $dest was NOT written. If the remote command needs longer than this connection lasted, 'rt fetch --detached' runs it as a background job and survives the drop."
     [[ "$transport" -ne 0 ]] && return "$transport"
     return 125
   fi
@@ -2706,11 +2852,13 @@ COMMANDS:
                        Run in background (tmux), survives disconnection. A
                        --name is a launch id: if that job is running or ran
                        before, nothing starts and rt exits 3.
-  fetch [--no-flush] [--timeout N] <local-path> <remote-command>
+  fetch [--no-flush] [--detached] [--timeout N] <local-path> <remote-command>
                        Run a remote command and save its output atomically after
                        SHA-256 verification. Flushes sync first by default;
                        --no-flush uses remote files as they stand, retaining
-                       SSH reachability and digest checks.
+                       SSH reachability and digest checks. --detached runs the
+                       command as a background job and copies its output back in
+                       pieces: for a slow command or a connection that drops.
   push [--mkdir] <local-path> <remote-path>
                        Upload ONE file and install it atomically after SHA-256
                        verification. Bypasses Mutagen sync; relative targets use
