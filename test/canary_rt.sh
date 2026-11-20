@@ -1171,6 +1171,21 @@ for c in "outputs/res.txt:an ignored path" "/etc/passwd:an absolute path" "../x:
       "$([ $? -eq 2 ] && echo 0 || echo 1)"
 done
 
+# A directory named like an ignore rule never syncs, whatever it holds, and nothing said so
+# (2026-10-27, 11-16). Asked about the directory itself, verify names the rule; a directory no
+# rule excludes keeps the plain refusal, and so does any directory while the session cannot be
+# asked (the order 15f3 pins).
+out=$( cmd_verify --timeout 0 outputs 2>&1 ); rc=$?
+chk "15f4 an ignored DIRECTORY is refused naming the rule that excludes it" \
+    "$([ "$rc" -eq 2 ] && grep -q "ignore rule 'outputs/'" <<< "$out" && echo 0 || echo 1)" \
+    "rc=$rc out=$(head -c 200 <<< "$out")"
+out=$( cmd_verify --timeout 0 sub 2>&1 ); rc=$?
+chk "15f5 a directory no rule excludes is not called ignored" \
+    "$([ "$rc" -eq 2 ] && ! grep -q 'ignore rule' <<< "$out" && echo 0 || echo 1)" "rc=$rc"
+out=$( FAKE_STATUS=unknown; cmd_verify --timeout 0 outputs 2>&1 ); rc=$?
+chk "15f6 ... and nothing is claimed about a rule while the session cannot be asked" \
+    "$([ "$rc" -eq 2 ] && ! grep -q 'ignore rule' <<< "$out" && echo 0 || echo 1)" "rc=$rc"
+
 # A newline splits one path across two manifest lines on BOTH sides, so the comparison and the
 # per-file mismatch report would describe something other than the file being asked about.
 ( cmd_verify --timeout 0 "$(printf 'a\nb')" ) >/dev/null 2>&1
@@ -1681,6 +1696,55 @@ _ssh() { sh -c "$1"; }
 
 _ssh() { sh -c "$1"; }
 
+# ── 18x. the invocation mistakes that kept recurring (2026-10-24..11-16) ──────
+# push: one local file and a remote destination. `rt push a.py b.py` installed a.py AS b.py on the
+# remote, silently; a directory was refused without a next step; a missing parent cost a failed
+# push and a round trip every time.
+printf 'A\n' > "$SCRATCH/a.py"; printf 'B\n' > "$SCRATCH/b.py"; printf 'REMOTE-B\n' > "$P/b.py"
+( cd "$SCRATCH" && cmd_push a.py b.py ) 2>"$E18"; rc=$?
+chk "18x1 a second argument that is another local file is refused, not installed over" \
+    "$([ "$rc" = 1 ] && grep -q 'ONE local file' "$E18" && [ "$(cat "$P/b.py")" = "REMOTE-B" ] && echo 0 || echo 1)" "rc=$rc"
+mkdir -p "$SCRATCH/variant"; printf 'A-variant\n' > "$SCRATCH/variant/a.py"
+( cd "$SCRATCH" && cmd_push variant/a.py a.py ) 2>"$E18"; rc=$?
+chk "18x2 ... a destination that only shares its NAME with a local file is the ordinary case" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$P/a.py" 2>/dev/null)" = "A-variant" ] && echo 0 || echo 1)" "rc=$rc"
+( cd "$SCRATCH" && cmd_push a.py "$P/b.py" ) 2>"$E18"; rc=$?
+chk "18x3 ... and an absolute remote path says the destination is meant" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$P/b.py")" = "A" ] && echo 0 || echo 1)" "rc=$rc"
+( cmd_push "$SCRATCH/variant" "variant" ) 2>"$E18"; rc=$?
+chk "18x4 a directory source is refused with the way to send it" \
+    "$([ "$rc" = 1 ] && grep -q 'is a directory' "$E18" && grep -q 'tar czf' "$E18" && echo 0 || echo 1)" "rc=$rc"
+cmd_push "$SCRATCH/a.py" "fresh/deep/a.py" 2>"$E18"; rc=$?
+chk "18x5 a missing parent directory still fails, and the message names --mkdir" \
+    "$([ "$rc" = 98 ] && grep -q -- '--mkdir' "$E18" && [ ! -e "$P/fresh" ] && echo 0 || echo 1)" "rc=$rc"
+cmd_push --mkdir "$SCRATCH/a.py" "fresh/deep/a.py" 2>"$E18"; rc=$?
+chk "18x6 --mkdir creates the parent and installs the verified file" \
+    "$([ "$rc" = 0 ] && cmp -s "$SCRATCH/a.py" "$P/fresh/deep/a.py" && echo 0 || echo 1)" "rc=$rc"
+# fetch: the local path comes first and the second argument is a command; fetch's own flags go
+# before both; and fetch never reads its caller's stdin.
+REMOTE_DIR="$SCRATCH/proj"
+( cmd_fetch "/no-such-remote-dir/one.csv" "$D/swapped.csv" ) 2>"$E18"; rc=$?
+chk "18x7 the two arguments in the other order are answered with the form to use" \
+    "$([ "$rc" = 1 ] && grep -q 'LOCAL path to write first' "$E18" && grep -q 'cat <remote-path>' "$E18" && [ ! -e "$D/swapped.csv" ] && echo 0 || echo 1)" "rc=$rc"
+( cmd_fetch "$D/flag-after.csv" "cat $REMOTE_DIR/one.csv" --no-flush ) 2>"$E18"; rc=$?
+chk "18x8 --no-flush after the command is refused, not sent to the remote" \
+    "$([ "$rc" = 1 ] && grep -q 'Options go first' "$E18" && [ ! -e "$D/flag-after.csv" ] && echo 0 || echo 1)" "rc=$rc"
+( cmd_fetch "$D/flag-after.csv" "cat $REMOTE_DIR/one.csv" --timeout 30 ) 2>"$E18"; rc=$?
+chk "18x9 --timeout after a quoted command is refused the same way" \
+    "$([ "$rc" = 1 ] && grep -q 'Options go first' "$E18" && [ ! -e "$D/flag-after.csv" ] && echo 0 || echo 1)" "rc=$rc"
+cmd_fetch "$D/own-flag.txt" echo --timeout=5 2>"$E18"; rc=$?
+chk "18x10 ... while a word-by-word remote command keeps a --timeout of its own" \
+    "$([ "$rc" = 0 ] && [ "$(cat "$D/own-flag.txt" 2>/dev/null)" = "--timeout=5" ] && echo 0 || echo 1)" "rc=$rc"
+_ssh() { cat > /dev/null; sh -c "$1"; }          # like real ssh: takes all the stdin it is given
+left="$(printf 'second\nthird\n' | { cmd_fetch "$D/in-a-loop.csv" "cat $REMOTE_DIR/one.csv" 2>/dev/null; cat; })"
+chk "18x11 fetch inside a read loop leaves the rest of the loop's input alone" \
+    "$([ "$left" = "$(printf 'second\nthird')" ] && cmp -s "$REMOTE_DIR/one.csv" "$D/in-a-loop.csv" && echo 0 || echo 1)" "left='$left'"
+left="$(printf 'second\nthird\n' | { cmd_fetch --timeout 20 "$D/in-a-loop2.csv" "cat $REMOTE_DIR/one.csv" 2>/dev/null; cat; })"
+chk "18x12 ... with --timeout too" \
+    "$([ "$left" = "$(printf 'second\nthird')" ] && cmp -s "$REMOTE_DIR/one.csv" "$D/in-a-loop2.csv" && echo 0 || echo 1)" "left='$left'"
+_ssh() { sh -c "$1"; }
+REMOTE_DIR="$P"
+
 # THE FALSE-POSITIVE GUARD. Every check above is satisfied by a `fetch` that never writes
 # anything and a `push` that always refuses. Without this the whole block scores a broken tool
 # as correct — the same guard block 17h exists to be.
@@ -1879,7 +1943,7 @@ out="$( (main -p h/p flush) 2>&1 )"
 chk "20f rt flush is sync flush" "$([ "$out" = "sync profile=h/p args=flush" ] && echo 0 || echo 1)" "$out"
 out="$( (main help push) 2>&1 )"
 chk "20g rt help <command> prints that command's lines" \
-    "$(grep -q '^  push <local-path>' <<< "$out" && ! grep -q '^  exec ' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
+    "$(grep -q '^  push \[--mkdir\] <local-path>' <<< "$out" && ! grep -q '^  exec ' <<< "$out" && echo 0 || echo 1)" "$(head -c 300 <<< "$out")"
 out="$( (main help no-such-command) 2>&1 )"
 chk "20h an unknown name falls back to the whole help" "$(grep -q '^COMMANDS:' <<< "$out" && echo 0 || echo 1)"
 
@@ -1909,6 +1973,24 @@ _ssh() { local in; in="$(cat)"; printf '%s\n' "$in" | sh -c "$1"; }
 out="$(echo 'piped-line' | cmd_exec --no-flush cat 2>/dev/null)"; rc=$?
 chk "22 piped stdin reaches the exec'd command" \
     "$([ "$rc" = 0 ] && [ "$out" = "piped-line" ] && echo 0 || echo 1)" "rc=$rc out=$out"
+
+# ── 23. reachability is asked twice before it is called a failure ────────────
+# A first connection that fails and passes seconds later (2026-10-25..11-10) used to end the
+# command with "Run 'rt connect' first", which is about the sync session.
+set +e; source "$RT" 2>/dev/null; set +e
+RT_PROFILE="h/p"; _init_profile; REMOTE_HOST="stub-host"
+: > "$SCRATCH/probes"
+_ssh_test() { echo probe >> "$SCRATCH/probes"; [ "$(wc -l < "$SCRATCH/probes" | tr -d ' ')" -ge 2 ]; }
+( RT_SSH_RETRY_WAIT=0 _require_ssh ) 2>"$SCRATCH/e23"; rc=$?
+chk "23a a link that answers on the second attempt is reachable" \
+    "$([ "$rc" = 0 ] && [ "$(wc -l < "$SCRATCH/probes" | tr -d ' ')" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+: > "$SCRATCH/probes"
+_ssh_test() { echo probe >> "$SCRATCH/probes"; return 1; }
+( RT_SSH_RETRY_WAIT=0 _require_ssh ) 2>"$SCRATCH/e23"; rc=$?
+chk "23b two failures end the command, after exactly two attempts" \
+    "$([ "$rc" = 1 ] && [ "$(wc -l < "$SCRATCH/probes" | tr -d ' ')" = 2 ] && echo 0 || echo 1)" "rc=$rc"
+chk "23c ... and the message is about the ssh link, not about connecting sync first" \
+    "$(grep -q 'ssh link' "$SCRATCH/e23" && ! grep -q "connect' first" "$SCRATCH/e23" && echo 0 || echo 1)" "$(cat "$SCRATCH/e23")"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi

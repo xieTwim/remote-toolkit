@@ -679,6 +679,17 @@ _ssh_test() {
   _ssh "echo ok" </dev/null >/dev/null 2>&1
 }
 
+# Reachability, with one retry. On some links a first connection fails and the same call passes
+# seconds later (four reports, 2026-10-25..11-10), and the old message, "Run 'rt connect' first",
+# sent the reader to the sync session, which has nothing to do with it and which some profiles
+# never have. RT_SSH_RETRY_WAIT is the pause between the two attempts, in seconds.
+_require_ssh() {
+  _ssh_test && return 0
+  sleep "${RT_SSH_RETRY_WAIT:-3}"
+  _ssh_test && return 0
+  die "[$RT_PROFILE] Cannot reach $REMOTE_HOST over ssh (two attempts, ${RT_SSH_RETRY_WAIT:-3}s apart). This is the ssh link, not the sync session. A host that answered a minute ago is usually back in a minute: retry. For a host never reached from here, 'ssh $REMOTE_HOST' shows the real error and 'rt -p $RT_PROFILE connect' sets the profile up."
+}
+
 # ── Subcommands ────────────────────────────────────────────────────
 
 cmd_check() {
@@ -984,7 +995,7 @@ _sync_preflight_for_exec() {  # <no_flush:true|false>
   local no_flush="${1:-false}"
 
   # Need SSH; sync state is independent
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST. Run 'rt connect' first."
+  _require_ssh
 
   # Auto-flush sync so the remote sees latest edits before exec.
   #
@@ -1477,7 +1488,7 @@ echo \"EXIT_CODE=\$(cat ${log_file}.rc 2>/dev/null || echo unknown)\" >> ${log_f
 cmd_logs() {
   load_config
 
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST. Run 'rt connect' first."
+  _require_ssh
 
   local job_id="${1:-}"
   local follow=false
@@ -2071,8 +2082,14 @@ cmd_verify() {
     if reason=$(_escapes_via_symlink "$p"); then
       die2 "'$p' passes through a symlink ($reason). Hashing the link text would not prove what the remote launches, following it would not prove the link, and an intermediate one can leave the profile root entirely. Verify the real path."
     fi
-    [[ ! -d "${LOCAL_DIR}/${p}" ]] \
-      || die2 "'$p' is a directory. Verify the files you are about to launch, by name — a recursive manifest brings in ordering, ignored descendants and mid-check mutation, which is a larger decision than this."
+    if [[ -d "${LOCAL_DIR}/${p}" ]]; then
+      # A directory named like an ignore rule (models/, data/, logs/) never syncs, whatever it
+      # holds, and nothing said so (2026-10-27, 11-16): asked about it, say that first.
+      if _has_sync && { reason=$(_ignored_reason "${p%/}/.") || reason=$(_ignored_reason "${p%/}"); }; then
+        die2 "'$p' is a directory the live session's ignore rule '${reason}' excludes: nothing under it ever syncs, whatever its size. Stage what you need from it another way (rt push), or remove the rule and recreate the session."
+      fi
+      die2 "'$p' is a directory. Verify the files you are about to launch, by name — a recursive manifest brings in ordering, ignored descendants and mid-check mutation, which is a larger decision than this."
+    fi
     [[ -f "${LOCAL_DIR}/${p}" ]] \
       || die2 "'$p' does not exist locally (looked in $LOCAL_DIR). Local is the authority for what you are staging; there is nothing to assert about."
   done
@@ -2253,11 +2270,28 @@ cmd_fetch() {
         · 124 the --timeout bound fired · 125 no outcome established · otherwise the
         remote command's own status (and the destination is NOT written)."
   local dest="$1"; shift
+  # One of fetch's own flags written after the local path used to be sent to the remote as part
+  # of the command (`rt fetch out.csv "cat x" --no-flush` ran `cat x --no-flush` there).
+  # --no-flush is never a remote command's own. --timeout can be, so it is refused only where it
+  # cannot be: as the first word, or behind a command given as one quoted word.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --no-flush) die "[$RT_PROFILE] fetch: '--no-flush' after the local path would be sent to the remote as part of the command. Options go first: rt fetch --no-flush <local-path> <remote-command>" ;;
+      --timeout|--timeout=*)
+        [[ "$1" != --timeout* && "$1" != *[[:space:]]* ]] \
+          || die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch --timeout N <local-path> <remote-command>" ;;
+    esac
+  done
   local command="$*"
 
   [[ -e "$dest" && ! -f "$dest" ]] && die "[$RT_PROFILE] fetch destination exists and is not a regular file: $dest"
   local ddir; ddir="$(dirname "$dest")"
-  [[ -d "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory does not exist: $ddir"
+  # The usual way to get here is the two arguments in the other order, or a remote path where a
+  # command belongs (six reports, 2026-10-24..11-16), so the message shows the form.
+  [[ -d "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory does not exist on this machine: $ddir
+  fetch takes the LOCAL path to write first, then a COMMAND for the remote to run, not a remote path:
+    rt fetch <local-path> \"cat <remote-path>\""
   [[ -w "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory is not writable: $ddir"
 
   _sync_preflight_for_exec "$no_flush"
@@ -2276,11 +2310,14 @@ cmd_fetch() {
   _fetch_trailer_filter "$token" "$acct/tr" < "$acct/err" >&2 &
   local filter_pid=$!
 
+  # stdin closed: fetch has no use for it, and ssh forwards its stdin whether or not the remote
+  # reads it, so inside `while read f; do rt fetch …; done < list` the first fetch swallowed the
+  # rest of the list and one file arrived (2026-11-07).
   local transport=0
   if [[ -n "$limit" ]]; then
-    _ssh_bounded "$limit" "$remote" > "$tmp" 2> "$acct/err" || transport=$?
+    _ssh_bounded "$limit" "$remote" > "$tmp" 2> "$acct/err" < /dev/null || transport=$?
   else
-    _ssh "$remote" > "$tmp" 2> "$acct/err" || transport=$?
+    _ssh "$remote" > "$tmp" 2> "$acct/err" < /dev/null || transport=$?
   fi
   [[ "$transport" -eq 124 ]] && { _exec_reap 2 "$filter_pid" || true; }
   wait "$filter_pid" 2>/dev/null || true
@@ -2352,7 +2389,7 @@ _fetch_settle() {  # <dest> <tmp> <transport> <trailer-rc> <trailer-digest> <tra
 # takes the local file's mode under the remote umask. `cat >` alone gave every install the
 # remote default, so a pushed helper lost its +x, and re-pushing an unchanged live one did too
 # (two PATH helpers non-executable for ~16 s under a running job, 2026-10-10).
-_push_remote_cmd() {  # <remote-dest> <expected-digest> <local mode, octal digits>
+_push_remote_cmd() {  # <remote-dest> <expected-digest> <local mode, octal digits> [<mkdir: 1 to create the parent>]
   # A function with a bare heredoc, not `x=$(cat <<EOF …)`: inside a command substitution bash
   # parses the heredoc body looking for the closing paren, and the `*)` of a `case` arm closes it
   # early. Same reason `_exec_remote_cmd` and `_fetch_remote_cmd` are written this way.
@@ -2366,6 +2403,7 @@ case "\$__rt_d" in
   *) __rt_d=$(_shq "$REMOTE_DIR")/\$__rt_d ;;
 esac
 __rt_dir=\$(dirname "\$__rt_d")
+if [ ! -d "\$__rt_dir" ] && [ "${4:-0}" = 1 ]; then mkdir -p "\$__rt_dir" || { echo "RT_MKDIR_FAILED \$__rt_dir" >&2; exit 99; }; fi
 [ -d "\$__rt_dir" ] || { echo "RT_NO_DEST_DIR \$__rt_dir" >&2; exit 98; }
 __rt_t="\$__rt_d.rt-incoming.\$\$"
 cat > "\$__rt_t" || { rm -f "\$__rt_t"; echo RT_WRITE_FAILED >&2; exit 99; }
@@ -2398,13 +2436,34 @@ _mode_of() {  # <path> — the permission bits push reads its bytes from: a syml
 }
 
 cmd_push() {
-  [[ $# -eq 2 ]] || die "Usage: rt push <local-path> <remote-path>
-  Sends <local-path> to <remote-path>, verified by sha256 and installed ATOMICALLY.
+  local mkdir=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mkdir) mkdir=1; shift ;;
+      --) shift; break ;;
+      -*) die "Unknown option for push: $1" ;;
+      *) break ;;
+    esac
+  done
+  [[ $# -eq 2 ]] || die "Usage: rt push [--mkdir] <local-path> <remote-path>
+  Sends ONE local file to <remote-path>, verified by sha256 and installed ATOMICALLY.
   A relative <remote-path> is resolved against REMOTE_DIR. Modes follow cp: a replaced file
   keeps its own mode; a new file takes the local file's mode under the remote umask.
+  --mkdir creates the destination's parent directory on the remote when it is missing.
   Exit: 0 verified · 2 unverifiable (no sha256 tool on one side) · 3 digest MISMATCH."
   local src="$1" dst="$2"
+  [[ ! -d "$src" ]] || die "[$RT_PROFILE] push source is a directory: $src
+  push sends one file. Pack the directory, push the archive and unpack it on the remote:
+    tar czf dir.tgz -C <parent> <dir> && rt push --mkdir dir.tgz <remote-dir>/dir.tgz && rt exec \"tar xzf <remote-dir>/dir.tgz -C <remote-dir>\""
   [[ -f "$src" ]] || die "[$RT_PROFILE] push source is not a regular file: $src"
+  # `rt push a.py b.py` reads as "send both" and means "send a.py as b.py": the remote b.py was
+  # overwritten with a.py's bytes, silently, twice (2026-10-27, 11-09). A second argument that is
+  # another local file under another name is taken for that mistake. The same name is the
+  # ordinary case of sending a file to its own relative path, and an absolute remote path says
+  # the destination is meant.
+  if [[ "$dst" != /* && -f "$dst" && ! "$dst" -ef "$src" && "$(basename "$dst")" != "$(basename "$src")" ]]; then
+    die "[$RT_PROFILE] push takes ONE local file and a remote destination, and '$dst' is another local file: this call would install $src on the remote AS $dst, not send both. Push each file in its own call; if $dst really is the destination, write it as an absolute remote path."
+  fi
   local want; want="$(_sha256_file "$src")" \
     || die2 "[$RT_PROFILE] No sha256 tool locally (need sha256sum or shasum). Cannot verify — unverifiable, not a mismatch."
   local n; n="$(wc -c < "$src" | tr -d ' ')"
@@ -2416,13 +2475,13 @@ cmd_push() {
   # the digest instead of installing a plausible file. The bytes are on disk before anything
   # claims anything about them.
   local remote rc=0
-  remote="$(_push_remote_cmd "$dst" "$want" "$mode")"
+  remote="$(_push_remote_cmd "$dst" "$want" "$mode" "$mkdir")"
   _ssh "$remote" < "$src" || rc=$?
   case "$rc" in
     0) info "[$RT_PROFILE] push verified $n bytes -> $dst (sha256 $want)"; return 0 ;;
     3) warn "[$RT_PROFILE] push DIGEST MISMATCH — see the remote's report above. $dst was NOT written; the incoming file was removed."; return 3 ;;
     97) warn "[$RT_PROFILE] push UNVERIFIABLE: the remote has neither sha256sum nor shasum. $dst was NOT written. Unverifiable, NOT a mismatch."; return 2 ;;
-    98) warn "[$RT_PROFILE] push FAILED: the destination's parent directory does not exist on the remote (push never creates directories). $dst was NOT written — create the directory first (rt exec \"mkdir -p …\"), then push again."; return 98 ;;
+    98) warn "[$RT_PROFILE] push FAILED: the destination's parent directory does not exist on the remote. $dst was NOT written — push again with --mkdir to create it: rt push --mkdir $src $dst"; return 98 ;;
     *) warn "[$RT_PROFILE] push FAILED (status $rc). Assume $dst was NOT written."; return "$rc" ;;
   esac
 }
@@ -2470,7 +2529,7 @@ _slurm_submit() {
   done
   [[ -n "$script" ]] || die "Usage: rt slurm submit <script> [-- sbatch_args...]"
 
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
+  _require_ssh
 
   # Mandatory flush — script must be on remote before sbatch
   if _has_sync; then
@@ -2526,7 +2585,7 @@ _slurm_submit() {
 }
 
 _slurm_queue() {
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
+  _require_ssh
   local fmt='%.10i %.12P %.20j %.8T %.10M %R'
   if [[ "${1:-}" == "--all" || "${1:-}" == "-a" ]]; then
     _ssh "squeue --format='$fmt'"
@@ -2537,7 +2596,7 @@ _slurm_queue() {
 
 _slurm_cancel() {
   [[ $# -gt 0 ]] || die "Usage: rt slurm cancel <jobid> [<jobid>...]"
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
+  _require_ssh
   local id qids=""
   for id in "$@"; do
     _require_jobid "$id"
@@ -2581,7 +2640,7 @@ _slurm_logs() {
   fi
 
   _require_jobid "$jobid"
-  _ssh_test || die "[$RT_PROFILE] Cannot reach $REMOTE_HOST."
+  _require_ssh
 
   local ext=".out"
   $err && ext=".err"
@@ -2652,11 +2711,12 @@ COMMANDS:
                        SHA-256 verification. Flushes sync first by default;
                        --no-flush uses remote files as they stand, retaining
                        SSH reachability and digest checks.
-  push <local-path> <remote-path>
-                       Upload and install atomically after SHA-256 verification.
-                       Bypasses Mutagen sync; relative targets use REMOTE_DIR.
-                       Modes as cp: a replaced file keeps its mode; a new one
-                       takes the local mode under the remote umask.
+  push [--mkdir] <local-path> <remote-path>
+                       Upload ONE file and install it atomically after SHA-256
+                       verification. Bypasses Mutagen sync; relative targets use
+                       REMOTE_DIR. Modes as cp: a replaced file keeps its mode; a
+                       new one takes the local mode under the remote umask.
+                       --mkdir creates a missing parent directory on the remote.
   logs                 List background jobs for this profile
   logs <job_id>        Show output of a background job
   logs <job_id> -f     Follow (tail -f) a background job's output

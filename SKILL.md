@@ -70,7 +70,7 @@ REMOTE_DIR="/home/user/scratch"
 
 Profile names must be in `<host>/<profile>` form (no bare-name fallback). Each segment is alphanumeric with single dashes between alphanumerics (no leading/trailing dash, no `--`, no `_` or `.`), max 32 chars — keeps the name unambiguous when `--` separates segments in the Mutagen session name and `_` separates them in tmux session names.
 
-**A session-less profile cannot create its own `REMOTE_DIR`.** Mutagen creates a synced profile's root on its first sync, but a profile that is never `connect`ed has no such step: every `exec` and `fetch` form starts with `cd REMOTE_DIR`, and `push` never creates directories, so a missing root fails before the payload runs. Create it once from another profile on the same host — `rt -p <host>/<other> exec --no-flush 'mkdir -p <REMOTE_DIR>'` — or with a plain `ssh` to `REMOTE_HOST`.
+**A session-less profile cannot create its own `REMOTE_DIR`.** Mutagen creates a synced profile's root on its first sync, but a profile that is never `connect`ed has no such step: every `exec` and `fetch` form starts with `cd REMOTE_DIR`, and `push` creates a parent directory only when asked (`--mkdir`), so a missing root fails before the payload runs. Create it once from another profile on the same host — `rt -p <host>/<other> exec --no-flush 'mkdir -p <REMOTE_DIR>'` — or with a plain `ssh` to `REMOTE_HOST`.
 
 #### One host, several storage backends
 
@@ -217,7 +217,13 @@ rt -p host/proj fetch runs.tar 'cd /data/runs && tar cf - *.csv'   # generated p
 rt -p host/proj fetch one.csv  'cat /data/runs/one.csv'            # an existing file
 rt -p host/proj fetch --no-flush one.csv 'cat /data/runs/one.csv'  # use remote files as they stand
 rt -p host/proj push ./patched.py scripts/patched.py               # local -> remote
+rt -p host/proj push --mkdir ./patched.py runs/new/patched.py      # ... creating runs/new/ there
 ```
+
+`fetch` takes the local path to write first and a remote *command* second (`'cat <file>'`, never a
+bare remote path), and its own options go before both. `push` sends one file per call: its second
+argument is the remote destination, a directory travels as a tarball, and a missing remote parent
+needs `--mkdir`.
 
 `fetch` flushes sync before running its remote command by default. Use `--no-flush` when the
 remote files are already the intended inputs: it skips the Mutagen preflight, including paused

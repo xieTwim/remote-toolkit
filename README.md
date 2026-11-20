@@ -97,7 +97,8 @@ under the remote umask.
 
 ```bash
 rt -p hpc/train push ./patched.py scripts/patched.py
-rt -p hpc/train fetch one.csv 'cat /data/runs/one.csv'
+rt -p hpc/train push --mkdir ./patched.py runs/new/patched.py   # create runs/new/ on the remote
+rt -p hpc/train fetch one.csv 'cat /data/runs/one.csv'          # local path first, then a remote command
 rt -p hpc/train fetch --no-flush one.csv 'cat /data/runs/one.csv'
 ```
 
