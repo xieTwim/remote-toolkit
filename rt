@@ -2251,10 +2251,12 @@ cmd_fetch() {
   local limit=""
   local no_flush=false
   local detached=false
+  local mkdirp=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-flush) no_flush=true; shift ;;
       --detached) detached=true; shift ;;
+      --mkdir) mkdirp=true; shift ;;
       --timeout) [[ $# -ge 2 ]] || die "Missing argument for --timeout."; limit="$2"; shift 2 ;;
       --timeout=*) limit="${1#--timeout=}"; shift ;;
       --) shift; break ;;
@@ -2262,7 +2264,7 @@ cmd_fetch() {
       *) break ;;
     esac
   done
-  [[ $# -ge 2 ]] || die "Usage: rt fetch [--no-flush] [--detached] [--timeout N] <local-path> <remote-command>
+  [[ $# -ge 2 ]] || die "Usage: rt fetch [--no-flush] [--detached] [--mkdir] [--timeout N] <local-path> <remote-command>
   Runs <remote-command> on the remote, verifies the payload by sha256, and writes it to
   <local-path> ATOMICALLY — the destination is never a partial file.
   Flushes sync first by default; --no-flush uses the remote files as they stand.
@@ -2282,7 +2284,7 @@ cmd_fetch() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      --no-flush|--detached) die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch $arg <local-path> <remote-command>" ;;
+      --no-flush|--detached|--mkdir) die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch $arg <local-path> <remote-command>" ;;
       --timeout|--timeout=*)
         [[ "$1" != --timeout* && "$1" != *[[:space:]]* ]] \
           || die "[$RT_PROFILE] fetch: '$arg' after the local path would be sent to the remote as part of the command. Options go first: rt fetch --timeout N <local-path> <remote-command>" ;;
@@ -2294,9 +2296,18 @@ cmd_fetch() {
   local ddir; ddir="$(dirname "$dest")"
   # The usual way to get here is the two arguments in the other order, or a remote path where a
   # command belongs (six reports, 2026-10-24..11-16), so the message shows the form.
+  # --mkdir rather than always creating it: the usual way to reach a non-existent directory is the two
+  # arguments in the other order or a remote path where a command belongs (six reports,
+  # 2026-10-24..11-16), and creating it silently would turn that mistake into a stray directory and a
+  # confusing remote error. A caller that legitimately writes into a new tree says so (2026-11-24: pulling
+  # a run's files back into a repo that never had that directory).
+  if [[ ! -d "$ddir" && "$mkdirp" == true ]]; then
+    mkdir -p "$ddir" || die "[$RT_PROFILE] fetch: --mkdir could not create $ddir"
+  fi
   [[ -d "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory does not exist on this machine: $ddir
   fetch takes the LOCAL path to write first, then a COMMAND for the remote to run, not a remote path:
-    rt fetch <local-path> \"cat <remote-path>\""
+    rt fetch <local-path> \"cat <remote-path>\"
+  If the directory is genuinely new and you mean to create it, pass --mkdir before the local path."
   [[ -w "$ddir" ]] || die "[$RT_PROFILE] fetch destination directory is not writable: $ddir"
 
   _sync_preflight_for_exec "$no_flush"

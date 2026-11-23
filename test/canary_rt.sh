@@ -1614,6 +1614,22 @@ chk "18j ... and still does not write the destination" \
 
 _ssh() { sh -c "$1"; }
 
+# A destination directory that does not exist is usually the two arguments in the other order, so the
+# guard stays — but a caller writing into a genuinely new tree should not have to mkdir by hand first
+# (2026-11-24: pulling a run's files back into a repo that never had that directory). `push` already
+# spells this --mkdir.
+( cmd_fetch "$D/fresh/sub/got.csv" "cat $REMOTE_DIR/one.csv" ) 2>"$E18"; rc=$?
+chk "18j1 a missing destination directory still fails, and the message now names --mkdir" \
+    "$([ "$rc" = 1 ] && [ ! -d "$D/fresh" ] && grep -q -- '--mkdir' "$E18" && echo 0 || echo 1)" "rc=$rc"
+cmd_fetch --mkdir "$D/fresh/sub/got.csv" "cat $REMOTE_DIR/one.csv" 2>"$E18"; rc=$?
+chk "18j2 --mkdir creates the tree and delivers the verified payload" \
+    "$([ "$rc" = 0 ] && cmp -s "$REMOTE_DIR/one.csv" "$D/fresh/sub/got.csv" && echo 0 || echo 1)" "rc=$rc"
+( cmd_fetch "$D/flag-after2.csv" "cat $REMOTE_DIR/one.csv" --mkdir ) 2>"$E18"; rc=$?
+chk "18j3 --mkdir after the command is refused, like the other flags" \
+    "$([ "$rc" = 1 ] && grep -q 'Options go first' "$E18" && [ ! -e "$D/flag-after2.csv" ] && echo 0 || echo 1)" "rc=$rc"
+
+_ssh() { sh -c "$1"; }
+
 # ── push: the INPUT side, and it is a different incident ─────────────────────
 # `base64 < local | rt exec 'base64 -d > remote'` delivered an EMPTY stdin stream 2 of 3 times.
 # base64 -d succeeded on zero bytes, wrote a 0-byte file, exited 0 — a 0-byte script "deployed"

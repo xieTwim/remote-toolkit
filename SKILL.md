@@ -218,6 +218,7 @@ rt -p host/proj fetch one.csv  'cat /data/runs/one.csv'            # an existing
 rt -p host/proj fetch --no-flush one.csv 'cat /data/runs/one.csv'  # use remote files as they stand
 rt -p host/proj push ./patched.py scripts/patched.py               # local -> remote
 rt -p host/proj push --mkdir ./patched.py runs/new/patched.py      # ... creating runs/new/ there
+rt -p host/proj fetch --mkdir new/dir/one.csv 'cat /data/one.csv'  # ... creating new/dir/ here
 rt -p host/proj fetch --detached counts.txt 'find runs -name done.json | wc -l'   # slow command, or a link that drops
 ```
 

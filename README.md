@@ -101,6 +101,7 @@ rt -p hpc/train push --mkdir ./patched.py runs/new/patched.py   # create runs/ne
 rt -p hpc/train fetch one.csv 'cat /data/runs/one.csv'          # local path first, then a remote command
 rt -p hpc/train fetch --detached n.txt 'find runs -name "*.json" | wc -l'   # a slow command, or a link that drops
 rt -p hpc/train fetch --no-flush one.csv 'cat /data/runs/one.csv'
+rt -p hpc/train fetch --mkdir new/dir/one.csv 'cat /data/runs/one.csv'   # create the local directory too
 ```
 
 `push` bypasses Mutagen. `fetch` flushes sync first by default; `--no-flush` skips the Mutagen
