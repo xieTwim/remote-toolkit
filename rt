@@ -687,6 +687,12 @@ _require_ssh() {
   _ssh_test && return 0
   sleep "${RT_SSH_RETRY_WAIT:-3}"
   _ssh_test && return 0
+  # A Colab runtime takes one ssh connection, and a client that vanished (sleep, a network drop)
+  # leaves the runtime holding it, so every new connection is refused until that session ends.
+  if [[ -f "${RT_HOME}/${RT_HOST_GROUP}/colab.meta" ]]; then
+    _colab_heal_slot "${RT_HOST_GROUP#colab-}" && _ssh_test && return 0
+    die "[$RT_PROFILE] Cannot reach Colab runtime '${RT_HOST_GROUP#colab-}' over ssh: $(tail -n 1 "${RT_HOME}/${RT_HOST_GROUP}/proxy.log" 2>/dev/null) 'rt colab ls' shows whether it still exists."
+  fi
   die "[$RT_PROFILE] Cannot reach $REMOTE_HOST over ssh (two attempts, ${RT_SSH_RETRY_WAIT:-3}s apart). This is the ssh link, not the sync session. A host that answered a minute ago is usually back in a minute: retry. For a host never reached from here, 'ssh $REMOTE_HOST' shows the real error and 'rt -p $RT_PROFILE connect' sets the profile up."
 }
 
@@ -2820,6 +2826,505 @@ _slurm_logs() {
   fi
 }
 
+# ── Colab runtimes (`rt colab ...`) ────────────────────────────────────────────
+#
+# A Google Colab runtime is an ephemeral VM reached through the official google-colab-cli. Its
+# `colab ssh --proxy-mode` carries ssh over a WebSocket, so an ssh alias whose ProxyCommand is
+# that bridge turns the runtime into an ordinary REMOTE_HOST, and every rt verb (exec, exec --bg,
+# logs, push, fetch) works on it unchanged. `rt colab` adds only the lifecycle — create, release,
+# list — and the safeguards that keep a runtime from billing unseen. Measured 2026-11-23 against
+# google-colab-cli 0.8.0:
+#
+#   * `colab ssh --proxy-mode -s NAME`, the form the CLI documents for ~/.ssh/config, CREATES a
+#     billable runtime whenever NAME is missing from its local session record, so once a runtime
+#     is gone, a single automatic reconnect opens a new one. The alias written here passes the
+#     hidden `--colab-internal-mode cmd`, the path the CLI's own `colab ssh -- CMD` takes, which
+#     only resolves an existing session: a released runtime answers 404 and nothing is created.
+#     A hidden option can change in any release, so `_colab_canary` re-checks the property
+#     offline, with the network cut, before every create.
+#   * A runtime accepts ONE ssh connection; a second is refused with HTTP 429. The alias
+#     multiplexes everything over one ControlMaster connection, closed after 15 idle minutes. A
+#     client that vanishes (sleep, a network drop) leaves the runtime holding the slot, and the next
+#     connection is refused until that session ends: `_colab_heal_slot` ends it through the kernel.
+#   * A runtime does NOT need a connection to live: with none at all, a detached process and a
+#     running kernel cell both kept going for 91 minutes, when the test stopped (the CLI
+#     maintainers say otherwise in issue #160). So nothing stops a forgotten runtime from billing
+#     except release. A watchdog on the VM releases it itself — POST
+#     http://$TBE_RUNTIME_ADDR/unassign, the endpoint behind google.colab.runtime.unassign();
+#     billing stopped within a second when measured — at its deadline or once it has been idle.
+
+RT_COLAB_TESTED_VERSIONS="0.8.0"
+
+_colab_common_paths() {
+  COLAB_ALIAS_DIR="${RT_COLAB_SSH_DIR:-$HOME/.ssh/rt-colab.d}"
+  COLAB_KEY="${RT_COLAB_KEY:-$HOME/.ssh/rt_colab_ed25519}"
+  COLAB_SSH_CONFIG="${RT_SSH_CONFIG:-$HOME/.ssh/config}"
+  # An empty session record, so `colab sessions` lists every runtime on the account as unknown.
+  COLAB_LIST_JSON="${RT_HOME}/.rt/_colab/empty-sessions.json"
+}
+
+_colab_paths() {   # <name>
+  _colab_common_paths
+  COLAB_NAME="$1"
+  COLAB_GROUP="colab-$1"
+  COLAB_DIR="${RT_HOME}/${COLAB_GROUP}"
+  COLAB_JSON="${COLAB_DIR}/colab-session.json"   # the colab CLI's own record, this runtime only
+  COLAB_META="${COLAB_DIR}/colab.meta"           # not *.conf, so it is never read as a profile
+  COLAB_PROXY_LOG="${COLAB_DIR}/proxy.log"
+  COLAB_ALIAS="${COLAB_ALIAS_DIR}/${COLAB_GROUP}.conf"
+}
+
+_colab_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9](-?[a-zA-Z0-9])*$ && ${#1} -le 26 ]] \
+    || die "Invalid runtime name '$1': letters and digits with single dashes between them, at most 26 characters (it becomes host group colab-$1)."
+}
+
+_colab_bin() {   # absolute path of the colab CLI
+  local b="${RT_COLAB_BIN:-}"
+  [[ -n "$b" ]] || b=$(command -v colab 2>/dev/null || true)
+  [[ -n "$b" && -x "$b" ]] \
+    || die "colab CLI not found. Install the official one: uv tool install --python 3.12 'google-colab-cli==0.8.0' — then run 'rt colab setup'."
+  # ssh runs a ProxyCommand in a non-login shell, so the path must be absolute.
+  [[ "$b" == /* ]] || b="$(cd "$(dirname "$b")" && pwd)/$(basename "$b")"
+  printf '%s' "$b"
+}
+
+_colab_ssh() { ssh -o BatchMode=yes "$@"; }   # one seam, so the tests can stand in for ssh
+
+_colab_fmt_time() { date -r "$1" '+%F %H:%M' 2>/dev/null || date -d "@$1" '+%F %H:%M'; }
+
+# The bridge must never create a runtime. With every proxy variable pointed at a dead port, so no
+# request can leave this machine, the exact ProxyCommand form must exit 2 with "not found" and
+# write nothing to stdout (stdout is the ssh byte stream).
+_colab_canary() {   # <colab-bin>
+  local bin="$1" tmp rc=0 out err dead="http://127.0.0.1:9"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/rt-colab-canary.XXXXXX")
+  : > "$tmp/s.json"
+  out=$(env -u NO_PROXY -u no_proxy HTTPS_PROXY="$dead" HTTP_PROXY="$dead" ALL_PROXY="$dead" \
+          https_proxy="$dead" http_proxy="$dead" all_proxy="$dead" \
+          "$bin" --config "$tmp/s.json" ssh --proxy-mode --colab-internal-mode cmd \
+          -s rt-canary -i "${COLAB_KEY}.pub" </dev/null 2>"$tmp/err") || rc=$?
+  err=$(cat "$tmp/err" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ $rc -eq 2 && -z "$out" && "$err" == *"not found"* ]] && return 0
+  warn "colab CLI canary: exit $rc, ${#out} bytes on stdout, stderr: ${err:0:300}"
+  return 1
+}
+
+_colab_include_line() { printf 'Include %s/*.conf' "$COLAB_ALIAS_DIR"; }
+
+# Only an Include above the first Host/Match block applies to every host.
+_colab_include_present() {
+  local want tilde=""
+  [[ -f "$COLAB_SSH_CONFIG" ]] || return 1
+  want=$(_colab_include_line)
+  [[ "$COLAB_ALIAS_DIR" == "$HOME"/* ]] && tilde="Include ~${COLAB_ALIAS_DIR#"$HOME"}/*.conf"
+  awk -v a="$want" -v b="$tilde" '
+    /^[[:space:]]*(Host|Match)[[:space:]]/ { exit }
+    { sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); if ($0 == a || (b != "" && $0 == b)) { found = 1; exit } }
+    END { exit !found }' "$COLAB_SSH_CONFIG"
+}
+
+_colab_require_setup() {   # <colab-bin>
+  [[ -f "$COLAB_KEY" && -f "${COLAB_KEY}.pub" ]] || die "No Colab ssh key at $COLAB_KEY. Run 'rt colab setup'."
+  _colab_include_present || die "$COLAB_SSH_CONFIG does not include $COLAB_ALIAS_DIR/*.conf above its first Host block. Run 'rt colab setup'."
+  _colab_canary "$1" \
+    || die "The installed colab CLI may create a runtime from the ssh bridge, so a reconnect could open billable runtimes unseen. Refusing. Pin google-colab-cli==${RT_COLAB_TESTED_VERSIONS%% *} or update rt."
+}
+
+_colab_usage_summary() {   # <colab-bin>: balance, rate and runtime count on one line
+  local u
+  u=$("$1" usage </dev/null 2>&1) || return 1
+  awk -F': ' '/^Current balance/ {b=$2} /^Usage rate/ {r=$2} /^Active assignments/ {n=$2}
+    END { if (b == "") exit 1; printf "balance %s, rate %s, %s runtime(s) on the account", b, r, n }' <<<"$u"
+}
+
+_colab_account_list() {   # <colab-bin>: "<endpoint> <hardware> <shape>" per runtime on the account
+  local out
+  mkdir -p "$(dirname "$COLAB_LIST_JSON")"
+  [[ -e "$COLAB_LIST_JSON" ]] || { : > "$COLAB_LIST_JSON"; chmod 600 "$COLAB_LIST_JSON"; }
+  out=$("$1" --config "$COLAB_LIST_JSON" sessions </dev/null 2>&1) || return 1
+  if grep -q 'No active sessions found' <<<"$out"; then
+    # The CLI prints this ALSO when it could not authenticate — with no local session it maps that
+    # failure to an empty list — and a network drop read as "every runtime gone" on 2026-11-23. An
+    # empty answer counts only when `colab usage`, which fails loudly, reports zero as well.
+    [[ "$("$1" usage </dev/null 2>/dev/null | sed -n 's/^Active assignments: *\([0-9][0-9]*\).*/\1/p')" == 0 ]]
+    return
+  fi
+  grep -q 'Hardware:' <<<"$out" || return 1
+  sed -n 's/^\[[^]]*\] \([^ ]*\) | Hardware: \([^|]*\)| Shape: \([^|]*\)|.*/\1 \2 \3/p' <<<"$out" \
+    | tr -s ' ' | sed 's/ $//'
+}
+
+_colab_json_endpoint() {   # the endpoint in this runtime's session record, or nothing
+  [[ -s "$COLAB_JSON" ]] || return 0
+  sed -n 's/^[[:space:]]*"endpoint":[[:space:]]*"\([^"]*\)".*/\1/p' "$COLAB_JSON" | head -n 1
+}
+
+_colab_check_paths() {   # <colab-bin>: everything the alias will name, checked before anything bills
+  local p
+  for p in "$1" "$COLAB_JSON" "$COLAB_KEY" "$COLAB_PROXY_LOG" "$COLAB_ALIAS"; do
+    [[ "$p" != *[[:space:]\'\"\\]* ]] || die "A path with a space or quote cannot go into the ssh alias safely: $p"
+  done
+}
+
+_colab_write_alias() {   # <colab-bin>
+  mkdir -p "$COLAB_ALIAS_DIR"; chmod 700 "$COLAB_ALIAS_DIR"
+  cat > "$COLAB_ALIAS" <<EOF
+# Colab runtime '${COLAB_NAME}': written by 'rt colab up', removed by 'rt colab down ${COLAB_NAME}'.
+# The bridge only connects to this existing runtime and never creates one. Host keys are new on
+# every runtime; the far end is authenticated by the TLS WebSocket to Google and the runtime token.
+Host ${COLAB_GROUP}
+  HostName ${COLAB_GROUP}
+  User root
+  ProxyCommand $1 --config ${COLAB_JSON} ssh --proxy-mode --colab-internal-mode cmd -s ${COLAB_NAME} -i ${COLAB_KEY}.pub 2>>${COLAB_PROXY_LOG}
+  IdentityFile ${COLAB_KEY}
+  IdentitiesOnly yes
+  ForwardAgent no
+  ForwardX11 no
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 15m
+  ServerAliveInterval 30
+  ServerAliveCountMax 4
+EOF
+  chmod 600 "$COLAB_ALIAS"
+}
+
+# Runs on the VM, from its own file. Releases the runtime when the deadline passes, or after
+# idle_minutes in which nothing was busy: no rt background job (a tmux session rt_*), no command
+# running over ssh, and less than half a core of CPU (an idle runtime spends about 0.16 of a core
+# on Colab's own processes).
+_colab_watchdog_script() {
+  cat <<'WATCHDOG'
+#!/bin/bash
+d=/root/.rt_colab
+echo $$ > "$d/watchdog.pid"
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$d/watchdog.log"; }
+tbe_addr() {
+  local p a
+  for p in 1 $(pgrep -f 'colab-fileshim|jupyter-server|kernel_manager_proxy'); do
+    a=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^TBE_RUNTIME_ADDR=//p' | head -n 1)
+    [ -n "$a" ] && { printf '%s' "$a"; return 0; }
+  done
+  return 1
+}
+cpu_jiffies() { awk '/^cpu / {print $2+$3+$4+$7+$8+$9}' /proc/stat; }
+busy() {   # <cpu jiffies used in the last interval> <threshold>
+  tmux ls -F '#{session_name}' 2>/dev/null | grep -q '^rt_' && return 0
+  local s
+  for s in $(pgrep -f '^sshd(-session)?: root@'); do pgrep -P "$s" >/dev/null && return 0; done
+  [ "$1" -ge "$2" ]
+}
+release() {
+  local a
+  log "releasing: $1"
+  a=$(tbe_addr) || { log "TBE_RUNTIME_ADDR not found, cannot release"; return; }
+  curl -sS -m 20 -X POST -o /dev/null -w 'unassign http %{http_code}\n' "http://$a/unassign" >> "$d/watchdog.log" 2>&1
+}
+# A watchdog that could not release would only look like a safeguard: stop, so `up` sees it gone.
+a=$(tbe_addr) || { log "TBE_RUNTIME_ADDR not found, so this runtime cannot be released from here: exiting"; rm -f "$d/watchdog.pid"; exit 3; }
+hz=$(getconf CLK_TCK); last=$(date +%s); prev=$(cpu_jiffies)
+log "started: deadline $(cat "$d/deadline"), idle limit $(cat "$d/idle_minutes") min, release endpoint $a"
+while sleep 60; do
+  now=$(date +%s); cur=$(cpu_jiffies); used=$((cur - prev)); prev=$cur
+  busy "$used" $((30 * hz)) && last=$now
+  deadline=$(cat "$d/deadline" 2>/dev/null || echo 0)
+  idle=$(cat "$d/idle_minutes" 2>/dev/null || echo 20)
+  if [ "$deadline" -gt 0 ] && [ "$now" -ge "$deadline" ]; then release "deadline reached"; sleep 120; continue; fi
+  if [ $((now - last)) -ge $((idle * 60)) ]; then release "idle for $idle min"; sleep 120; fi
+done
+WATCHDOG
+}
+
+# Installs and (re)starts the watchdog, then prints the digest of the file it runs. Sent as one
+# base64 word, so no process's argv carries a pattern that a pgrep on the VM could match.
+_colab_bootstrap_script() {   # <deadline-epoch> <idle-minutes>
+  printf 'set -e\nd=/root/.rt_colab\nmkdir -p /content/work "$d"\n'
+  printf "cat > \"\$d/watchdog.sh\" <<'RT_COLAB_WATCHDOG'\n"
+  _colab_watchdog_script
+  printf 'RT_COLAB_WATCHDOG\n'
+  cat <<BOOT
+chmod 700 "\$d/watchdog.sh"
+printf '%s\n' $1 > "\$d/deadline"
+printf '%s\n' $2 > "\$d/idle_minutes"
+if [ -f "\$d/watchdog.pid" ]; then kill "\$(cat "\$d/watchdog.pid")" 2>/dev/null || true; rm -f "\$d/watchdog.pid"; fi
+setsid nohup bash "\$d/watchdog.sh" >/dev/null 2>&1 </dev/null &
+sleep 2
+[ -f "\$d/watchdog.pid" ] && kill -0 "\$(cat "\$d/watchdog.pid")" 2>/dev/null || { echo WATCHDOG_NOT_RUNNING; exit 3; }
+sha256sum "\$d/watchdog.sh" | cut -d' ' -f1
+BOOT
+}
+
+_colab_install_watchdog() {   # <deadline-epoch> <idle-minutes>
+  local b64 want got
+  b64=$(_colab_bootstrap_script "$1" "$2" | base64 | tr -d '\n')
+  want=$(_colab_watchdog_script | _sha256_file /dev/stdin)
+  got=$(_colab_ssh "$COLAB_GROUP" "printf %s '$b64' | base64 -d | bash" </dev/null) || { warn "watchdog install: ${got:-no output}"; return 1; }
+  [[ "$got" == "$want" ]] || { warn "watchdog on the VM has digest '${got}', expected '${want}'"; return 1; }
+}
+
+# Stop the runtime, confirm it left the account, then drop every local trace of it. Files stay
+# when the runtime may still be there, so the next try still knows what to release.
+_colab_release_and_forget() {   # <colab-bin>
+  local bin="$1" ep="${COLAB_ENDPOINT:-}" list i gone=0 on=1
+  [[ -n "$ep" ]] || ep=$(_colab_json_endpoint)
+  # Already released (its watchdog, Colab, or the web UI): asking to stop it only fails with 404.
+  if [[ -n "$ep" ]] && list=$(_colab_account_list "$bin") && ! grep -qF "$ep" <<<"$list"; then on=0; fi
+  if [[ $on == 1 && -n "$(_colab_json_endpoint)" ]]; then
+    "$bin" --config "$COLAB_JSON" stop -s "$COLAB_NAME" </dev/null >&2 \
+      || warn "'colab stop' reported an error; checking the account list."
+  fi
+  ssh -O exit "$COLAB_GROUP" >/dev/null 2>&1 || true
+  if [[ -n "$ep" ]]; then
+    for i in 1 2 3 4 5 6; do
+      if list=$(_colab_account_list "$bin"); then
+        grep -qF "$ep" <<<"$list" || { gone=1; break; }
+      fi
+      sleep "${RT_COLAB_POLL_WAIT:-5}"
+    done
+    if [[ $gone != 1 ]]; then
+      warn "Runtime $ep is still on the account after 'colab stop'; its files are kept. Retry 'rt colab down $COLAB_NAME'."
+      return 1
+    fi
+  fi
+  rm -f "$COLAB_ALIAS"
+  rm -rf "$COLAB_DIR" "${RT_HOME}/.rt/${COLAB_GROUP}"
+}
+
+_colab_setup() {
+  _colab_common_paths
+  local bin ver u
+  bin=$(_colab_bin)
+  ver=$("$bin" version 2>/dev/null | sed -n 's/^Version: //p' | head -n 1)
+  info "colab CLI: $bin (version ${ver:-unknown})"
+  [[ " $RT_COLAB_TESTED_VERSIONS " == *" $ver "* ]] \
+    || warn "rt colab was measured against google-colab-cli $RT_COLAB_TESTED_VERSIONS; the canary below decides whether this one is safe."
+  if [[ ! -f "$COLAB_KEY" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -C rt-colab -f "$COLAB_KEY" </dev/null || die "ssh-keygen failed"
+    info "Created $COLAB_KEY (ed25519: Colab rejects RSA keys). Only its public half is sent to Colab."
+  fi
+  mkdir -p "$COLAB_ALIAS_DIR"; chmod 700 "$COLAB_ALIAS_DIR"
+  if ! _colab_include_present; then
+    if [[ -f "$COLAB_SSH_CONFIG" ]]; then cp -p "$COLAB_SSH_CONFIG" "$COLAB_SSH_CONFIG.bak-rt-colab-$(date +%Y%m%d%H%M%S)"; fi
+    { _colab_include_line; printf '\n'; [[ -f "$COLAB_SSH_CONFIG" ]] && cat "$COLAB_SSH_CONFIG"; } > "$COLAB_SSH_CONFIG.rt-colab-tmp"
+    chmod 600 "$COLAB_SSH_CONFIG.rt-colab-tmp"
+    mv "$COLAB_SSH_CONFIG.rt-colab-tmp" "$COLAB_SSH_CONFIG"
+    info "Added '$(_colab_include_line)' as the first line of $COLAB_SSH_CONFIG (a backup is beside it)."
+  fi
+  _colab_canary "$bin" \
+    || die "Canary failed: this colab CLI may create a runtime from the ssh bridge. Pin google-colab-cli==${RT_COLAB_TESTED_VERSIONS%% *}."
+  info "Canary passed: the ssh bridge refuses to create a runtime."
+  if u=$(_colab_usage_summary "$bin"); then
+    info "Signed in: $u"
+  else
+    warn "Not signed in, or Colab is unreachable. Sign in once in a terminal with 'colab usage': it prints a link, you approve every scope and paste back the code."
+  fi
+}
+
+_colab_up() {
+  local name="" hours=4 idle="" accel="" hm="" hw bin before after ep now deadline
+  local -a new_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --high-mem)      new_args+=(--high-mem); hm=" high-mem"; shift ;;
+      --gpu|--tpu)     [[ $# -ge 2 ]] || die "$1 needs a value"
+                       [[ -z "$accel" ]] || die "One accelerator only."
+                       new_args+=("$1" "$2"); accel="$(printf '%s' "${1#--}" | tr 'a-z' 'A-Z') $2"; shift 2 ;;
+      --hours)         [[ $# -ge 2 ]] || die "--hours needs a value"; hours="$2"; shift 2 ;;
+      --idle-minutes)  [[ $# -ge 2 ]] || die "--idle-minutes needs a value"; idle="$2"; shift 2 ;;
+      -*)              die "Unknown option for 'rt colab up': $1" ;;
+      *)               [[ -z "$name" ]] || die "One runtime name only (got '$name' and '$1')."
+                       name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "Usage: rt colab up NAME [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M]"
+  _colab_name "$name"
+  _colab_paths "$name"
+  hw="${accel:-CPU}${hm}"
+  [[ "$hours" =~ ^[0-9]+$ ]] && hours=$((10#$hours)) && (( hours >= 1 && hours <= 24 )) \
+    || die "--hours must be a whole number from 1 to 24 (Colab ends a runtime at 24 h anyway)."
+  # An accelerator bills many times a CPU runtime, so its idle tail is cut shorter by default.
+  [[ -n "$idle" ]] || { [[ -n "$accel" ]] && idle=10 || idle=20; }
+  [[ "$idle" =~ ^[0-9]+$ ]] && idle=$((10#$idle)) && (( idle >= 5 && idle <= 600 )) \
+    || die "--idle-minutes must be a whole number from 5 to 600."
+  [[ ! -e "$COLAB_DIR" ]] || die "Host group $COLAB_GROUP already exists. 'rt colab ls' shows it; 'rt colab down $name' releases it."
+  bin=$(_colab_bin)
+  _colab_check_paths "$bin"
+  _colab_require_setup "$bin"
+  before=$(_colab_usage_summary "$bin") \
+    || die "'colab usage' failed: not signed in, or Colab is unreachable. Sign in once in a terminal with 'colab usage'."
+  info "Account before: $before"
+
+  mkdir -p "$COLAB_DIR"; chmod 700 "$COLAB_DIR"
+  info "Creating Colab runtime '$name' ($hw) ..."
+  if ! "$bin" --config "$COLAB_JSON" new -s "$name" ${new_args[@]+"${new_args[@]}"} </dev/null >&2; then
+    rm -rf "$COLAB_DIR"
+    die "'colab new' failed. If it got as far as an assignment, 'rt colab ls' lists it as not ours, for 'colab stop' by hand."
+  fi
+  ep=$(_colab_json_endpoint)
+  if [[ -z "$ep" ]]; then
+    "$bin" --config "$COLAB_JSON" stop -s "$name" </dev/null >&2 || true
+    rm -rf "$COLAB_DIR"
+    die "'colab new' left no endpoint in $COLAB_JSON, so rt cannot track the runtime; asked Colab to stop it. Check 'rt colab ls'."
+  fi
+  # From here until the watchdog runs, ANY exit releases the runtime: rt never leaves one billing
+  # without its watchdog. (A global, because the trap may run after this function's locals.)
+  COLAB_RELEASE_BIN="$bin"
+  trap '_colab_release_and_forget "$COLAB_RELEASE_BIN" || true' EXIT
+  now=$(date +%s); deadline=$(( now + hours * 3600 ))
+  {
+    printf 'COLAB_ENDPOINT=%q\nCOLAB_HARDWARE=%q\n' "$ep" "$hw"
+    printf 'COLAB_CREATED=%s\nCOLAB_DEADLINE=%s\nCOLAB_IDLE_MINUTES=%s\n' "$now" "$deadline" "$idle"
+  } > "$COLAB_META"
+  COLAB_ENDPOINT="$ep"
+  printf '# Colab runtime %s (%s): written by rt colab up; rt colab down %s releases it.\nREMOTE_HOST="%s"\n' \
+    "$name" "$hw" "$name" "$COLAB_GROUP" > "$COLAB_DIR/host.conf"
+  printf 'REMOTE_DIR="/content/work"\n' > "$COLAB_DIR/work.conf"
+  _colab_write_alias "$bin"
+
+  # The first connection becomes the master: the one ssh connection the runtime allows.
+  if ! _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" true </dev/null; then
+    warn "ssh to the new runtime failed: $(tail -n 3 "$COLAB_PROXY_LOG" 2>/dev/null | tr '\n' ' ')"
+    die "Releasing '$name' so that it does not bill unused."
+  fi
+  _colab_install_watchdog "$deadline" "$idle" \
+    || die "The watchdog did not start, so '$name' is being released: rt never leaves a runtime up without one."
+  trap - EXIT
+  after=$(_colab_usage_summary "$bin" || echo "unknown")
+  info "Runtime '$name' is up ($hw, endpoint $ep). Account now: $after"
+  info "  Profile $COLAB_GROUP/work, REMOTE_DIR /content/work, no sync: move files with rt push / rt fetch."
+  info "    rt -p $COLAB_GROUP/work exec 'nproc'"
+  info "  It releases itself at $(_colab_fmt_time "$deadline") or after $idle idle minutes; 'rt colab down $name' releases it now."
+  info "  Its disk goes with it: fetch results before that."
+}
+
+_colab_down() {
+  local bin
+  [[ $# -eq 1 ]] || die "Usage: rt colab down NAME"
+  _colab_name "$1"
+  _colab_paths "$1"
+  [[ -d "$COLAB_DIR" ]] || die "No runtime '$1' recorded here ('rt colab ls' lists them)."
+  COLAB_ENDPOINT=""
+  # shellcheck source=/dev/null
+  [[ -f "$COLAB_META" ]] && . "$COLAB_META"
+  bin=$(_colab_bin)
+  _colab_release_and_forget "$bin" || exit 1
+  info "Released '$1' (${COLAB_ENDPOINT:-endpoint unknown}); its ssh alias and rt profile are gone. Account: $(_colab_usage_summary "$bin" || echo unknown)"
+}
+
+_colab_ls() {
+  local bin list meta g ep hw dl state master ours=" " any=0 rest gone_names=""
+  _colab_common_paths
+  bin=$(_colab_bin)
+  list=$(_colab_account_list "$bin") || die "Could not list the account's runtimes: not signed in, or Colab is unreachable."
+  printf '%-22s %-28s %-16s %-9s %-7s %s\n' RUNTIME ENDPOINT HARDWARE ACCOUNT MASTER RELEASES-ITSELF-BY
+  for meta in "$RT_HOME"/colab-*/colab.meta; do
+    [[ -f "$meta" ]] || continue
+    any=1
+    g=$(basename "$(dirname "$meta")")
+    ep=$(COLAB_ENDPOINT=""; . "$meta"; printf '%s' "$COLAB_ENDPOINT")
+    hw=$(COLAB_HARDWARE="?"; . "$meta"; printf '%s' "$COLAB_HARDWARE")
+    dl=$(COLAB_DEADLINE=0; . "$meta"; printf '%s' "$COLAB_DEADLINE")
+    state=gone
+    [[ -n "$ep" ]] && grep -qF "$ep" <<<"$list" && state=assigned
+    master=down
+    ssh -O check "$g" >/dev/null 2>&1 && master=up
+    printf '%-22s %-28s %-16s %-9s %-7s %s\n' "${g#colab-}" "${ep:-?}" "$hw" "$state" "$master" "$(_colab_fmt_time "$dl")"
+    [[ $state == gone ]] && gone_names+=" ${g#colab-}"
+    ours+="$ep "
+  done
+  [[ $any == 1 ]] || printf '(no runtime created by rt on this machine)\n'
+  [[ -z "$gone_names" ]] || printf 'gone:%s — released already (watchdog, Colab or the web UI); rt colab down NAME clears the record\n' "$gone_names"
+  while read -r ep rest; do
+    [[ -n "$ep" && "$ours" != *" $ep "* ]] || continue
+    printf 'not ours: %s (%s) — another machine on this account, the web UI, or a lost record; left alone\n' "$ep" "$rest"
+  done <<<"$list"
+  info "Account: $(_colab_usage_summary "$bin" || echo unknown)"
+}
+
+# A client that vanished without closing (sleep, a network drop through the proxy — twice in one
+# evening on 2026-11-23) leaves its sshd behind, and that sshd holds the only slot: every new
+# connection gets 429. The kernel is reached without ssh, so it can end that session; the slot was
+# free again 33 s later when measured.
+_colab_end_stale_ssh() {   # <colab-bin>
+  "$1" --config "$COLAB_JSON" exec -s "$COLAB_NAME" >&2 <<'PY'
+import os, signal, subprocess
+pids = subprocess.run(["pgrep", "-f", "^sshd(-session)?: root@"], capture_output=True, text=True).stdout.split()
+for p in pids:
+    try:
+        os.kill(int(p), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+print("ended ssh connections:", " ".join(pids) or "none")
+PY
+}
+
+# Open a fresh connection (it becomes the master); if the runtime refuses it because a vanished
+# session holds the slot, end that session through the kernel and wait for the slot. 0 = connected.
+_colab_heal_slot() {   # <name>
+  local bin mark i
+  _colab_paths "$1"
+  touch "$COLAB_PROXY_LOG"
+  mark=$(wc -l < "$COLAB_PROXY_LOG" | tr -d ' ')
+  _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" true </dev/null 2>/dev/null && return 0
+  tail -n +"$((mark + 1))" "$COLAB_PROXY_LOG" | grep -q 'HTTP 429' || return 1
+  bin=$(_colab_bin) || return 1
+  info "[$COLAB_GROUP] A vanished earlier connection still holds the runtime's only ssh slot; ending it through the Colab kernel and waiting for the slot (about 30 s) ..."
+  _colab_end_stale_ssh "$bin" >>"$COLAB_PROXY_LOG" 2>&1 || true
+  for i in $(seq 1 "${RT_COLAB_SLOT_TRIES:-18}"); do
+    sleep "${RT_COLAB_SLOT_WAIT:-5}"
+    _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" true </dev/null 2>/dev/null && return 0
+  done
+  return 1
+}
+
+_colab_reconnect() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: rt colab reconnect NAME"
+  _colab_name "$name"
+  _colab_paths "$name"
+  [[ -d "$COLAB_DIR" ]] || die "No runtime '$name' recorded here ('rt colab ls' lists them)."
+  if ssh -O check "$COLAB_GROUP" >/dev/null 2>&1; then info "The connection to '$name' is up."; return 0; fi
+  _colab_heal_slot "$name" \
+    || die "Could not reconnect to '$name': $(tail -n 1 "$COLAB_PROXY_LOG" 2>/dev/null) 'rt colab ls' shows whether it still exists."
+  info "Reconnected to '$name'."
+}
+
+_colab_extend() {
+  local name="${1:-}" hours="" deadline
+  [[ "${2:-}" == --hours ]] && hours="${3:-}"
+  [[ -n "$name" && "$hours" =~ ^[0-9]+$ ]] && (( hours >= 1 && hours <= 24 )) \
+    || die "Usage: rt colab extend NAME --hours H   (1-24, counted from now; Colab's own 24 h limit still counts from creation)"
+  _colab_name "$name"
+  _colab_paths "$name"
+  [[ -f "$COLAB_META" ]] || die "No runtime '$name' recorded here ('rt colab ls' lists them)."
+  deadline=$(( $(date +%s) + hours * 3600 ))
+  _colab_ssh "$COLAB_GROUP" "printf '%s\n' $deadline > /root/.rt_colab/deadline" </dev/null \
+    || die "Could not reach '$name' to move its deadline ('rt colab reconnect $name' first?)."
+  sed -i.bak "s/^COLAB_DEADLINE=.*/COLAB_DEADLINE=$deadline/" "$COLAB_META" && rm -f "$COLAB_META.bak"
+  info "'$name' now releases itself at $(_colab_fmt_time "$deadline")."
+}
+
+cmd_colab() {
+  local sub="${1:-}" bin
+  shift || true
+  case "$sub" in
+    setup)      _colab_setup "$@" ;;
+    up)         _colab_up "$@" ;;
+    down)       _colab_down "$@" ;;
+    ls|list)    _colab_ls "$@" ;;
+    usage)      _colab_common_paths; bin=$(_colab_bin); "$bin" usage ;;
+    reconnect)  _colab_reconnect "$@" ;;
+    extend)     _colab_extend "$@" ;;
+    ""|help)    _sub_help colab ;;
+    *)          die "Unknown command: rt colab $sub. Use setup, up, down, ls, usage, reconnect or extend." ;;
+  esac
+}
+
 cmd_help() {
   cat <<HELP
 Remote Toolkit — Drive remote servers from Claude Code
@@ -2898,6 +3403,23 @@ COMMANDS:
   slurm logs           List recent submissions for this profile
   slurm logs <id> [-f] [--err]
                        Cat or tail slurm-<id>.out (--err for .err)
+  colab setup          One-time, for Google Colab runtimes: an ed25519 key, an
+                       Include line in ~/.ssh/config, and the canary proving the
+                       installed colab CLI cannot create a runtime from ssh
+  colab up NAME [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M]
+                       Create a Colab runtime and make it profile colab-NAME/work
+                       (REMOTE_DIR /content/work; no sync: use push and fetch).
+                       One ssh connection per runtime, shared by every rt call.
+                       It keeps running with no connection at all, so nothing but
+                       release stops it billing: a watchdog on the VM releases it
+                       after H hours (default 4) or M idle minutes (default 20;
+                       10 with an accelerator).
+  colab down NAME      Release it, confirm it left the account, drop its profile
+  colab ls             Runtimes made here, then any other on the account (untouched)
+  colab usage          Compute-unit balance and the account's hourly rate
+  colab reconnect NAME Re-open the connection, freeing a slot a vanished one holds
+  colab extend NAME --hours H
+                       Move the self-release deadline to H hours from now
   help                 Show this help
   help <command>       Help for one command (also: rt <command> --help)
 
@@ -2924,6 +3446,9 @@ EXAMPLES:
 
 ENVIRONMENT:
   RT_HOME              Config & state directory (default: ~/.config/remote-toolkit)
+  RT_COLAB_BIN         colab CLI (default: \`command -v colab\`)
+  RT_COLAB_SSH_DIR     where rt colab writes ssh aliases (default: ~/.ssh/rt-colab.d)
+  RT_COLAB_KEY         ssh key for Colab runtimes (default: ~/.ssh/rt_colab_ed25519)
 
 CONFIG LAYOUT (in \$RT_HOME):
   <host>/host.conf        Host-level config (shared by all profiles in the group)
@@ -2963,7 +3488,9 @@ _sub_help() {
     on && index($0, "  " s) == 1 && (length($0) == length(s) + 2 || substr($0, length(s) + 3, 1) == " ") { p = 1; print; next }
     on && p && /^                   / { print; next }
     on { p = 0 }')"
-  if [[ -n "$text" ]]; then printf 'Usage: rt -p HOST/PROFILE %s ...\n%s\n' "$1" "$text"; else cmd_help; fi
+  local pfx="-p HOST/PROFILE "
+  [[ "$1" == colab ]] && pfx=""   # its verbs name a runtime, not a profile
+  if [[ -n "$text" ]]; then printf 'Usage: rt %s%s ...\n%s\n' "$pfx" "$1" "$text"; else cmd_help; fi
 }
 
 main() {
@@ -3025,6 +3552,7 @@ main() {
     sync)          cmd_sync "$@" ;;
     verify)        cmd_verify "$@" ;;
     slurm)         cmd_slurm "$@" ;;
+    colab)         cmd_colab "$@" ;;
     flush)         cmd_sync flush "$@" ;;
     help|--help|-h) if [[ -n "${1:-}" ]]; then _sub_help "$1"; else cmd_help; fi ;;
     *)             die "Unknown command: $subcmd. Run 'rt help' for usage." ;;

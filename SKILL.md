@@ -1,6 +1,6 @@
 ---
 name: remote
-description: Remote Toolkit — drives remote servers via Mutagen file sync + SSH through the `rt` CLI; multi-server profiles, Slurm submission/monitoring on HPC hosts, tmux-backed background commands. Trigger on any mention of a remote server, SSH target, HPC cluster, GPU box, `rt`, file sync to/from a remote machine, Slurm jobs (submit/queue/logs/cancel), `.sbatch` files, profile setup, or running/moving/deploying something on a remote — even without the words "rt"/"remote toolkit". On the first triggering prompt run `rt status --all` to enumerate profiles before assuming one.
+description: Remote Toolkit — drives remote servers via Mutagen file sync + SSH through the `rt` CLI; multi-server profiles, Slurm submission/monitoring on HPC hosts, tmux-backed background commands. Trigger on any mention of a remote server, SSH target, HPC cluster, GPU box, Google Colab runtimes or compute units (`rt colab`), `rt`, file sync to/from a remote machine, Slurm jobs (submit/queue/logs/cancel), `.sbatch` files, profile setup, or running/moving/deploying something on a remote — even without the words "rt"/"remote toolkit". On the first triggering prompt run `rt status --all` to enumerate profiles before assuming one.
 ---
 
 # Remote Toolkit — Full Guide for Claude Code
@@ -313,6 +313,44 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
 ```
 
 `rt` does not generate sbatch scripts — write your own `*.sbatch` under the profile's local replica and submit by path.
+
+## Google Colab runtimes (`rt colab`)
+
+A Colab runtime is a disposable VM billed in compute units (CU) from the account's balance. `rt colab up` creates one and makes it an ordinary profile, `colab-<name>/work`, so `exec`, `exec --bg`, `logs`, `push` and `fetch` work on it as on any host. Good for CPU work that fits a throwaway machine: data processing, builds, evaluations that are not timed, several workers in parallel. Not for benchmarks that need stable timing (shared VMs, the CPU model varies) and not for anything that must outlive the runtime's disk.
+
+Measured 2026-11-23 (google-colab-cli 0.8.0):
+
+| shape | flag | CPU | RAM | CU/hour |
+|---|---|---|---|---|
+| standard | (none) | 2 vCPU | 12 GB | 0.08 |
+| high-RAM | `--high-mem` | 8 vCPU | 50 GB | 0.26 |
+
+Every runtime has a 226 GB disk, Ubuntu 24.04, Python 3.13, and gcc, git, tmux, rsync and curl. GPU (`--gpu T4|L4|G4|A100|H100`) and TPU (`--tpu v5e1|v6e1`) runtimes cost many times more — others report about 1.2 CU/h for a T4 and 5.4 for an A100 (not measured here) — so never start one without the user's go-ahead.
+
+**Setup (once per machine).** Install the official CLI pinned — `uv tool install --python 3.12 'google-colab-cli==0.8.0'` — and have the **user** sign in by running `colab usage` in a terminal (it prints a link; they approve every scope and paste back the code; the token goes to the OS keychain). Then `rt colab setup` creates `~/.ssh/rt_colab_ed25519`, puts `Include ~/.ssh/rt-colab.d/*.conf` at the top of `~/.ssh/config`, and runs the canary below.
+
+```bash
+rt colab up etl1 --high-mem --hours 6        # create; prints the profile and when it releases itself
+rt -p colab-etl1/work push --mkdir ./job.tar.gz in/job.tar.gz
+rt -p colab-etl1/work exec --bg --name prep 'cd in && tar xzf job.tar.gz && python3 prep.py'
+rt -p colab-etl1/work logs rt_colab-etl1_work_bg_prep
+rt -p colab-etl1/work fetch ./out.parquet 'cat in/out/out.parquet'
+rt colab down etl1                           # release now; the disk goes with it
+rt colab ls                                  # rt's runtimes, then any other on the account
+rt colab usage                               # balance and the account's hourly rate
+```
+
+Rules:
+
+1. **Never run `colab ssh` yourself, in any form.** Bare `colab ssh` creates a runtime when none is recorded, and `colab ssh --proxy-mode -s NAME` — the form the CLI documents for `~/.ssh/config` — creates one whenever NAME is missing from its local record, so a reconnect after a release silently opens a new billable runtime. The aliases `rt colab up` writes bridge with `--colab-internal-mode cmd`, which only connects to an existing runtime (a released one answers 404). That option is hidden and could change in any release, so `rt colab setup` and every `rt colab up` first check offline, with the network cut, that the installed CLI still refuses to create; `up` refuses to run if it does not.
+2. **One ssh connection per runtime.** A second one is refused with HTTP 429. The alias multiplexes every rt call over one ControlMaster connection, which closes after 15 idle minutes. When this Mac sleeps or its network drops while that connection is open, the runtime keeps the dead session and refuses new ones; rt's next command notices, ends that session through the Colab kernel (which needs no ssh) and connects once the slot frees, about 30-50 s later (measured twice on 2026-11-23). `rt colab reconnect NAME` does the same on demand.
+3. **The runtime releases itself.** `up` starts a watchdog on the VM that calls Colab's own release endpoint when the deadline passes (`--hours`, default 4, at most 24 — Colab ends every runtime at 24 h) or after `--idle-minutes` with nothing busy (default 20; 10 with an accelerator). Busy means an rt background job (tmux), a command running over ssh, or at least half a core of CPU. A process you detach any other way and that mostly waits on the network looks idle, so launch work with `exec --bg`. Move the deadline with `rt colab extend NAME --hours H`. Releasing ends every process on the VM.
+4. **Move data on the VM's side.** A runtime downloads from the internet at 140-180 MB/s; this Mac reaches it at about 4 MB/s through the proxy. Push code and small inputs; let the VM fetch datasets and models itself.
+5. **No Mutagen sync** (`rt connect`): the runtime and its disk are temporary. Use `push`/`fetch`, and fetch results before `down` or the deadline.
+6. **Other runtimes on the account are not yours.** `rt colab ls` lists them as `not ours`: another machine signed in to the same account, the web UI, or a lost record. Leave them alone and never run `colab stop --all`.
+7. **Keep the account out of the VM.** Do not mount Google Drive (`colab drivemount`) or propagate credentials (`colab auth`) unless the user asks for it: either hands the whole account's Drive or Google Cloud access to everything that runs on the VM. Do not copy API keys there either.
+
+**A runtime lives without any connection.** With no connection at all, a detached process and a running kernel cell each kept going for 91 minutes, until the test was stopped; the Colab CLI's maintainers describe the opposite (a runtime is shut down soon after its last connection closes), and on this account that did not happen. So a job survives this Mac sleeping, and a forgotten runtime keeps billing — until its watchdog releases it, or Colab's 24-hour limit. Two traps found on the way: the CLI answers "No active sessions found" also when it could not sign in, so rt trusts an empty list only when `colab usage` agrees; and after a release the old connection can still answer for up to a minute, then gets 404.
 
 ## Important Rules
 

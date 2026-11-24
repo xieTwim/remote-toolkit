@@ -2109,6 +2109,194 @@ chk "23b two failures end the command, after exactly two attempts" \
 chk "23c ... and the message is about the ssh link, not about connecting sync first" \
     "$(grep -q 'ssh link' "$SCRATCH/e23" && ! grep -q "connect' first" "$SCRATCH/e23" && echo 0 || echo 1)" "$(cat "$SCRATCH/e23")"
 
+# ── 24. rt colab: the lifecycle, and the boundary that a runtime is never created unseen ──
+# A Colab runtime bills from the moment it exists, and google-colab-cli's documented ssh bridge
+# (`--proxy-mode -s NAME`) creates one whenever NAME is missing locally (2026-11-23), so any
+# reconnect after a release would open a new billable runtime. Pinned here: rt creates nothing
+# unless the installed CLI's bridge provably cannot create; a runtime whose ssh or watchdog fails
+# is released at once; `down` drops its records only after the account no longer lists it; a
+# runtime rt did not create is never touched. The colab CLI and ssh are stubs; 24q runs the real
+# CLI's canary when one is installed (offline: every proxy variable points at a dead port).
+set +e; source "$RT" 2>/dev/null; set +e
+C="$SCRATCH/colab"; mkdir -p "$C/bin" "$C/home/.ssh"
+export RT_COLAB_SSH_DIR="$C/home/.ssh/rt-colab.d" RT_COLAB_KEY="$C/home/.ssh/key" \
+       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
+: > "$C/home/.ssh/key"; : > "$C/home/.ssh/key.pub"
+cat > "$C/bin/colab" <<'STUB'
+#!/usr/bin/env bash
+# Stub google-colab-cli: calls are logged to $CSTUB/calls; the account's runtimes are the lines of $CSTUB/backend.
+cfg=""; [ "$1" = --config ] && { cfg="$2"; shift 2; }
+echo "$*" >> "$CSTUB/calls"
+case "$1" in
+  version)  echo "Version: 0.8.0" ;;
+  usage)    printf 'Current balance: 100.00 compute units\nUsage rate: 0.08/hr\nActive assignments: %s\n' "$(grep -c . "$CSTUB/backend")" ;;
+  ssh)      if [ -n "${CSTUB_UNSAFE:-}" ]; then echo "SSH-2.0-bridged"; exit 0; fi
+            echo "[colab] session 'x' not found. Run \`colab sessions\` to list active sessions." >&2; exit 2 ;;
+  new)      [ -n "${CSTUB_NEW_FAIL:-}" ] && exit 1
+            ep="m-s-test-$3"; echo "$ep" >> "$CSTUB/backend"
+            printf '{\n  "%s": {\n    "name": "%s",\n    "endpoint": "%s"\n  }\n}\n' "$3" "$3" "$ep" > "$cfg" ;;
+  sessions) [ -n "${CSTUB_SESSIONS_GARBLED:-}" ] && { echo "Traceback: ConnectionError"; exit 0; }
+            [ -n "${CSTUB_SESSIONS_EMPTY_LIE:-}" ] && { echo "[colab] No active sessions found on server."; exit 0; }
+            if [ -s "$CSTUB/backend" ]; then
+              while read -r ep; do echo "[?] $ep | Hardware: CPU | Shape: Standard | Variant: DEFAULT"; done < "$CSTUB/backend"
+            else echo "[colab] No active sessions found on server."; fi ;;
+  stop)     [ -n "${CSTUB_STOP_NOOP:-}" ] && exit 1
+            ep=$(sed -n 's/.*"endpoint": "\(.*\)".*/\1/p' "$cfg")
+            grep -vxF "$ep" "$CSTUB/backend" > "$CSTUB/b2"; mv "$CSTUB/b2" "$CSTUB/backend"; : > "$cfg" ;;
+  exec)     cat > /dev/null; touch "$CSTUB/slot_freed" ;;   # ending the stale session frees the slot
+esac
+STUB
+chmod +x "$C/bin/colab"
+# ssh to the runtime: the bootstrap's answer is the digest of the watchdog it carries, recomputed
+# from the base64 payload rt actually sent — so 24f fails if rt ships a different file than it hashes.
+_colab_ssh() {
+  printf 'ssh %s\n' "$*" >> "$CSTUB/ssh_calls"
+  [ -n "${SSTUB_FAIL:-}" ] && return 255
+  if [ -n "${SSTUB_HELD:-}" ] && [ ! -e "$CSTUB/slot_freed" ]; then   # the runtime refuses: say why, as the bridge does
+    local h; for h in "$@"; do case "$h" in colab-*) echo "[colab] $SSTUB_HELD" >> "$RT_HOME/$h/proxy.log" ;; esac; done
+    return 255
+  fi
+  local last="${!#}" b64
+  case "$last" in
+    *'| base64 -d | bash')
+      b64=$(sed -n "s/^printf %s '\(.*\)' | base64 -d | bash\$/\1/p" <<<"$last")
+      printf '%s' "$b64" | base64 -d > "$CSTUB/boot.sh"
+      if [ -n "${SSTUB_BADWD:-}" ]; then echo deadbeef; return 0; fi
+      sed -n '/RT_COLAB_WATCHDOG.$/,/^RT_COLAB_WATCHDOG$/p' "$CSTUB/boot.sh" | sed '1d;$d' | _sha256_file /dev/stdin ;;
+  esac
+  return 0
+}
+ssh() { printf 'real-ssh %s\n' "$*" >> "$CSTUB/ssh_calls"; return 1; }   # -O check / -O exit
+fresh_colab() {
+  rm -rf "$RT_HOME"/colab-* "$RT_COLAB_SSH_DIR" "$RT_HOME/.rt/_colab" "$C/boot.sh" "$C/slot_freed"
+  : > "$C/backend"; : > "$C/calls"; : > "$C/ssh_calls"
+  printf 'Include %s/*.conf\nHost other\n  HostName example\n' "$RT_COLAB_SSH_DIR" > "$RT_SSH_CONFIG"
+  unset CSTUB_UNSAFE CSTUB_NEW_FAIL CSTUB_STOP_NOOP CSTUB_SESSIONS_GARBLED SSTUB_FAIL SSTUB_BADWD SSTUB_HELD
+}
+
+fresh_colab; _colab_common_paths
+_colab_include_present; r1=$?
+printf 'Host other\n  HostName example\nInclude %s/*.conf\n' "$RT_COLAB_SSH_DIR" > "$RT_SSH_CONFIG"
+_colab_include_present; r2=$?
+( HOME="$C/home"; RT_COLAB_SSH_DIR="$C/home/.ssh/rt-colab.d"; _colab_common_paths
+  printf 'Include ~/.ssh/rt-colab.d/*.conf\nHost x\n' > "$RT_SSH_CONFIG"; _colab_include_present ); r3=$?
+chk "24a an Include above the first Host block counts (also in ~ form); one inside a Host block does not" \
+    "$([ $r1 = 0 ] && [ $r2 = 1 ] && [ $r3 = 0 ] && echo 0 || echo 1)" "r1=$r1 r2=$r2 r3=$r3"
+
+fresh_colab; printf 'Host other\n  HostName example\n' > "$RT_SSH_CONFIG"
+( _colab_setup ) >/dev/null 2>&1; rc=$?
+chk "24b setup puts the Include line first, keeps the rest, and backs the old file up" \
+    "$([ $rc = 0 ] && [ "$(head -n 1 "$RT_SSH_CONFIG")" = "Include $RT_COLAB_SSH_DIR/*.conf" ] && grep -q '^Host other' "$RT_SSH_CONFIG" && ls "$RT_SSH_CONFIG".bak-rt-colab-* >/dev/null 2>&1 && echo 0 || echo 1)" "rc=$rc"
+
+fresh_colab; export CSTUB_UNSAFE=1
+( _colab_up t1 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24c a CLI whose ssh bridge answers instead of refusing: up refuses and never calls 'colab new'" \
+    "$([ $rc != 0 ] && ! grep -q '^new' "$C/calls" && grep -q 'Refusing' "$C/err" && [ ! -e "$RT_HOME/colab-t1" ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+
+fresh_colab
+( _colab_up t1 --high-mem --hours 2 ) >/dev/null 2>"$C/err"; rc=$?
+A="$RT_COLAB_SSH_DIR/colab-t1.conf"; M="$RT_HOME/colab-t1/colab.meta"
+chk "24d up creates the runtime with the flags given and records it as profile colab-t1/work" \
+    "$([ $rc = 0 ] && grep -qx 'new -s t1 --high-mem' "$C/calls" && grep -qx 'REMOTE_HOST="colab-t1"' "$RT_HOME/colab-t1/host.conf" && grep -qx 'REMOTE_DIR="/content/work"' "$RT_HOME/colab-t1/work.conf" && grep -qx 'COLAB_ENDPOINT=m-s-test-t1' "$M" && echo 0 || echo 1)" \
+    "rc=$rc $(cat "$C/err")"
+chk "24e the alias bridges without the creating form, multiplexes one connection, forwards nothing" \
+    "$(grep -qF -- 'ssh --proxy-mode --colab-internal-mode cmd -s t1 ' "$A" && grep -qx '  ControlMaster auto' "$A" && grep -qx '  ControlPersist 15m' "$A" && grep -qx '  ForwardAgent no' "$A" && grep -qx '  IdentitiesOnly yes' "$A" && ! grep -qF -- '--rm' "$A" && echo 0 || echo 1)" \
+    "$(cat "$A" 2>/dev/null)"
+dl=$(sed -n 's/^COLAB_DEADLINE=//p' "$M"); cr=$(sed -n 's/^COLAB_CREATED=//p' "$M")
+chk "24f the watchdog went over, the VM's digest matched it, and it carries the deadline and idle limit" \
+    "$([ $rc = 0 ] && [ -s "$C/boot.sh" ] && [ $((dl - cr)) = 7200 ] && grep -qF "printf '%s\n' $dl > \"\$d/deadline\"" "$C/boot.sh" && grep -qF "printf '%s\n' 20 > \"\$d/idle_minutes\"" "$C/boot.sh" && echo 0 || echo 1)" \
+    "dl=$dl cr=$cr"
+sed -n '/RT_COLAB_WATCHDOG.$/,/^RT_COLAB_WATCHDOG$/p' "$C/boot.sh" | sed '1d;$d' > "$C/wd.sh"
+bash -n "$C/wd.sh" 2>/dev/null && bash -n "$C/boot.sh" 2>/dev/null; rc=$?
+chk "24g the bootstrap and the watchdog it installs are valid shell" "$rc"
+( _colab_extend t1 --hours 3 ) >/dev/null 2>&1; rc=$?
+dl2=$(sed -n 's/^COLAB_DEADLINE=//p' "$M")
+chk "24h extend moves the deadline on the VM and in the record" \
+    "$([ $rc = 0 ] && [ $((dl2 - $(date +%s))) -ge 10790 ] && grep -qF "printf '%s\n' $dl2 > /root/.rt_colab/deadline" "$C/ssh_calls" && echo 0 || echo 1)" "rc=$rc dl2=$dl2"
+echo "m-s-foreign" >> "$C/backend"
+out=$( _colab_ls 2>/dev/null ); rc=$?
+chk "24i ls shows rt's runtime as assigned and another one as not ours, and stops neither" \
+    "$([ $rc = 0 ] && grep -q '^t1 .*m-s-test-t1 .*assigned' <<<"$out" && grep -q '^not ours: m-s-foreign' <<<"$out" && ! grep -q '^stop' "$C/calls" && echo 0 || echo 1)" "$out"
+( _colab_down t1 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24j down stops it, sees it leave the account, then removes alias and profile — the foreign one stays" \
+    "$([ $rc = 0 ] && grep -qx 'stop -s t1' "$C/calls" && [ "$(cat "$C/backend")" = m-s-foreign ] && [ ! -e "$RT_HOME/colab-t1" ] && [ ! -e "$A" ] && echo 0 || echo 1)" "rc=$rc $(cat "$C/err")"
+
+fresh_colab; export SSTUB_FAIL=1
+( _colab_up t2 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24k ssh to the new runtime fails: up releases it, sees it gone, and leaves no trace" \
+    "$([ $rc != 0 ] && grep -qx 'stop -s t2' "$C/calls" && [ ! -s "$C/backend" ] && [ ! -e "$RT_HOME/colab-t2" ] && [ ! -e "$RT_COLAB_SSH_DIR/colab-t2.conf" ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+
+fresh_colab; export SSTUB_BADWD=1
+( _colab_up t3 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24l a watchdog the VM does not confirm byte for byte: the runtime is released" \
+    "$([ $rc != 0 ] && grep -qx 'stop -s t3' "$C/calls" && [ ! -s "$C/backend" ] && [ ! -e "$RT_HOME/colab-t3" ] && echo 0 || echo 1)" "rc=$rc"
+
+fresh_colab; ( _colab_up t4 ) >/dev/null 2>&1; export CSTUB_STOP_NOOP=1
+( _colab_down t4 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24m a runtime still on the account after stop: down fails and keeps its records for a retry" \
+    "$([ $rc != 0 ] && [ -e "$RT_HOME/colab-t4/colab.meta" ] && [ -e "$RT_COLAB_SSH_DIR/colab-t4.conf" ] && echo 0 || echo 1)" "rc=$rc"
+
+fresh_colab; _colab_common_paths
+printf 'm-s-a\nm-hm-b\n' > "$C/backend"
+out=$(_colab_account_list "$RT_COLAB_BIN"); r1=$?
+: > "$C/backend"; out2=$(_colab_account_list "$RT_COLAB_BIN"); r2=$?
+export CSTUB_SESSIONS_GARBLED=1; _colab_account_list "$RT_COLAB_BIN" >/dev/null; r3=$?
+chk "24n the account list: one line per runtime; an empty account is an empty success; anything else fails" \
+    "$([ $r1 = 0 ] && [ "$out" = "$(printf 'm-s-a CPU Standard\nm-hm-b CPU Standard')" ] && [ $r2 = 0 ] && [ -z "$out2" ] && [ $r3 = 1 ] && echo 0 || echo 1)" \
+    "r1=$r1 out=$out r2=$r2 out2=$out2 r3=$r3"
+unset CSTUB_SESSIONS_GARBLED
+export CSTUB_SESSIONS_EMPTY_LIE=1; printf 'm-s-a\n' > "$C/backend"
+_colab_account_list "$RT_COLAB_BIN" >/dev/null; r4=$?
+chk "24n2 'No active sessions' while colab usage still counts a runtime is a failure, not an empty account" \
+    "$([ $r4 = 1 ] && echo 0 || echo 1)" "r4=$r4"
+unset CSTUB_SESSIONS_EMPTY_LIE; : > "$C/backend"
+
+bad=0
+for n in a_b -x x- a--b "$(printf 'a%.0s' $(seq 27))"; do ( _colab_name "$n" ) 2>/dev/null && bad=1; done
+( _colab_name w-1 ) 2>/dev/null || bad=1
+chk "24o a runtime name follows the host-group grammar, 26 characters at most" "$bad"
+
+fresh_colab; export CSTUB_NEW_FAIL=1
+( _colab_up t5 ) >/dev/null 2>&1; rc=$?
+chk "24p a failed 'colab new' leaves no half-made profile behind" \
+    "$([ $rc != 0 ] && [ ! -e "$RT_HOME/colab-t5" ] && [ ! -e "$RT_COLAB_SSH_DIR/colab-t5.conf" ] && echo 0 || echo 1)" "rc=$rc"
+fresh_colab; ( _colab_up t6 ) >/dev/null 2>&1
+export SSTUB_HELD="Already-active SSH session (HTTP 429): another colab ssh is connected to this runtime." RT_COLAB_SLOT_WAIT=0
+( _colab_heal_slot t6 ) >/dev/null 2>&1; rc=$?
+chk "24r a slot held by a vanished session: heal ends it through the kernel, then connects" \
+    "$([ $rc = 0 ] && grep -qx 'exec -s t6' "$C/calls" && echo 0 || echo 1)" "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+rm -f "$C/slot_freed"; : > "$C/calls"; export SSTUB_HELD="Endpoint not found (HTTP 404): this runtime does not expose the /colab/ssh endpoint."
+( _colab_heal_slot t6 ) >/dev/null 2>&1; rc=$?
+chk "24s a refusal that is not a held slot (404: the runtime is gone): no kernel call, and a failure" \
+    "$([ $rc = 1 ] && ! grep -q '^exec' "$C/calls" && echo 0 || echo 1)" "rc=$rc"
+rm -f "$C/slot_freed"; : > "$C/calls"; export SSTUB_HELD="Already-active SSH session (HTTP 429): another colab ssh is connected to this runtime."
+( RT_PROFILE="colab-t6/work"; _init_profile; REMOTE_HOST=colab-t6
+  _ssh_test() { [ -e "$CSTUB/slot_freed" ]; }; RT_SSH_RETRY_WAIT=0 _require_ssh ) >/dev/null 2>&1; rc=$?
+chk "24t on a Colab profile, rt's reachability check heals a held slot instead of failing" \
+    "$([ $rc = 0 ] && grep -qx 'exec -s t6' "$C/calls" && echo 0 || echo 1)" "rc=$rc"
+unset SSTUB_HELD RT_COLAB_SLOT_WAIT
+
+fresh_colab; ( _colab_up t7 ) >/dev/null 2>&1; : > "$C/backend"; : > "$C/calls"
+( _colab_down t7 ) >/dev/null 2>&1; rc=$?
+chk "24u a runtime that already released itself: down sends no stop, and clears the record" \
+    "$([ $rc = 0 ] && ! grep -q '^stop' "$C/calls" && [ ! -e "$RT_HOME/colab-t7" ] && echo 0 || echo 1)" "rc=$rc"
+fresh_colab
+( set -e; _colab_write_alias() { return 1; }; _colab_up t8 ) >/dev/null 2>&1; rc=$?
+chk "24v under set -e, a failure after the runtime exists but before its watchdog runs still releases it" \
+    "$([ $rc != 0 ] && grep -qx 'stop -s t8' "$C/calls" && [ ! -s "$C/backend" ] && [ ! -e "$RT_HOME/colab-t8" ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+fresh_colab
+
+if real=$(command -v colab 2>/dev/null) && [ -n "$real" ]; then
+  ( _colab_common_paths; _colab_canary "$real" ) >/dev/null 2>&1; rc=$?
+  chk "24q the installed colab CLI ($("$real" version 2>/dev/null | head -n 1)) still refuses to create a runtime from the ssh bridge" "$rc"
+else
+  echo "  skip 24q (no colab CLI installed)"
+fi
+unset RT_COLAB_SSH_DIR RT_COLAB_KEY RT_SSH_CONFIG RT_COLAB_POLL_WAIT CSTUB RT_COLAB_BIN
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1

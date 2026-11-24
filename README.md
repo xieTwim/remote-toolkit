@@ -124,6 +124,43 @@ wandb/  outputs/  checkpoints/  .ipynb_checkpoints/
 
 **Ignores are frozen when the session is created.** Editing `MUTAGEN_IGNORE` does not change a running session; `rt disconnect && rt connect` applies it. `rt sync status` prints the **live** session's effective ignores and warns when they no longer match what the config would create — read that, not the config file.
 
+### Google Colab runtimes
+
+`rt colab` turns a Google Colab runtime — a disposable VM paid for in compute units — into an
+ordinary profile. It drives the official [google-colab-cli](https://github.com/googlecolab/google-colab-cli),
+whose `colab ssh --proxy-mode` carries ssh over a WebSocket.
+
+```bash
+uv tool install --python 3.12 'google-colab-cli==0.8.0'
+colab usage            # once, in a terminal: sign in (prints a link, you paste back a code)
+rt colab setup         # ssh key, Include line in ~/.ssh/config, safety canary
+rt colab up etl1 --high-mem --hours 6
+rt -p colab-etl1/work exec 'nproc'
+rt colab down etl1
+```
+
+What `rt colab` adds over writing the ssh alias by hand:
+
+- **No runtime is ever created by a reconnect.** The CLI's documented alias form,
+  `colab ssh --proxy-mode -s NAME`, creates a billable runtime whenever NAME is missing from its
+  local record, so after a release one automatic reconnect opens a new one. rt's alias uses the
+  bridge that only connects to an existing runtime, and checks offline before every create that
+  the installed CLI still behaves that way.
+- **One connection.** A runtime accepts a single ssh connection, so the alias multiplexes every
+  call over one ControlMaster connection. A connection that vanished (sleep, a network drop) leaves
+  the runtime holding the slot; rt's next command ends that session through the Colab kernel and
+  reconnects, and `rt colab reconnect NAME` does the same on demand.
+- **The runtime releases itself.** A watchdog on the VM calls Colab's release endpoint at the
+  deadline (`--hours`, default 4) or after `--idle-minutes` (default 20) with no rt job, no ssh
+  command and under half a core of CPU. That is the only thing that stops a forgotten runtime: one
+  with no connection at all kept running for 91 minutes when measured. `rt colab down NAME`
+  releases it at once and confirms it has left the account.
+- **Other runtimes on the account are left alone.** `rt colab ls` lists them as `not ours`.
+
+Measured with 0.8.0: a standard runtime has 2 vCPU and 12 GB for 0.08 CU/hour; `--high-mem`
+gives 8 vCPU and 50 GB for 0.26. Each has a 226 GB disk that is gone on release, so move results
+out with `rt fetch` first.
+
 ## Things You May Need to Do Manually
 
 | Scenario | Action |

@@ -32,7 +32,7 @@ README.md                User-facing documentation
   - Local mount default: `~/Work/Remote/<host>/<profile>/`.
 - **Dispatch**: `main()` parses global flags then routes to `cmd_*` functions.
 
-Subcommands: `init` `check` `setup-key` `connect` `disconnect` `exec` `logs` `status` `sync` `slurm` `help`
+Subcommands: `init` `check` `setup-key` `connect` `disconnect` `exec` `logs` `status` `sync` `slurm` `colab` `help`
 
 ## Mutagen Integration
 
@@ -47,6 +47,40 @@ Subcommands: `init` `check` `setup-key` `connect` `disconnect` `exec` `logs` `st
 - Gated by `SLURM_ENABLED=1` set in `host.conf` (typical) or `<profile>.conf` (override). `cmd_slurm` calls `_slurm_require_enabled` first; non-Slurm hosts get a clear error.
 - `rt slurm submit` performs a mandatory `_sync_flush` before `sbatch` to prevent stale-code submissions, then parses sbatch output for the job ID and appends to `.rt/<host>/<profile>/slurm_jobs` (cap 50 entries).
 - `SLURM_SBATCH_ARGS` (host.conf or `<profile>.conf`; plain var, profile value replaces host value) seeds `sbatch_args` in `_slurm_submit` BEFORE the explicit `-- ...` args, so per-invocation args override the standing defaults (sbatch last-wins). The submit info line echoes the merged args. Do not put a default partition here — CLI args override in-script `#SBATCH -p` directives.
+
+## Colab runtimes (`rt colab`)
+
+The section "Colab runtimes" in `rt` (comment block at its top holds the measured facts). A runtime
+NAME is host group `colab-NAME` with one profile, `work` (REMOTE_DIR `/content/work`), so every
+existing verb works on it through an ssh alias; `rt colab` only adds the lifecycle.
+
+- Per runtime: `$RT_HOME/colab-NAME/` holds `host.conf`, `work.conf`, `colab.meta` (endpoint,
+  hardware, created, deadline, idle limit — deliberately not `*.conf`, so it is never read as a
+  profile), the colab CLI's own `colab-session.json` for this runtime alone, and `proxy.log`;
+  the alias is `~/.ssh/rt-colab.d/colab-NAME.conf` (`RT_COLAB_SSH_DIR`), reached through one
+  `Include` line that `rt colab setup` puts at the top of `~/.ssh/config`.
+- The ProxyCommand is `colab --config <that json> ssh --proxy-mode --colab-internal-mode cmd -s NAME`.
+  The documented `--proxy-mode -s NAME` creates a runtime when NAME is missing locally; the hidden
+  `cmd` mode only resolves. `_colab_canary` re-proves that offline (dead proxies, empty record:
+  exit 2, "not found", empty stdout) in `setup` and before every `up`; `up` refuses otherwise.
+  Canary 24q runs it against the installed CLI, so an upgrade that breaks it fails the suite.
+- One ssh connection per runtime (429 on a second): the alias sets `ControlMaster auto` +
+  `ControlPersist 15m`. The first `true` in `up` becomes the master. A vanished client leaves the
+  runtime holding the slot; `_require_ssh` calls `_colab_heal_slot` for colab profiles (end the
+  session through `colab exec`, retry every 5 s for 90 s; the slot freed ~33 s after when measured).
+- A runtime needs no connection to live (91 min with none, measured), so release is the only cost
+  stop: there is deliberately no keep-awake/keep-alive machinery.
+- `colab sessions` prints "No active sessions found" also when the CLI could not authenticate, so
+  `_colab_account_list` accepts an empty answer only when `colab usage` reports 0 as well — a
+  "gone" verdict on a still-billing runtime would delete the only record of it.
+- The watchdog (`_colab_watchdog_script`) is installed by a bootstrap sent as one base64 word
+  (`_colab_bootstrap_script`), so no argv on the VM carries a pgrep-able pattern, and `up` releases
+  the runtime unless the VM reports the digest of exactly the script rt sent. It releases via
+  `POST http://$TBE_RUNTIME_ADDR/unassign` (read from a Colab process's environment), the endpoint
+  behind `google.colab.runtime.unassign()`.
+- Failure paths release: a failed first ssh or watchdog install calls `_colab_release_and_forget`,
+  which deletes local records only after the account list no longer shows the endpoint.
+- Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q).
 
 ## CC Integration: SKILL + slash command
 
