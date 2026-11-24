@@ -2120,7 +2120,7 @@ chk "23c ... and the message is about the ssh link, not about connecting sync fi
 set +e; source "$RT" 2>/dev/null; set +e
 C="$SCRATCH/colab"; mkdir -p "$C/bin" "$C/home/.ssh"
 export RT_COLAB_SSH_DIR="$C/home/.ssh/rt-colab.d" RT_COLAB_KEY="$C/home/.ssh/key" \
-       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
+       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 RT_COLAB_FIRST_SSH_WAIT=0 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
 : > "$C/home/.ssh/key"; : > "$C/home/.ssh/key.pub"
 cat > "$C/bin/colab" <<'STUB'
 #!/usr/bin/env bash
@@ -2133,6 +2133,7 @@ case "$1" in
   ssh)      if [ -n "${CSTUB_UNSAFE:-}" ]; then echo "SSH-2.0-bridged"; exit 0; fi
             echo "[colab] session 'x' not found. Run \`colab sessions\` to list active sessions." >&2; exit 2 ;;
   new)      [ -n "${CSTUB_NEW_FAIL:-}" ] && exit 1
+            [ -n "${CSTUB_NEW_FAIL_FOR:-}" ] && [ "$3" = "$CSTUB_NEW_FAIL_FOR" ] && exit 1
             ep="m-s-test-$3"; echo "$ep" >> "$CSTUB/backend"
             printf '{\n  "%s": {\n    "name": "%s",\n    "endpoint": "%s"\n  }\n}\n' "$3" "$3" "$ep" > "$cfg" ;;
   sessions) # Offline, the real 0.8.0 exits 1 and its traceback quotes the source line below.
@@ -2143,9 +2144,15 @@ case "$1" in
               while read -r ep; do echo "[?] $ep | Hardware: CPU | Shape: Standard | Variant: DEFAULT"; done < "$CSTUB/backend"
             else echo "[colab] No active sessions found on server."; fi ;;
   stop)     [ -n "${CSTUB_STOP_NOOP:-}" ] && exit 1
+            [ -n "${CSTUB_STOP_NOOP_FOR:-}" ] && [ "$3" = "$CSTUB_STOP_NOOP_FOR" ] && exit 1
             ep=$(sed -n 's/.*"endpoint": "\(.*\)".*/\1/p' "$cfg")
             grep -vxF "$ep" "$CSTUB/backend" > "$CSTUB/b2"; mv "$CSTUB/b2" "$CSTUB/backend"; : > "$cfg" ;;
   exec)     cat > /dev/null; touch "$CSTUB/slot_freed" ;;   # ending the stale session frees the slot
+  drivemount) printf '%s\n' "${BROWSER:-}" > "$CSTUB/browser-$3"   # one file each: the mounts run in parallel
+            case " ${CSTUB_DRIVE_PENDING:-} " in
+              *" $3 "*) printf 'Please visit:\nhttps://accounts.google.com/o/oauth2/v2/auth?state=st-%s\n' "$3" ;;
+              *) touch "$CSTUB/mounted-colab-$3"; echo "Mounted at $4" ;;
+            esac ;;
 esac
 STUB
 chmod +x "$C/bin/colab"
@@ -2154,14 +2161,23 @@ chmod +x "$C/bin/colab"
 _colab_ssh() {
   printf 'ssh %s\n' "$*" >> "$CSTUB/ssh_calls"
   [ -n "${SSTUB_FAIL:-}" ] && return 255
+  if [ -n "${SSTUB_FAIL_ONCE:-}" ] && [ ! -e "$CSTUB/failed_once" ]; then touch "$CSTUB/failed_once"; return 255; fi
+  local a; for a in "$@"; do [ -n "${SSTUB_FAIL_FOR:-}" ] && [ "$a" = "colab-$SSTUB_FAIL_FOR" ] && return 255; done
   if [ -n "${SSTUB_HELD:-}" ] && [ ! -e "$CSTUB/slot_freed" ]; then   # the runtime refuses: say why, as the bridge does
     local h; for h in "$@"; do case "$h" in colab-*) echo "[colab] $SSTUB_HELD" >> "$RT_HOME/$h/proxy.log" ;; esac; done
     return 255
   fi
-  local last="${!#}" b64
+  local last="${!#}" b64 host=""
+  for a in "$@"; do case "$a" in colab-*) host="$a" ;; esac; done
   case "$last" in
+    *"type fuse.drive"*) [ -e "$CSTUB/mounted-$host" ]; return ;;
     *'| base64 -d | bash')
       b64=$(sed -n "s/^printf %s '\(.*\)' | base64 -d | bash\$/\1/p" <<<"$last")
+      if printf '%s' "$b64" | base64 -d | grep -q RT_DRIVE_OK; then
+        echo "flush $host" >> "$CSTUB/calls"
+        if [ -n "${SSTUB_FLUSH_FAIL:-}" ]; then echo RT_DRIVE_FAILED; else rm -f "$CSTUB/mounted-$host"; echo RT_DRIVE_OK; fi
+        return 0
+      fi
       printf '%s' "$b64" | base64 -d > "$CSTUB/boot.sh"
       if [ -n "${SSTUB_BADWD:-}" ]; then echo deadbeef; return 0; fi
       sed -n '/RT_COLAB_WATCHDOG.$/,/^RT_COLAB_WATCHDOG$/p' "$CSTUB/boot.sh" | sed '1d;$d' | _sha256_file /dev/stdin ;;
@@ -2170,10 +2186,10 @@ _colab_ssh() {
 }
 ssh() { printf 'real-ssh %s\n' "$*" >> "$CSTUB/ssh_calls"; return 1; }   # -O check / -O exit
 fresh_colab() {
-  rm -rf "$RT_HOME"/colab-* "$RT_COLAB_SSH_DIR" "$RT_HOME/.rt/_colab" "$C/boot.sh" "$C/slot_freed"
+  rm -rf "$RT_HOME"/colab-* "$RT_COLAB_SSH_DIR" "$RT_HOME/.rt/_colab" "$C/boot.sh" "$C/slot_freed" "$C/failed_once" "$C"/mounted-* "$C"/browser-* "$C/opened"
   : > "$C/backend"; : > "$C/calls"; : > "$C/ssh_calls"
   printf 'Include %s/*.conf\nHost other\n  HostName example\n' "$RT_COLAB_SSH_DIR" > "$RT_SSH_CONFIG"
-  unset CSTUB_UNSAFE CSTUB_NEW_FAIL CSTUB_STOP_NOOP CSTUB_SESSIONS_GARBLED SSTUB_FAIL SSTUB_BADWD SSTUB_HELD
+  unset CSTUB_UNSAFE CSTUB_NEW_FAIL CSTUB_NEW_FAIL_FOR CSTUB_STOP_NOOP CSTUB_STOP_NOOP_FOR CSTUB_SESSIONS_GARBLED CSTUB_DRIVE_PENDING SSTUB_FAIL SSTUB_FAIL_FOR SSTUB_FAIL_ONCE SSTUB_FLUSH_FAIL SSTUB_BADWD SSTUB_HELD
 }
 
 fresh_colab; _colab_common_paths
@@ -2296,6 +2312,111 @@ fresh_colab
 chk "24v under set -e, a failure after the runtime exists but before its watchdog runs still releases it" \
     "$([ $rc != 0 ] && grep -qx 'stop -s t8' "$C/calls" && [ ! -s "$C/backend" ] && [ ! -e "$RT_HOME/colab-t8" ] && echo 0 || echo 1)" \
     "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+fresh_colab; export SSTUB_FAIL_ONCE=1
+( _colab_up t10 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24k2 a new runtime that refuses its first connection once is kept: up tries again and succeeds" \
+    "$([ $rc = 0 ] && [ -e "$C/failed_once" ] && ! grep -q '^stop' "$C/calls" && [ -e "$RT_HOME/colab-t10/colab.meta" ] && [ "$(grep -c . "$C/backend")" = 1 ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls") $(tail -n 2 "$C/err")"
+unset SSTUB_FAIL_ONCE
+# Sets: several runtimes made, used and released as one (2026-11-24). A set is all or nothing, so a
+# failure part-way never leaves some members billing; members are found by record, not by name.
+fresh_colab
+( _colab_up s --count 3 --hours 2 ) >/dev/null 2>"$C/err"; rc=$?
+idx=$(for k in 1 2 3; do sed -n 's/^COLAB_SET_INDEX=//p' "$RT_HOME/colab-s-$k/colab.meta" 2>/dev/null; done | tr -d '\n')
+chk "24w up --count 3 makes set s: s-1, s-2, s-3 created in order, each recorded with its set, number and size" \
+    "$([ $rc = 0 ] && [ "$(grep '^new' "$C/calls" | tr '\n' ';')" = 'new -s s-1;new -s s-2;new -s s-3;' ] && [ "$idx" = 123 ] && grep -qx 'COLAB_SET=s' "$RT_HOME/colab-s-2/colab.meta" && grep -qx 'COLAB_SET_SIZE=3' "$RT_HOME/colab-s-3/colab.meta" && [ "$(grep -c . "$C/backend")" = 3 ] && echo 0 || echo 1)" \
+    "rc=$rc idx=$idx calls=$(tr '\n' ';' < "$C/calls") $(tail -n 2 "$C/err")"
+fresh_colab; export CSTUB_NEW_FAIL_FOR=s-3
+( _colab_up s --count 3 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24x a set is all or nothing: when s-3 cannot be created, s-1 and s-2 are released and no record is left" \
+    "$([ $rc != 0 ] && [ ! -s "$C/backend" ] && ! ls -d "$RT_HOME"/colab-s-* >/dev/null 2>&1 && grep -qx 'stop -s s-1' "$C/calls" && grep -qx 'stop -s s-2' "$C/calls" && echo 0 || echo 1)" \
+    "rc=$rc backend=$(tr '\n' ' ' < "$C/backend") $(tail -n 2 "$C/err")"
+unset CSTUB_NEW_FAIL_FOR
+fresh_colab; export SSTUB_FAIL_FOR=s-2
+( _colab_up s --count 3 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24x2 a member that exists but cannot be reached is released by its own trap, then the ones before it" \
+    "$([ $rc != 0 ] && [ ! -s "$C/backend" ] && ! ls -d "$RT_HOME"/colab-s-* >/dev/null 2>&1 && grep -qx 'stop -s s-2' "$C/calls" && ! grep -q 'new -s s-3' "$C/calls" && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+unset SSTUB_FAIL_FOR
+fresh_colab
+( _colab_write_alias() { return 1; }; _colab_up s --count 2 ) >/dev/null 2>&1; rc=$?
+chk "24x3 errexit holds inside each member even when the caller has it off: an alias that cannot be written releases it" \
+    "$([ $rc != 0 ] && [ ! -s "$C/backend" ] && ! ls -d "$RT_HOME"/colab-s-* >/dev/null 2>&1 && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+fresh_colab
+( _colab_up abcdefghijklmnopqrstuvwx --count 10 ) >/dev/null 2>&1; r1=$?
+( _colab_up s --count 11 ) >/dev/null 2>&1; r2=$?
+mkdir -p "$RT_HOME/colab-s-2"; ( _colab_up s --count 3 ) >/dev/null 2>&1; r3=$?; rmdir "$RT_HOME/colab-s-2"
+chk "24y every member is checked before anything bills: a name too long, too many members, or one already recorded" \
+    "$([ $r1 != 0 ] && [ $r2 != 0 ] && [ $r3 != 0 ] && ! grep -q '^new' "$C/calls" && echo 0 || echo 1)" \
+    "r1=$r1 r2=$r2 r3=$r3 calls=$(tr '\n' ';' < "$C/calls")"
+fresh_colab; ( _colab_up s --count 3 ) >/dev/null 2>&1; ( _colab_up t9 ) >/dev/null 2>&1
+( _colab_down --set s ) >/dev/null 2>"$C/err"; rc=$?
+chk "24z down --set releases every member of the set, and nothing else" \
+    "$([ $rc = 0 ] && [ "$(tr -d '\n' < "$C/backend")" = m-s-test-t9 ] && ! ls -d "$RT_HOME"/colab-s-* >/dev/null 2>&1 && [ -e "$RT_HOME/colab-t9/colab.meta" ] && echo 0 || echo 1)" \
+    "rc=$rc backend=$(tr '\n' ' ' < "$C/backend") $(tail -n 2 "$C/err")"
+fresh_colab; ( _colab_up s --count 3 ) >/dev/null 2>&1; export CSTUB_STOP_NOOP_FOR=s-2
+( _colab_down --set s ) >/dev/null 2>"$C/err"; rc=$?
+chk "24z2 a member that will not leave the account keeps its records and fails the command; the others are released" \
+    "$([ $rc != 0 ] && [ -e "$RT_HOME/colab-s-2/colab.meta" ] && [ ! -e "$RT_HOME/colab-s-1" ] && [ ! -e "$RT_HOME/colab-s-3" ] && [ "$(tr -d '\n' < "$C/backend")" = m-s-test-s-2 ] && grep -q 'Not released: s-2' "$C/err" && echo 0 || echo 1)" \
+    "rc=$rc backend=$(tr '\n' ' ' < "$C/backend") $(tail -n 2 "$C/err")"
+unset CSTUB_STOP_NOOP_FOR
+fresh_colab; ( _colab_up s --count 3 ) >/dev/null 2>&1
+# The stand-in reads its stdin as rt exec does, so a member list left on stdin would end the loop early.
+_colab_member_exec() { cat > /dev/null; printf '%s\n' "$*" >> "$C/member_exec"; [ -z "${MSTUB_FAIL_FOR:-}" ] || [ "$1" != "colab-$MSTUB_FAIL_FOR/work" ]; }
+: > "$C/member_exec"
+( _colab_exec_set s --bg --name prep 'python3 job.py' ) > "$C/out" 2>"$C/err"; rc=$?
+chk "24z3 exec SET runs the command on each member in number order, with its shard number and the set size exported" \
+    "$([ $rc = 0 ] && [ "$(grep -c . "$C/member_exec")" = 3 ] && [ "$(sed -n 2p "$C/member_exec")" = 'colab-s-2/work --bg --name prep export RT_SHARD=2 RT_SHARDS=3; python3 job.py' ] && grep -qx '== s-3 (shard 3 of 3)' "$C/out" && echo 0 || echo 1)" \
+    "rc=$rc $(tr '\n' ';' < "$C/member_exec")"
+: > "$C/member_exec"; export MSTUB_FAIL_FOR=s-1
+( _colab_exec_set s 'true' ) >/dev/null 2>"$C/err"; rc=$?
+chk "24z4 a member where the command fails does not stop the others, and the whole command fails naming it" \
+    "$([ $rc != 0 ] && [ "$(grep -c . "$C/member_exec")" = 3 ] && grep -q 'failed on: s-1' "$C/err" && echo 0 || echo 1)" "rc=$rc $(tail -n 1 "$C/err")"
+unset MSTUB_FAIL_FOR
+rm -rf "$RT_HOME/colab-s-2"; : > "$C/member_exec"
+( _colab_exec_set s 'true' ) >/dev/null 2>"$C/err"; rc=$?
+chk "24z5 a set with a member missing here refuses before running anything, since one shard would not run" \
+    "$([ $rc != 0 ] && [ ! -s "$C/member_exec" ] && grep -q 's-2' "$C/err" && echo 0 || echo 1)" "rc=$rc $(tail -n 1 "$C/err")"
+# Google Drive (2026-11-24): mounted through the official `colab drivemount`, which exits 0 also when
+# the mount failed, and wants one browser approval per runtime. Its queued writes are pushed before
+# rt releases a runtime, by `down` and by the watchdog.
+_colab_open_url() { echo "$1" >> "$C/opened"; }
+fresh_colab; ( _colab_up t11 ) >/dev/null 2>&1; ( _colab_up t12 ) >/dev/null 2>&1
+( _colab_drive t11 t12 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24d2 drive mounts on every runtime named, keeps the CLI from opening a browser, and records the mount" \
+    "$([ $rc = 0 ] && grep -qx 'drivemount -s t11 /content/drive' "$C/calls" && grep -qx 'drivemount -s t12 /content/drive' "$C/calls" && [ "$(cat "$C/browser-t11" "$C/browser-t12" 2>/dev/null | tr '\n' ' ')" = 'true true ' ] && grep -qx 'COLAB_DRIVE=1' "$RT_HOME/colab-t11/colab.meta" && grep -qx 'COLAB_DRIVE=1' "$RT_HOME/colab-t12/colab.meta" && [ ! -e "$C/opened" ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls") $(tail -n 2 "$C/err")"
+fresh_colab; ( _colab_up t11 ) >/dev/null 2>&1; ( _colab_up t12 ) >/dev/null 2>&1; export CSTUB_DRIVE_PENDING=t12
+( _colab_drive t11 t12 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24d3 a runtime still waiting for approval is not taken as mounted: only its page is opened, and the command fails naming it" \
+    "$([ $rc != 0 ] && grep -qx 'COLAB_DRIVE=1' "$RT_HOME/colab-t11/colab.meta" && ! grep -q 'COLAB_DRIVE' "$RT_HOME/colab-t12/colab.meta" && [ "$(cat "$C/opened" 2>/dev/null)" = 'https://accounts.google.com/o/oauth2/v2/auth?state=st-t12' ] && grep -q 'rt colab drive t12' "$C/err" && echo 0 || echo 1)" \
+    "rc=$rc opened=$(cat "$C/opened" 2>/dev/null) $(tail -n 1 "$C/err")"
+unset CSTUB_DRIVE_PENDING
+fresh_colab
+( _colab_up s --count 2 --drive ) >/dev/null 2>"$C/err"; rc=$?
+chk "24d4 up --count 2 --drive mounts Drive on both members" \
+    "$([ $rc = 0 ] && grep -qx 'COLAB_DRIVE=1' "$RT_HOME/colab-s-1/colab.meta" && grep -qx 'COLAB_DRIVE=1' "$RT_HOME/colab-s-2/colab.meta" && echo 0 || echo 1)" "rc=$rc $(tail -n 2 "$C/err")"
+fresh_colab; ( _colab_up t11 ) >/dev/null 2>&1; ( _colab_drive t11 ) >/dev/null 2>&1; : > "$C/calls"
+( _colab_down t11 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24d5 down pushes Drive's pending writes before it stops the runtime" \
+    "$([ $rc = 0 ] && [ "$(grep -E '^(flush|stop)' "$C/calls" | tr '\n' ';')" = 'flush colab-t11;stop -s t11;' ] && [ ! -e "$RT_HOME/colab-t11" ] && echo 0 || echo 1)" \
+    "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+fresh_colab; ( _colab_up t11 ) >/dev/null 2>&1; ( _colab_drive t11 ) >/dev/null 2>&1; : > "$C/calls"; export SSTUB_FLUSH_FAIL=1
+( _colab_down t11 ) >/dev/null 2>"$C/err"; r1=$?; c1=$(tr '\n' ';' < "$C/calls")
+( _colab_down t11 --no-flush ) >/dev/null 2>&1; r2=$?
+chk "24d6 a flush that does not confirm keeps the runtime and its records; --no-flush releases it without one" \
+    "$([ $r1 != 0 ] && [[ "$c1" != *stop* ]] && grep -q -- '--no-flush' "$C/err" && [ $r2 = 0 ] && [ ! -e "$RT_HOME/colab-t11" ] && [ "$(grep -c '^flush' "$C/calls")" = 1 ] && echo 0 || echo 1)" \
+    "r1=$r1 r2=$r2 calls=$(tr '\n' ';' < "$C/calls")"
+unset SSTUB_FLUSH_FAIL
+fresh_colab; ( _colab_up t11 ) >/dev/null 2>&1; ( _colab_drive t11 ) >/dev/null 2>&1; : > "$C/backend"; : > "$C/calls"
+( _colab_down t11 ) >/dev/null 2>&1; rc=$?
+chk "24d7 a Drive runtime already off the account is cleared without a flush it could not do" \
+    "$([ $rc = 0 ] && ! grep -q '^flush' "$C/calls" && [ ! -e "$RT_HOME/colab-t11" ] && echo 0 || echo 1)" "rc=$rc calls=$(tr '\n' ';' < "$C/calls")"
+_colab_watchdog_script > "$C/wd2.sh"
+fl=$(sed -n '/^release() {/,/^}/{/drive_flush >>/=;}' "$C/wd2.sh"); un=$(sed -n '/^release() {/,/^}/{/unassign/=;}' "$C/wd2.sh")
+chk "24d8 the watchdog pushes Drive's pending writes before it calls unassign, and still releases if that fails" \
+    "$(bash -n "$C/wd2.sh" && grep -q '^drive_flush() {' "$C/wd2.sh" && [ -n "$fl" ] && [ -n "$un" ] && [ "$fl" -lt "$un" ] && grep -q 'releasing anyway' "$C/wd2.sh" && echo 0 || echo 1)" "flush@$fl unassign@$un"
 fresh_colab
 
 if real=$(command -v colab 2>/dev/null) && [ -n "$real" ]; then

@@ -89,8 +89,25 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   the runtime unless the VM reports the digest of exactly the script rt sent. It releases via
   `POST http://$TBE_RUNTIME_ADDR/unassign` (read from a Colab process's environment), the endpoint
   behind `google.colab.runtime.unassign()`.
-- Failure paths release: a failed first ssh or watchdog install calls `_colab_release_and_forget`,
-  which deletes local records only after the account list no longer shows the endpoint.
+- Failure paths release: a first ssh that fails three times (two retries through `_colab_heal_slot`,
+  since one runtime refused it once right after READY), or a failed watchdog install, calls
+  `_colab_release_and_forget`, which deletes local records only after the account list no longer
+  shows the endpoint.
+- Sets: `up --count N` checks every member name first, then creates NAME-1..N through `_colab_up_one`,
+  each in a subshell with errexit forced on (`set +e; ( set -e; ... ); rc=$?`): run as an if/||
+  condition, bash ignores -e inside, and a member that dies part-way would skip its own release.
+  A failure releases the members already up. Members carry COLAB_SET/_INDEX/_SIZE in colab.meta;
+  `down --set` and `exec SET` find them by record (`_colab_set_members`), never by name pattern.
+  `exec SET` runs rt itself per member (`_colab_member_exec`, the test seam) with `RT_SHARD`/
+  `RT_SHARDS` exported and stdin closed, since rt exec forwards stdin to the remote command.
+- Google Drive (`--drive`, `rt colab drive`): the official `colab drivemount`, run in parallel with
+  `BROWSER=true` so the CLI does not open a page per attempt. It exits 0 also when the mount failed,
+  so each VM is asked (`mount | grep 'type fuse.drive'`); approval is per runtime (the consent URL's
+  `state` carries the runtime), so rt opens the URLs of those not mounted (`_colab_open_url`, the
+  test seam) and the user runs the command again. `_colab_drive_flush_fn` (Colab's
+  `drive.flush_and_unmount()`, with CLOUDSDK_CONFIG read from a Colab process, which an ssh login
+  lacks) is shared by the watchdog, which releases even when it fails, and `down`, which then keeps
+  the runtime unless `--no-flush`. COLAB_DRIVE=1 in colab.meta marks a mount rt made.
 - Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q).
 
 ## CC Integration: SKILL + slash command

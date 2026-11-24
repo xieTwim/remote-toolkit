@@ -3028,9 +3028,17 @@ busy() {   # <cpu jiffies used in the last interval> <threshold>
   for s in $(pgrep -f '^sshd(-session)?: root@'); do pgrep -P "$s" >/dev/null && return 0; done
   [ "$1" -ge "$2" ]
 }
+WATCHDOG
+  _colab_drive_flush_fn
+  cat <<'WATCHDOG'
 release() {
   local a
   log "releasing: $1"
+  # Google Drive queues writes on the VM; releasing first would drop them. The release still follows
+  # a failed flush: the watchdog's job is that billing stops.
+  if mount | grep -q 'type fuse.drive'; then
+    if drive_flush >> "$d/watchdog.log" 2>&1; then log "drive: pending writes pushed, unmounted"; else log "drive: flush failed or timed out; releasing anyway"; fi
+  fi
   a=$(tbe_addr) || { log "TBE_RUNTIME_ADDR not found, cannot release"; return; }
   curl -sS -m 20 -X POST -o /dev/null -w 'unassign http %{http_code}\n' "http://$a/unassign" >> "$d/watchdog.log" 2>&1
 }
@@ -3047,6 +3055,23 @@ while sleep 60; do
   if [ $((now - last)) -ge $((idle * 60)) ]; then release "idle for $idle min"; sleep 120; fi
 done
 WATCHDOG
+}
+
+# Google Drive mounted on a runtime (rt colab drive) keeps recent writes queued on the VM; this pushes
+# them and unmounts. Colab's drive module finds its own binary through CLOUDSDK_CONFIG, which only
+# Colab's processes carry, not an ssh login (measured 2026-11-24: 4 s for a small queue).
+_colab_drive_flush_fn() {
+  cat <<'FLUSH'
+drive_flush() {   # 0 once nothing is left to push, also when no Drive is mounted
+  mount | grep -q 'type fuse.drive' || return 0
+  local p v=""
+  for p in $(pgrep -f 'colab-fileshim|jupyter-server|kernel_manager_proxy'); do
+    v=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^CLOUDSDK_CONFIG=//p' | head -n 1)
+    [ -n "$v" ] && break
+  done
+  CLOUDSDK_CONFIG="${v:-/content/.config}" timeout 600 python3 -c 'from google.colab import drive; drive.flush_and_unmount()'
+}
+FLUSH
 }
 
 # Installs and (re)starts the watchdog, then prints the digest of the file it runs. Sent as one
@@ -3135,7 +3160,7 @@ _colab_setup() {
 }
 
 _colab_up() {
-  local name="" hours=4 idle="" accel="" hm="" hw bin before after ep now deadline
+  local name="" hours=4 idle="" accel="" hm="" hw count="" drive="" k j rc had_e=0 failed=""
   local -a new_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -3145,14 +3170,15 @@ _colab_up() {
                        new_args+=("$1" "$2"); accel="$(printf '%s' "${1#--}" | tr 'a-z' 'A-Z') $2"; shift 2 ;;
       --hours)         [[ $# -ge 2 ]] || die "--hours needs a value"; hours="$2"; shift 2 ;;
       --idle-minutes)  [[ $# -ge 2 ]] || die "--idle-minutes needs a value"; idle="$2"; shift 2 ;;
+      --count)         [[ $# -ge 2 ]] || die "--count needs a value"; count="$2"; shift 2 ;;
+      --drive)         drive=1; shift ;;
       -*)              die "Unknown option for 'rt colab up': $1" ;;
       *)               [[ -z "$name" ]] || die "One runtime name only (got '$name' and '$1')."
                        name="$1"; shift ;;
     esac
   done
-  [[ -n "$name" ]] || die "Usage: rt colab up NAME [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M]"
+  [[ -n "$name" ]] || die "Usage: rt colab up NAME [--count N] [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M] [--drive]"
   _colab_name "$name"
-  _colab_paths "$name"
   hw="${accel:-CPU}${hm}"
   [[ "$hours" =~ ^[0-9]+$ ]] && hours=$((10#$hours)) && (( hours >= 1 && hours <= 24 )) \
     || die "--hours must be a whole number from 1 to 24 (Colab ends a runtime at 24 h anyway)."
@@ -3160,6 +3186,41 @@ _colab_up() {
   [[ -n "$idle" ]] || { [[ -n "$accel" ]] && idle=10 || idle=20; }
   [[ "$idle" =~ ^[0-9]+$ ]] && idle=$((10#$idle)) && (( idle >= 5 && idle <= 600 )) \
     || die "--idle-minutes must be a whole number from 5 to 600."
+  if [[ -z "$count" ]]; then _colab_up_one "$name"; [[ -z "$drive" ]] || _colab_drive "$name"; return; fi
+
+  # A set: NAME-1 .. NAME-N, each a runtime exactly like the one above, recorded with its set so
+  # that `down --set` and `exec` find the members by record, never by a name pattern.
+  [[ "$count" =~ ^[0-9]+$ ]] && count=$((10#$count)) && (( count >= 1 && count <= 10 )) \
+    || die "--count must be a whole number from 1 to 10."
+  for ((k = 1; k <= count; k++)); do
+    _colab_name "$name-$k"
+    [[ ! -e "$RT_HOME/colab-$name-$k" ]] \
+      || die "Host group colab-$name-$k already exists, so set '$name' cannot be made. 'rt colab ls' shows it."
+  done
+  info "Creating set '$name': $count runtimes, $name-1 to $name-$count ($hw each), one after another."
+  [[ $- == *e* ]] && had_e=1
+  for ((k = 1; k <= count; k++)); do
+    # errexit ON inside, whatever the caller has: a member that dies part-way must still reach its
+    # own EXIT trap, which releases it. (Run as an if/|| condition, bash would ignore -e in there.)
+    set +e; ( set -e; _colab_up_one "$name-$k" "$name" "$k" "$count" ); rc=$?; (( had_e )) && set -e
+    [[ $rc != 0 ]] || continue
+    warn "'$name-$k' could not be created. A set is all or nothing, so the $((k - 1)) already up are being released."
+    for ((j = 1; j < k; j++)); do
+      set +e; ( set -e; _colab_down_one "$name-$j" ); rc=$?; (( had_e )) && set -e
+      [[ $rc == 0 ]] || failed+=" $name-$j"
+    done
+    [[ -z "$failed" ]] || die "Could not release:$failed. They are still recorded; retry 'rt colab down --set $name'."
+    die "Nothing of set '$name' is left running: '$name-$k' failed (its message is above)."
+  done
+  info "Set '$name' is up: $name-1 to $name-$count."
+  info "  Every one runs a command, with RT_SHARD=1..$count and RT_SHARDS=$count set: rt colab exec $name --bg --name JOB 'COMMAND'"
+  info "  Release them all: rt colab down --set $name"
+  [[ -z "$drive" ]] || _colab_drive --set "$name"
+}
+
+_colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up parsed (hw, hours, idle, new_args)
+  local name="$1" bin before after ep now deadline
+  _colab_paths "$name"
   [[ ! -e "$COLAB_DIR" ]] || die "Host group $COLAB_GROUP already exists. 'rt colab ls' shows it; 'rt colab down $name' releases it."
   bin=$(_colab_bin)
   _colab_check_paths "$bin"
@@ -3188,6 +3249,7 @@ _colab_up() {
   {
     printf 'COLAB_ENDPOINT=%q\nCOLAB_HARDWARE=%q\n' "$ep" "$hw"
     printf 'COLAB_CREATED=%s\nCOLAB_DEADLINE=%s\nCOLAB_IDLE_MINUTES=%s\n' "$now" "$deadline" "$idle"
+    [[ -z "${2:-}" ]] || printf 'COLAB_SET=%q\nCOLAB_SET_INDEX=%s\nCOLAB_SET_SIZE=%s\n' "$2" "$3" "$4"
   } > "$COLAB_META"
   COLAB_ENDPOINT="$ep"
   printf '# Colab runtime %s (%s): written by rt colab up; rt colab down %s releases it.\nREMOTE_HOST="%s"\n' \
@@ -3195,32 +3257,191 @@ _colab_up() {
   printf 'REMOTE_DIR="/content/work"\n' > "$COLAB_DIR/work.conf"
   _colab_write_alias "$bin"
 
-  # The first connection becomes the master: the one ssh connection the runtime allows.
+  # The first connection becomes the master: the one ssh connection the runtime allows. A runtime
+  # that had just reported READY refused it once (2026-11-24, one creation in about a dozen), so it
+  # gets two more tries, through the heal path in case the failed attempt left a session holding the slot.
   if ! _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" true </dev/null; then
-    warn "ssh to the new runtime failed: $(tail -n 3 "$COLAB_PROXY_LOG" 2>/dev/null | tr '\n' ' ')"
-    die "Releasing '$name' so that it does not bill unused."
+    sleep "${RT_COLAB_FIRST_SSH_WAIT:-10}"
+    if ! _colab_heal_slot "$name"; then
+      sleep "${RT_COLAB_FIRST_SSH_WAIT:-10}"
+      _colab_heal_slot "$name" || {
+        warn "ssh to the new runtime failed three times: $(tail -n 3 "$COLAB_PROXY_LOG" 2>/dev/null | tr '\n' ' ')"
+        die "Releasing '$name' so that it does not bill unused."
+      }
+    fi
   fi
   _colab_install_watchdog "$deadline" "$idle" \
     || die "The watchdog did not start, so '$name' is being released: rt never leaves a runtime up without one."
   trap - EXIT
   after=$(_colab_usage_summary "$bin" || echo "unknown")
   info "Runtime '$name' is up ($hw, endpoint $ep). Account now: $after"
+  [[ -z "${2:-}" ]] || return 0   # a set member: the set prints the one summary
   info "  Profile $COLAB_GROUP/work, REMOTE_DIR /content/work, no sync: move files with rt push / rt fetch."
   info "    rt -p $COLAB_GROUP/work exec 'nproc'"
   info "  It releases itself at $(_colab_fmt_time "$deadline") or after $idle idle minutes; 'rt colab down $name' releases it now."
   info "  Its disk goes with it: fetch results before that."
 }
 
-_colab_down() {
-  local bin
-  [[ $# -eq 1 ]] || die "Usage: rt colab down NAME"
+# The runtimes a command names: NAME [NAME ...], or --set SET for every member recorded here.
+_colab_targets() {   # sets COLAB_TARGETS; 1 when nothing was named
+  local sname="" idx n members
+  COLAB_TARGETS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --set) [[ $# -ge 2 ]] || die "--set needs the set's name"; sname="$2"; shift 2 ;;
+      -*)    die "Unknown option: $1" ;;
+      *)     COLAB_TARGETS+=("$1"); shift ;;
+    esac
+  done
+  if [[ -n "$sname" ]]; then
+    [[ ${#COLAB_TARGETS[@]} -eq 0 ]] || die "Give either --set SET or runtime names, not both."
+    _colab_name "$sname"
+    members=$(_colab_set_members "$sname")
+    [[ -n "$members" ]] || die "No runtime of set '$sname' is recorded here ('rt colab ls' lists them)."
+    while read -r idx n; do COLAB_TARGETS+=("$n"); done <<<"$members"
+  fi
+  [[ ${#COLAB_TARGETS[@]} -gt 0 ]] || return 1
+  for n in "${COLAB_TARGETS[@]}"; do _colab_name "$n"; done
+}
+
+_colab_down() {   # NAME [NAME ...] | --set SET   [--no-flush]
+  local n failed="" rc had_e=0
+  local -a rest=()
+  COLAB_NO_FLUSH=0
+  for n in "$@"; do if [[ "$n" == --no-flush ]]; then COLAB_NO_FLUSH=1; else rest+=("$n"); fi; done
+  _colab_targets ${rest[@]+"${rest[@]}"} || die "Usage: rt colab down NAME [NAME ...] | rt colab down --set SET   [--no-flush]"
+  if [[ ${#COLAB_TARGETS[@]} -eq 1 ]]; then _colab_down_one "${COLAB_TARGETS[0]}"; return; fi
+  # Each in its own subshell with errexit on (see _colab_up), so one that will not go does not
+  # stop the rest from being released.
+  [[ $- == *e* ]] && had_e=1
+  for n in "${COLAB_TARGETS[@]}"; do
+    set +e; ( set -e; _colab_down_one "$n" ); rc=$?; (( had_e )) && set -e
+    [[ $rc == 0 ]] || failed+=" $n"
+  done
+  [[ -z "$failed" ]] || die "Not released:$failed. Their records are kept; retry 'rt colab down' for each."
+}
+
+_colab_set_members() {   # <set>: "<number> <name>" for each member recorded here, in number order
+  local meta s
+  for meta in "$RT_HOME"/colab-*/colab.meta; do
+    [[ -f "$meta" ]] || continue
+    s=$(COLAB_SET=""; . "$meta"; printf '%s' "$COLAB_SET")
+    [[ "$s" == "$1" ]] || continue
+    printf '%s %s\n' "$(COLAB_SET_INDEX=0; . "$meta"; printf '%s' "$COLAB_SET_INDEX")" \
+      "$(basename "$(dirname "$meta")" | sed 's/^colab-//')"
+  done | sort -n
+}
+
+# One rt per member, so each gets its own profile state.
+_colab_member_exec() { "$RT_SCRIPT_DIR/rt" -p "$1" exec "${@:2}"; }
+
+_colab_exec_set() {   # SET [--bg] [--name JOB] [--timeout S] COMMAND
+  local sname="${1:-}" cmd members size n idx name failed="" missing=""
+  local -a opts=()
+  [[ -n "$sname" ]] || die "Usage: rt colab exec SET [--bg --name JOB] [--timeout S] 'COMMAND'"
+  shift
+  _colab_name "$sname"
+  while [[ $# -gt 1 ]]; do
+    case "$1" in
+      --bg)             opts+=(--bg); shift ;;
+      --name|--timeout) opts+=("$1" "$2"); shift 2 ;;
+      --)               shift; break ;;
+      -*)               die "Unknown option for 'rt colab exec': $1 (it passes on --bg, --name and --timeout)." ;;
+      *)                break ;;
+    esac
+  done
+  [[ $# -eq 1 ]] || die "Give the command as one quoted argument after the options: rt colab exec $sname [--bg --name JOB] 'COMMAND'"
+  cmd="$1"
+  members=$(_colab_set_members "$sname")
+  [[ -n "$members" ]] || die "No runtime of set '$sname' is recorded here ('rt colab ls' lists them)."
+  size=$(COLAB_SET_SIZE=0; . "$RT_HOME/colab-$(head -n 1 <<<"$members" | cut -d' ' -f2)/colab.meta"; printf '%s' "$COLAB_SET_SIZE")
+  for ((n = 1; n <= size; n++)); do grep -q "^$n " <<<"$members" || missing+=" $sname-$n"; done
+  [[ -z "$missing" ]] \
+    || die "Set '$sname' has no record here of$missing, so not every shard would run. Run the command on each runtime with rt -p colab-NAME/work exec, or make the set again."
+  while read -r idx name; do
+    printf '== %s (shard %s of %s)\n' "$name" "$idx" "$size"
+    # stdin closed: rt exec forwards stdin to the remote command, which would read the rest of this list.
+    _colab_member_exec "colab-$name/work" ${opts[@]+"${opts[@]}"} "export RT_SHARD=$idx RT_SHARDS=$size; $cmd" </dev/null \
+      || failed+=" $name"
+  done <<<"$members"
+  [[ -z "$failed" ]] || die "The command failed on:$failed"
+}
+
+_colab_drive_flush_remote() {   # <name>: 0 once Google Drive on it has pushed its pending writes (or none is mounted)
+  local b64 out
+  ssh -O check "$COLAB_GROUP" >/dev/null 2>&1 || _colab_heal_slot "$1" || true
+  b64=$( { _colab_drive_flush_fn; printf 'if drive_flush >&2; then echo RT_DRIVE_OK; else echo RT_DRIVE_FAILED; fi\n'; } | base64 | tr -d '\n')
+  out=$(_colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" "printf %s '$b64' | base64 -d | bash" </dev/null) || return 1
+  [[ "$out" == *RT_DRIVE_OK* ]]
+}
+
+_colab_open_url() {   # one seam, so the tests can stand in for the browser
+  if [[ "$(uname -s)" == Darwin ]] && command -v open >/dev/null 2>&1 && open "$1" >/dev/null 2>&1; then return 0; fi
+  printf '  %s\n' "$1" >&2
+}
+
+# Google Drive at /content/drive on each runtime named, through the official `colab drivemount`.
+# Measured 2026-11-24: Google wants one approval in a browser per runtime (its consent URL carries
+# the runtime), the next mount on that runtime needs none, and a file written on one runtime was
+# visible on another 12 s later. The mount gives everything on the VM the whole My Drive.
+_colab_drive() {   # NAME [NAME ...] | --set SET
+  local bin n url tmp pend="" ok=""
+  local -a pids=() urls=()
+  _colab_targets "$@" || die "Usage: rt colab drive NAME [NAME ...] | rt colab drive --set SET"
+  bin=$(_colab_bin)
+  for n in "${COLAB_TARGETS[@]}"; do
+    _colab_paths "$n"
+    [[ -d "$COLAB_DIR" ]] || die "No runtime '$n' recorded here ('rt colab ls' lists them)."
+  done
+  tmp="${RT_HOME}/.rt/_colab/drive.$$"; mkdir -p "$tmp"
+  info "Mounting Google Drive at /content/drive on: ${COLAB_TARGETS[*]} ..."
+  # All at once, since a runtime still waiting for its approval takes about two minutes to fail.
+  # BROWSER=true keeps the CLI from opening a page on every attempt; rt opens only those still needed.
+  for n in "${COLAB_TARGETS[@]}"; do
+    _colab_paths "$n"
+    BROWSER=true "$bin" --config "$COLAB_JSON" drivemount -s "$n" /content/drive </dev/null >"$tmp/$n.log" 2>&1 &
+    pids+=("$!")
+  done
+  for n in "${pids[@]}"; do wait "$n" || true; done
+  # The CLI exits 0 also when the mount failed, so each VM is asked.
+  for n in "${COLAB_TARGETS[@]}"; do
+    _colab_paths "$n"
+    if _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" "mount | grep -q 'type fuse.drive'" </dev/null; then
+      grep -qx 'COLAB_DRIVE=1' "$COLAB_META" || printf 'COLAB_DRIVE=1\n' >> "$COLAB_META"
+      ok+=" $n"
+    else
+      pend+=" $n"
+      url=$(grep -o 'https://accounts\.google\.com/o/oauth2/[^[:space:]]*' "$tmp/$n.log" | head -n 1 || true)
+      [[ -z "$url" ]] || urls+=("$url")
+    fi
+  done
+  rm -rf "$tmp"
+  [[ -z "$ok" ]] || info "Google Drive is mounted at /content/drive on:$ok. Whatever runs there can read and change every file in this account's My Drive."
+  [[ -n "$pend" ]] || return 0
+  if [[ ${#urls[@]} -gt 0 ]]; then
+    warn "Google wants one approval per runtime. Opening the page for:$pend. Approve each with the account the colab CLI signed in with."
+    for url in "${urls[@]}"; do _colab_open_url "$url"; done
+  fi
+  die "Google Drive is not mounted on:$pend. Once each page is approved, run: rt colab drive$pend"
+}
+
+_colab_down_one() {   # <name>
+  local bin list on=1
   _colab_name "$1"
   _colab_paths "$1"
   [[ -d "$COLAB_DIR" ]] || die "No runtime '$1' recorded here ('rt colab ls' lists them)."
-  COLAB_ENDPOINT=""
+  COLAB_ENDPOINT=""; COLAB_DRIVE=0
   # shellcheck source=/dev/null
   [[ -f "$COLAB_META" ]] && . "$COLAB_META"
   bin=$(_colab_bin)
+  # Google Drive queues writes on the VM: release it before they are pushed and they are lost. A
+  # runtime already off the account has nothing left to push.
+  if [[ -n "$COLAB_ENDPOINT" ]] && list=$(_colab_account_list "$bin") && ! grep -qF "$COLAB_ENDPOINT" <<<"$list"; then on=0; fi
+  if [[ $on == 1 && "$COLAB_DRIVE" == 1 && "${COLAB_NO_FLUSH:-0}" != 1 ]]; then
+    info "Saving Google Drive's pending writes on '$1' before it goes ..."
+    _colab_drive_flush_remote "$1" \
+      || die "Google Drive on '$1' did not confirm that its pending writes were saved, so '$1' is kept. Retry 'rt colab down $1', or release it anyway with 'rt colab down $1 --no-flush'."
+  fi
   _colab_release_and_forget "$bin" || exit 1
   info "Released '$1' (${COLAB_ENDPOINT:-endpoint unknown}); its ssh alias and rt profile are gone. Account: $(_colab_usage_summary "$bin" || echo unknown)"
 }
@@ -3325,12 +3546,14 @@ cmd_colab() {
     setup)      _colab_setup "$@" ;;
     up)         _colab_up "$@" ;;
     down)       _colab_down "$@" ;;
+    exec)       _colab_exec_set "$@" ;;
+    drive)      _colab_drive "$@" ;;
     ls|list)    _colab_ls "$@" ;;
     usage)      _colab_common_paths; bin=$(_colab_bin); "$bin" usage ;;
     reconnect)  _colab_reconnect "$@" ;;
     extend)     _colab_extend "$@" ;;
     ""|help)    _sub_help colab ;;
-    *)          die "Unknown command: rt colab $sub. Use setup, up, down, ls, usage, reconnect or extend." ;;
+    *)          die "Unknown command: rt colab $sub. Use setup, up, down, exec, drive, ls, usage, reconnect or extend." ;;
   esac
 }
 
@@ -3415,7 +3638,7 @@ COMMANDS:
   colab setup          One-time, for Google Colab runtimes: an ed25519 key, an
                        Include line in ~/.ssh/config, and the canary proving the
                        installed colab CLI cannot create a runtime from ssh
-  colab up NAME [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M]
+  colab up NAME [--count N] [--high-mem] [--gpu G | --tpu T] [--hours H] [--idle-minutes M] [--drive]
                        Create a Colab runtime and make it profile colab-NAME/work
                        (REMOTE_DIR /content/work; no sync: use push and fetch).
                        One ssh connection per runtime, shared by every rt call.
@@ -3423,7 +3646,23 @@ COMMANDS:
                        release stops it billing: a watchdog on the VM releases it
                        after H hours (default 4) or M idle minutes (default 20;
                        10 with an accelerator).
-  colab down NAME      Release it, confirm it left the account, drop its profile
+                       --count N (1-10) makes a set: runtimes NAME-1 ... NAME-N,
+                       each as above, created one after another. All or nothing:
+                       if one cannot be created, those already up are released.
+                       --drive then mounts Google Drive on each (see colab drive).
+  colab exec SET [--bg --name JOB] [--timeout S] 'COMMAND'
+                       Run COMMAND on every runtime of set SET in turn, with
+                       RT_SHARD (1..N, the runtime's number) and RT_SHARDS (N)
+                       exported; with --bg each runs it as its own background job
+  colab drive NAME [NAME ...] | --set SET
+                       Mount Google Drive at /content/drive on each: shared by every
+                       runtime that mounts it, and open to whatever runs there (the
+                       whole My Drive). Google wants one approval per runtime in a
+                       browser: rt opens the pages still needed; run it again after.
+  colab down NAME [NAME ...] | --set SET [--no-flush]
+                       Release them, confirm each left the account, drop their profiles.
+                       Drive's pending writes are pushed first; a runtime that does not
+                       confirm it is kept, unless --no-flush.
   colab ls             Runtimes made here, then any other on the account (untouched)
   colab usage          Compute-unit balance and the account's hourly rate
   colab reconnect NAME Re-open the connection, freeing a slot a vanished one holds

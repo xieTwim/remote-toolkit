@@ -318,14 +318,17 @@ rt -p fact-cluster/scratch slurm cancel 12345                               # sc
 
 A Colab runtime is a disposable VM billed in compute units (CU) from the account's balance. `rt colab up` creates one and makes it an ordinary profile, `colab-<name>/work`, so `exec`, `exec --bg`, `logs`, `push` and `fetch` work on it as on any host. Good for CPU work that fits a throwaway machine: data processing, builds, evaluations that are not timed, several workers in parallel. Not for benchmarks that need stable timing (shared VMs, the CPU model varies) and not for anything that must outlive the runtime's disk.
 
-Measured 2026-11-23 (google-colab-cli 0.8.0):
+Measured 2026-11-23/24 (google-colab-cli 0.8.0):
 
-| shape | flag | CPU | RAM | CU/hour |
-|---|---|---|---|---|
-| standard | (none) | 2 vCPU | 12 GB | 0.08 |
-| high-RAM | `--high-mem` | 8 vCPU | 50 GB | 0.26 |
+| shape | flag | CPU | RAM | accelerator | disk | CU/hour |
+|---|---|---|---|---|---|---|
+| standard | (none) | 2 vCPU | 12 GB | — | 226 GB | 0.08 |
+| high-RAM | `--high-mem` | 8 vCPU | 50 GB | — | 226 GB | 0.26 |
+| T4 | `--gpu T4` | 2 vCPU | 12 GB | Tesla T4, 15 GB | 236 GB | 1.15 |
+| L4 | `--gpu L4` | 12 vCPU | 52 GB | L4, 22 GB | 236 GB | 1.94 |
+| TPU v5e | `--tpu v5e1` | 24 vCPU | 47 GB | one v5e chip | 226 GB | 3.09 |
 
-Every runtime has a 226 GB disk, Ubuntu 24.04, Python 3.13, and gcc, git, tmux, rsync and curl. GPU (`--gpu T4|L4|G4|A100|H100`) and TPU (`--tpu v5e1|v6e1`) runtimes cost many times more — others report about 1.2 CU/h for a T4 and 5.4 for an A100 (not measured here) — so never start one without the user's go-ahead.
+All run Ubuntu 24.04 and Python 3.13 with gcc, git, tmux, rsync and curl. Over rt's ssh, CUDA works on T4 and L4 (PyTorch 2.14, CUDA 13.0); JAX on the TPU does not, since the ssh login lacks the TPU environment Colab gives its kernel, so the TPU runtime is for now a 24-vCPU, 47 GB CPU machine. A100, G4, H100 and v6e1 were refused through the CLI on 2026-11-24 (HTTP 503; v6e1 timed out), as others had reported the day before (google-colab-cli#273). Accelerators cost many times a CPU runtime, so never start one without the user's go-ahead.
 
 **Setup (once per machine).** Install the official CLI pinned — `uv tool install --python 3.12 'google-colab-cli==0.8.0'` — and have the **user** sign in by running `colab usage` in a terminal (it prints a link; they approve every scope and paste back the code; the token goes to the OS keychain). Then `rt colab setup` creates `~/.ssh/rt_colab_ed25519`, puts `Include ~/.ssh/rt-colab.d/*.conf` at the top of `~/.ssh/config`, and runs the canary below.
 
@@ -340,6 +343,21 @@ rt colab ls                                  # rt's runtimes, then any other on 
 rt colab usage                               # balance and the account's hourly rate
 ```
 
+**Several runtimes at once (a set).** `rt colab up etl --count 5 --high-mem` makes etl-1 to etl-5 one after another, each with its own watchdog. If one cannot be made, those already up are released, so a set is all or nothing. `rt colab exec etl [--bg --name JOB] 'COMMAND'` runs COMMAND on each in turn with `RT_SHARD` (1-5, the runtime's number) and `RT_SHARDS` (5) exported, so the job takes its own share of the input (`files[shard-1::shards]` in Python). `rt colab down --set etl` releases them all. The members share no disk unless Drive is mounted (below): each fetches its own input, and results come back per member. How many runtimes the account allows at once is not known; four ran together when measured.
+
+```bash
+rt colab up etl --count 5 --high-mem --hours 6
+rt colab exec etl --bg --name prep 'python3 prep.py --shard "$RT_SHARD" --of "$RT_SHARDS"'
+rt -p colab-etl-3/work logs rt_colab-etl-3_work_bg_prep
+rt colab down --set etl
+```
+
+**Google Drive shared between runtimes, only when the user asks for it (rule 7).** `rt colab up ... --drive`, or `rt colab drive NAME ...` / `--set SET` on runtimes already up, mounts the account's Drive at `/content/drive` through the official `colab drivemount`. Measured 2026-11-24:
+- Google wants one approval in a browser **per runtime**. rt opens the pages still needed; the user approves each with the account the colab CLI signed in with, and the same `rt colab drive` command run again mounts them in 15-20 s each. A runtime that has mounted once needs no new approval.
+- A file written on one runtime was visible on another 12 s later.
+- Until `rt colab drive` reports a runtime mounted, `/content/drive` there is an ordinary directory on the VM's disk and goes with it at release: never write results there on the assumption.
+- Before a runtime goes, its queued Drive writes are pushed: by `rt colab down`, which keeps the runtime when the push does not confirm (`--no-flush` releases it anyway), and by the watchdog, which releases even if the push fails, so that billing stops.
+
 Rules:
 
 1. **Never run `colab ssh` yourself, in any form.** Bare `colab ssh` creates a runtime when none is recorded, and `colab ssh --proxy-mode -s NAME` — the form the CLI documents for `~/.ssh/config` — creates one whenever NAME is missing from its local record. That is by design, and the CLI drops the record once it notices the runtime is gone, so a later reconnect silently opens a new billable runtime. The aliases `rt colab up` writes bridge with `--colab-internal-mode cmd`, which only connects to an existing runtime (a released one answers 404). That option is hidden and could change in any release, so `rt colab setup` and every `rt colab up` first check offline, with the network cut, that the installed CLI still refuses to create; `up` refuses to run if it does not.
@@ -348,7 +366,7 @@ Rules:
 4. **Move data on the VM's side.** A runtime downloads from the internet at 140-180 MB/s; this Mac reaches it at about 4 MB/s through the proxy. Push code and small inputs; let the VM fetch datasets and models itself.
 5. **No Mutagen sync** (`rt connect`): the runtime and its disk are temporary. Use `push`/`fetch`, and fetch results before `down` or the deadline.
 6. **Other runtimes on the account are not yours.** `rt colab ls` lists them as `not ours`: another machine signed in to the same account, the web UI, or a lost record. Leave them alone and never run `colab stop --all`.
-7. **Keep the account out of the VM.** Do not mount Google Drive (`colab drivemount`) or propagate credentials (`colab auth`) unless the user asks for it: either hands the whole account's Drive or Google Cloud access to everything that runs on the VM. Do not copy API keys there either.
+7. **Keep the account out of the VM unless the user asks.** Mount Google Drive (`--drive`, `rt colab drive`) only when the user asked for it in this task: the mount gives everything that runs on the VM the whole My Drive of an account other people may share, to read, change and delete, and a deletion there reaches every runtime and the account itself. Never run `colab drivemount` or `colab auth` yourself, and do not copy API keys to the VM.
 
 **A runtime lives without any connection.** With no connection at all, a detached process and a running kernel cell each kept going for 91 minutes, until the test was stopped. A Colab CLI maintainer describes the same (background code runs for hours) and adds that Colab can remove any runtime at any time; an earlier answer from the Colab team expected a shutdown soon after the last connection closes, which did not happen here. So a job usually survives this Mac sleeping (fetch results as they appear, since nothing guarantees it), and a forgotten runtime keeps billing until its watchdog releases it, or Colab's 24-hour limit. Two traps found on the way: a failed `colab sessions` (no network, or a sign-in that needs a person) exits 1 with a traceback that quotes the source line printing "No active sessions found on server.", so read its exit status and never grep its output; and after a release the old connection can still answer for up to a minute, then gets 404.
 
