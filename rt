@@ -2836,19 +2836,24 @@ _slurm_logs() {
 # google-colab-cli 0.8.0:
 #
 #   * `colab ssh --proxy-mode -s NAME`, the form the CLI documents for ~/.ssh/config, CREATES a
-#     billable runtime whenever NAME is missing from its local session record, so once a runtime
-#     is gone, a single automatic reconnect opens a new one. The alias written here passes the
-#     hidden `--colab-internal-mode cmd`, the path the CLI's own `colab ssh -- CMD` takes, which
-#     only resolves an existing session: a released runtime answers 404 and nothing is created.
-#     A hidden option can change in any release, so `_colab_canary` re-checks the property
-#     offline, with the network cut, before every create.
-#   * A runtime accepts ONE ssh connection; a second is refused with HTTP 429. The alias
-#     multiplexes everything over one ControlMaster connection, closed after 15 idle minutes. A
-#     client that vanishes (sleep, a network drop) leaves the runtime holding the slot, and the next
-#     connection is refused until that session ends: `_colab_heal_slot` ends it through the kernel.
+#     billable runtime whenever NAME is missing from its local session record — by design, so a
+#     host works on first connect (its docs/06_ssh_access.md) — and the CLI drops that record once
+#     it notices the runtime is gone, so the next automatic reconnect opens a new one. The alias
+#     written here passes the hidden `--colab-internal-mode cmd`, the path the CLI's own
+#     `colab ssh -- CMD` takes, which only resolves an existing session: a released runtime answers
+#     404 and nothing is created. A hidden option can change in any release, so `_colab_canary`
+#     re-checks the property offline, with the network cut, before every create.
+#   * A runtime accepted ONE ssh connection here (the limit depends on the Colab plan); a second
+#     is refused with HTTP 429. The alias multiplexes everything over one ControlMaster
+#     connection, closed after 15 idle minutes. A client that vanishes (sleep, a network drop)
+#     leaves the runtime holding the slot, and the next connection is refused until that session
+#     ends: `_colab_heal_slot` ends it through the kernel. (The CLI's main branch adds
+#     `colab ssh --force` for the same repair, after 0.8.0; its maintainers plan a backend fix.)
 #   * A runtime does NOT need a connection to live: with none at all, a detached process and a
-#     running kernel cell both kept going for 91 minutes, when the test stopped (the CLI
-#     maintainers say otherwise in issue #160). So nothing stops a forgotten runtime from billing
+#     running kernel cell both kept going for 91 minutes, when the test stopped. A CLI maintainer
+#     wrote the same in discussion #219 (background code runs for hours, and any runtime can be
+#     removed at any time); a Colab team member's earlier answer in issue #160 expected a shutdown
+#     soon after the last connection closes. So nothing stops a forgotten runtime from billing
 #     except release. A watchdog on the VM releases it itself — POST
 #     http://$TBE_RUNTIME_ADDR/unassign, the endpoint behind google.colab.runtime.unassign();
 #     billing stopped within a second when measured — at its deadline or once it has been idle.
@@ -2943,11 +2948,15 @@ _colab_account_list() {   # <colab-bin>: "<endpoint> <hardware> <shape>" per run
   local out
   mkdir -p "$(dirname "$COLAB_LIST_JSON")"
   [[ -e "$COLAB_LIST_JSON" ]] || { : > "$COLAB_LIST_JSON"; chmod 600 "$COLAB_LIST_JSON"; }
+  # Status before text: a failed call (no network, a sign-in that needs a person) exits 1, and its
+  # traceback prints source lines that include "No active sessions found on server." A hand-written
+  # poll that grepped the text alone read a network drop as "every runtime gone" (2026-11-23).
   out=$("$1" --config "$COLAB_LIST_JSON" sessions </dev/null 2>&1) || return 1
   if grep -q 'No active sessions found' <<<"$out"; then
-    # The CLI prints this ALSO when it could not authenticate — with no local session it maps that
-    # failure to an empty list — and a network drop read as "every runtime gone" on 2026-11-23. An
-    # empty answer counts only when `colab usage`, which fails loudly, reports zero as well.
+    # An empty answer is what lets rt delete the records of a runtime that may still bill, so a
+    # second endpoint must agree: `colab usage` reports 0 as well. (The CLI does print an empty
+    # list with exit 0 for one sign-in failure, ADC credentials that cannot refresh under
+    # --auth=adc; rt never passes --auth, so the check guards against what was not seen.)
     [[ "$("$1" usage </dev/null 2>/dev/null | sed -n 's/^Active assignments: *\([0-9][0-9]*\).*/\1/p')" == 0 ]]
     return
   fi
@@ -3163,7 +3172,7 @@ _colab_up() {
   info "Creating Colab runtime '$name' ($hw) ..."
   if ! "$bin" --config "$COLAB_JSON" new -s "$name" ${new_args[@]+"${new_args[@]}"} </dev/null >&2; then
     rm -rf "$COLAB_DIR"
-    die "'colab new' failed. If it got as far as an assignment, 'rt colab ls' lists it as not ours, for 'colab stop' by hand."
+    die "'colab new' failed. After a slow allocation Colab can create the runtime anyway (google-colab-cli#263): check 'rt colab ls' in a few minutes. A new one marked not ours bills with no watchdog, and colab 0.8.0 cannot release a runtime it has no record of."
   fi
   ep=$(_colab_json_endpoint)
   if [[ -z "$ep" ]]; then

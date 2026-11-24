@@ -60,19 +60,30 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   the alias is `~/.ssh/rt-colab.d/colab-NAME.conf` (`RT_COLAB_SSH_DIR`), reached through one
   `Include` line that `rt colab setup` puts at the top of `~/.ssh/config`.
 - The ProxyCommand is `colab --config <that json> ssh --proxy-mode --colab-internal-mode cmd -s NAME`.
-  The documented `--proxy-mode -s NAME` creates a runtime when NAME is missing locally; the hidden
-  `cmd` mode only resolves. `_colab_canary` re-proves that offline (dead proxies, empty record:
-  exit 2, "not found", empty stdout) in `setup` and before every `up`; `up` refuses otherwise.
-  Canary 24q runs it against the installed CLI, so an upgrade that breaks it fails the suite.
-- One ssh connection per runtime (429 on a second): the alias sets `ControlMaster auto` +
-  `ControlPersist 15m`. The first `true` in `up` becomes the master. A vanished client leaves the
-  runtime holding the slot; `_require_ssh` calls `_colab_heal_slot` for colab profiles (end the
-  session through `colab exec`, retry every 5 s for 90 s; the slot freed ~33 s after when measured).
-- A runtime needs no connection to live (91 min with none, measured), so release is the only cost
-  stop: there is deliberately no keep-awake/keep-alive machinery.
-- `colab sessions` prints "No active sessions found" also when the CLI could not authenticate, so
-  `_colab_account_list` accepts an empty answer only when `colab usage` reports 0 as well — a
-  "gone" verdict on a still-billing runtime would delete the only record of it.
+  The documented `--proxy-mode -s NAME` creates a runtime when NAME is missing locally, by design
+  (the CLI's `docs/06_ssh_access.md`); the hidden `cmd` mode only resolves. `_colab_canary`
+  re-proves that offline (dead proxies, empty record: exit 2, "not found", empty stdout) in `setup`
+  and before every `up`; `up` refuses otherwise. Canary 24q runs it against the installed CLI, so
+  an upgrade that breaks it fails the suite. The same doc says bare `--proxy-mode` (no `-s`) only
+  resolves too, which would do this without a hidden option (BACKLOG).
+- One ssh connection per runtime here (429 on a second; the CLI says the limit depends on the
+  plan): the alias sets `ControlMaster auto` + `ControlPersist 15m`, with `ControlPath` keyed on
+  the per-runtime HostName, so two runtimes never share a master. (The CLI's own `colab ssh` gives
+  every session the host name `colab-runtime`, so under a `Host *` ControlMaster one session's
+  commands reach another's runtime: its discussion #247.) The first `true` in `up` becomes
+  the master. A vanished client leaves the runtime holding the slot; `_require_ssh` calls
+  `_colab_heal_slot` for colab profiles (end the session through `colab exec`, retry every 5 s for
+  90 s; the slot freed ~33 s after when measured). The CLI's main branch adds `colab ssh --force`
+  for the same, after 0.8.0 (BACKLOG).
+- A runtime needs no connection to live (91 min with none, measured; a CLI maintainer says the
+  same in its discussion #219, against an earlier answer in issue #160), so release is the only
+  cost stop: there is deliberately no keep-awake/keep-alive machinery.
+- `colab sessions` exits 1 when it fails (no network, a sign-in that needs a person), and its
+  traceback quotes the source line that prints "No active sessions found on server." So
+  `_colab_account_list` reads the exit status before the text (24n3), and accepts an empty answer
+  only when `colab usage` reports 0 as well, because a "gone" verdict on a still-billing runtime
+  would delete the only record of it. (The one empty-list-on-failure path in the CLI is
+  unrefreshable ADC credentials under `--auth=adc`, which rt never passes.)
 - The watchdog (`_colab_watchdog_script`) is installed by a bootstrap sent as one base64 word
   (`_colab_bootstrap_script`), so no argv on the VM carries a pgrep-able pattern, and `up` releases
   the runtime unless the VM reports the digest of exactly the script rt sent. It releases via

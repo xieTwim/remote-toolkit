@@ -2135,7 +2135,9 @@ case "$1" in
   new)      [ -n "${CSTUB_NEW_FAIL:-}" ] && exit 1
             ep="m-s-test-$3"; echo "$ep" >> "$CSTUB/backend"
             printf '{\n  "%s": {\n    "name": "%s",\n    "endpoint": "%s"\n  }\n}\n' "$3" "$3" "$ep" > "$cfg" ;;
-  sessions) [ -n "${CSTUB_SESSIONS_GARBLED:-}" ] && { echo "Traceback: ConnectionError"; exit 0; }
+  sessions) # Offline, the real 0.8.0 exits 1 and its traceback quotes the source line below.
+            [ -n "${CSTUB_SESSIONS_CRASH:-}" ] && { printf '|   284 |   sessions, assignments = state.sync_sessions()\n|   286 |       typer.echo("[colab] No active sessions found on server.")\nProxyError: Unable to connect to proxy\n' >&2; exit 1; }
+            [ -n "${CSTUB_SESSIONS_GARBLED:-}" ] && { echo "Traceback: ConnectionError"; exit 0; }
             [ -n "${CSTUB_SESSIONS_EMPTY_LIE:-}" ] && { echo "[colab] No active sessions found on server."; exit 0; }
             if [ -s "$CSTUB/backend" ]; then
               while read -r ep; do echo "[?] $ep | Hardware: CPU | Shape: Standard | Variant: DEFAULT"; done < "$CSTUB/backend"
@@ -2252,6 +2254,13 @@ _colab_account_list "$RT_COLAB_BIN" >/dev/null; r4=$?
 chk "24n2 'No active sessions' while colab usage still counts a runtime is a failure, not an empty account" \
     "$([ $r4 = 1 ] && echo 0 || echo 1)" "r4=$r4"
 unset CSTUB_SESSIONS_EMPTY_LIE; : > "$C/backend"
+# The real failure, 2026-11-23: with no network `colab sessions` exits 1, and the traceback quotes the
+# source line that prints "No active sessions found on server." — even with `colab usage` at 0.
+export CSTUB_SESSIONS_CRASH=1
+_colab_account_list "$RT_COLAB_BIN" >/dev/null; r5=$?
+chk "24n3 a failed 'colab sessions' whose traceback quotes 'No active sessions' is a failure, not an empty account" \
+    "$([ $r5 = 1 ] && echo 0 || echo 1)" "r5=$r5"
+unset CSTUB_SESSIONS_CRASH
 
 bad=0
 for n in a_b -x x- a--b "$(printf 'a%.0s' $(seq 27))"; do ( _colab_name "$n" ) 2>/dev/null && bad=1; done

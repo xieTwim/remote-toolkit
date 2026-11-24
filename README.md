@@ -143,13 +143,15 @@ What `rt colab` adds over writing the ssh alias by hand:
 
 - **No runtime is ever created by a reconnect.** The CLI's documented alias form,
   `colab ssh --proxy-mode -s NAME`, creates a billable runtime whenever NAME is missing from its
-  local record, so after a release one automatic reconnect opens a new one. rt's alias uses the
+  local record (by design, so a host works on first connect). Once the CLI notices a runtime is
+  gone it drops that record, and the next automatic reconnect opens a new one. rt's alias uses the
   bridge that only connects to an existing runtime, and checks offline before every create that
   the installed CLI still behaves that way.
-- **One connection.** A runtime accepts a single ssh connection, so the alias multiplexes every
-  call over one ControlMaster connection. A connection that vanished (sleep, a network drop) leaves
-  the runtime holding the slot; rt's next command ends that session through the Colab kernel and
-  reconnects, and `rt colab reconnect NAME` does the same on demand.
+- **One connection.** A runtime accepted a single ssh connection on the plan measured here (the
+  limit depends on the plan), so the alias multiplexes every call over one ControlMaster
+  connection. A connection that vanished (sleep, a network drop) leaves the runtime holding the
+  slot; rt's next command ends that session through the Colab kernel and reconnects, and
+  `rt colab reconnect NAME` does the same on demand.
 - **The runtime releases itself.** A watchdog on the VM calls Colab's release endpoint at the
   deadline (`--hours`, default 4) or after `--idle-minutes` (default 20) with no rt job, no ssh
   command and under half a core of CPU. That is the only thing that stops a forgotten runtime: one
