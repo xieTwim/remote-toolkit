@@ -2120,7 +2120,8 @@ chk "23c ... and the message is about the ssh link, not about connecting sync fi
 set +e; source "$RT" 2>/dev/null; set +e
 C="$SCRATCH/colab"; mkdir -p "$C/bin" "$C/home/.ssh"
 export RT_COLAB_SSH_DIR="$C/home/.ssh/rt-colab.d" RT_COLAB_KEY="$C/home/.ssh/key" \
-       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 RT_COLAB_FIRST_SSH_WAIT=0 RT_COLAB_CLI_LOG="$C/colab.log" RT_COLAB_ADOPT_WAIT=2 RT_COLAB_ADOPT_POLL=1 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
+       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 RT_COLAB_FIRST_SSH_WAIT=0 RT_COLAB_CLI_LOG="$C/colab.log" RT_COLAB_ADOPT_WAIT=2 RT_COLAB_ADOPT_POLL=1 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab" \
+       RT_COLAB_KEEP=0   # no keeper process from up here; 24r turns it on where it tests it
 : > "$C/home/.ssh/key"; : > "$C/home/.ssh/key.pub"
 cat > "$C/bin/colab" <<'STUB'
 #!/usr/bin/env bash
@@ -2464,6 +2465,86 @@ chk "24f2 the bootstrap gives every rt command a TPU runtime's environment: env.
     "$(bash -n "$C/boot2.sh" && [ -n "$tpu" ] && [ "$tpu" -lt "$start" ] && grep -qF "/proc/\$p/environ" "$C/boot2.sh" && grep -qF "printf '[ -f /root/.rt_colab/env.sh ] && . /root/.rt_colab/env.sh\n'; cat /root/.bashrc" "$C/boot2.sh" && echo 0 || echo 1)" "tpu@$tpu start@$start"
 fresh_colab
 
+# The keeper (2026-11-24). Colab took back four CPU runtimes about 3 h after their last connection,
+# while two that this Mac connected to every 30 min were still there at 4.5 h (google-colab-cli#160:
+# Colab "mostly depends on checking for live connections to the VM"). Its loop runs here in a
+# background subshell with ssh stubbed, bounded, so that a keeper that never stops fails its check
+# (124) instead of hanging the suite.
+( _detach "$C/det.log" bash -c 'printf "%s %s\n" "$$" "$(ps -o pgid= -p $$ | tr -d " ")" > "$1"' _ "$C/det.out" )
+for i in $(seq 1 50); do [ -s "$C/det.out" ] && break; sleep 0.1; done
+dp=""; dg=""; read -r dp dg < "$C/det.out" 2>/dev/null
+chk "24K1 a detached process has a session of its own (it leads its own process group), so no terminal or caller takes it down" \
+    "$([ -n "$dp" ] && [ "$dp" = "$dg" ] && [ "$dg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] && echo 0 || echo 1)" "pid=$dp pgid=$dg"
+_detach() { printf '%s\n' "$*" >> "$C/detached"; }   # from here on, record what would be detached
+fresh_colab; rm -f "$C/detached"
+( RT_COLAB_KEEP=1; _colab_up k1 ) >/dev/null 2>&1; r1=$?
+( _colab_up k2 ) >/dev/null 2>&1; r2=$?
+chk "24K2 up leaves a keeper for the runtime, as rt colab _keep NAME logging beside its record; none with RT_COLAB_KEEP=0" \
+    "$([ $r1 = 0 ] && [ $r2 = 0 ] && grep -qxF "$RT_HOME/colab-k1/keeper.log $RT_SCRIPT_DIR/rt colab _keep k1" "$C/detached" && ! grep -q k2 "$C/detached" && echo 0 || echo 1)" \
+    "r1=$r1 r2=$r2 $(cat "$C/detached" 2>/dev/null)"
+K="$RT_HOME/colab-k1"; rm -f "$C/pings"
+keep_until_third() { _colab_ssh() { echo "$*" >> "$C/pings"; [ "$(grep -c . "$C/pings")" -lt 3 ] || rm -f "$K/colab.meta"; return 0; }
+                     RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0; _colab_keep k1; }
+_run_bounded 10 keep_until_third; rc=$?
+chk "24K3 the keeper connects through the runtime's alias whenever a connection is due, and stops once the record is gone" \
+    "$([ $rc = 0 ] && [ "$(grep -c . "$C/pings")" = 3 ] && [ "$(sort -u "$C/pings")" = "-o ConnectTimeout=30 colab-k1 true" ] && grep -q 'stopped: its record is gone' "$K/keeper.log" && [ ! -e "$K/keeper.pid" ] && echo 0 || echo 1)" \
+    "rc=$rc pings=$(grep -c . "$C/pings" 2>/dev/null) $(tail -n 2 "$K/keeper.log" 2>/dev/null)"
+fresh_colab; ( _colab_up k4 ) >/dev/null 2>&1; K="$RT_HOME/colab-k4"; rm -f "$C/pings"
+keep_replaced() { _colab_ssh() { echo x >> "$C/pings"; sed -i.bak 's/^COLAB_ENDPOINT=.*/COLAB_ENDPOINT=m-s-test-other/' "$K/colab.meta"; return 0; }
+                  RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0; _colab_keep k4; }
+_run_bounded 10 keep_replaced; rc=$?
+chk "24K4 ... and once the record names another runtime (down, then up again under the same name)" \
+    "$([ $rc = 0 ] && [ "$(grep -c . "$C/pings")" = 1 ] && grep -q 'stopped: its record is gone or names another runtime' "$K/keeper.log" && echo 0 || echo 1)" \
+    "rc=$rc $(tail -n 1 "$K/keeper.log" 2>/dev/null)"
+fresh_colab; ( _colab_up k5 ) >/dev/null 2>&1; K="$RT_HOME/colab-k5"; : > "$C/ssh_calls"
+sed -i.bak 's/^COLAB_DEADLINE=.*/COLAB_DEADLINE=1/' "$K/colab.meta"
+keep_late() { RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0; _colab_keep k5; }
+_run_bounded 10 keep_late; rc=$?
+chk "24K5 ... and at the deadline, where the watchdog releases the runtime, without connecting again" \
+    "$([ $rc = 0 ] && ! grep -q 'colab-k5 true' "$C/ssh_calls" && grep -q 'stopped: its deadline has passed' "$K/keeper.log" && echo 0 || echo 1)" \
+    "rc=$rc $(tail -n 1 "$K/keeper.log" 2>/dev/null)"
+fresh_colab; ( _colab_up k6 ) >/dev/null 2>&1; K="$RT_HOME/colab-k6"; : > "$C/backend"   # Colab took it back
+keep_gone() { SSTUB_FAIL=1 RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0 RT_COLAB_KEEP_RETRY=0; _colab_keep k6; }
+_run_bounded 10 keep_gone; r1=$?
+gone=$(tail -n 1 "$K/keeper.log" 2>/dev/null)
+fresh_colab; ( _colab_up k7 ) >/dev/null 2>&1; K="$RT_HOME/colab-k7"; rm -f "$C/fails"
+keep_offline() { _colab_ssh() { echo f >> "$C/fails"; [ "$(grep -c . "$C/fails")" -lt 6 ] || rm -f "$K/colab.meta"; return 255; }
+                 export CSTUB_SESSIONS_CRASH=1; RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0 RT_COLAB_KEEP_RETRY=0; _colab_keep k7; }
+_run_bounded 10 keep_offline; r2=$?
+chk "24K6 when it cannot connect, a runtime gone from the account stops the keeper; an account it cannot list (offline) does not" \
+    "$([ $r1 = 0 ] && [[ "$gone" == *'stopped: it is no longer on the account' ]] && [ $r2 = 0 ] && grep -q 'could not connect (3 in a row)' "$K/keeper.log" && grep -q 'stopped: its record is gone' "$K/keeper.log" && ! grep -q 'no longer on the account' "$K/keeper.log" && echo 0 || echo 1)" \
+    "r1=$r1 r2=$r2 | $gone | $(tail -n 2 "$K/keeper.log" 2>/dev/null | tr '\n' ' ')"
+mkdir -p "$C/kbin"; printf '#!/bin/sh\necho "$*" >> "%s/caf"\n' "$C" > "$C/kbin/caffeinate"; chmod +x "$C/kbin/caffeinate"
+fresh_colab; ( _colab_up k8 ) >/dev/null 2>&1; K="$RT_HOME/colab-k8"; rm -f "$C/caf"
+keep_awake() { PATH="$C/kbin:$PATH"; _colab_ssh() { rm -f "$K/colab.meta"; return 0; }; RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0; _colab_keep k8; }
+_run_bounded 10 keep_awake; r1=$?
+for i in $(seq 1 30); do [ -s "$C/caf" ] && break; sleep 0.1; done
+caf1=$(cat "$C/caf" 2>/dev/null)
+fresh_colab; ( _colab_up k8 ) >/dev/null 2>&1; rm -f "$C/caf"
+keep_asleep() { PATH="$C/kbin:$PATH"; _colab_ssh() { rm -f "$K/colab.meta"; return 0; }; RT_COLAB_KEEP_EVERY=0 RT_COLAB_KEEP_TICK=0 RT_COLAB_KEEP_AWAKE=0; _colab_keep k8; }
+_run_bounded 10 keep_asleep; r2=$?; sleep 0.3
+chk "24K7 the keeper holds off this Mac's idle sleep for as long as it runs (caffeinate -i -w its pid); RT_COLAB_KEEP_AWAKE=0 lets it sleep" \
+    "$([ $r1 = 0 ] && [ $r2 = 0 ] && [ "$caf1" = "-i -w $$" ] && [ ! -e "$C/caf" ] && echo 0 || echo 1)" "r1=$r1 r2=$r2 caf1=$caf1"
+fresh_colab; ( _colab_up k9 ) >/dev/null 2>&1; K="$RT_HOME/colab-k9"
+echo $$ > "$K/keeper.pid"   # a live process, but not this runtime's keeper
+o1=$( _colab_ls 2>/dev/null )
+bash -c 'sleep 5; :' colab _keep k9 & fk=$!
+echo "$fk" > "$K/keeper.pid"
+o2=$( _colab_ls 2>/dev/null )
+kill "$fk" 2>/dev/null; wait "$fk" 2>/dev/null
+chk "24K8 ls reads a keeper as on only when its pid file names that runtime's keeper, and names the runtimes left without one" \
+    "$(grep -q '^k9 .* assigned  *down  *off ' <<<"$o1" && grep -q '^keeper off: k9 ' <<<"$o1" && grep -q '^k9 .* assigned  *down  *on ' <<<"$o2" && ! grep -q '^keeper off' <<<"$o2" && echo 0 || echo 1)" \
+    "$o1 /// $o2"
+fresh_colab; ( _colab_up k10 ) >/dev/null 2>&1; rm -f "$C/detached"
+( RT_COLAB_KEEP=1; _colab_reconnect k10 ) >/dev/null 2>&1; r1=$?
+n1=$(grep -c 'colab _keep k10$' "$C/detached" 2>/dev/null)
+( RT_COLAB_KEEP=1; RT_HOST_GROUP=colab-k10; _ssh_test() { return 0; }; _require_ssh ) >/dev/null 2>&1
+( RT_COLAB_KEEP=1; RT_HOST_GROUP=h; _ssh_test() { return 0; }; _require_ssh ) >/dev/null 2>&1
+n2=$(grep -c 'colab _keep' "$C/detached" 2>/dev/null)
+chk "24K9 reconnect, and any rt command that reaches the runtime, start its keeper again when none runs (Colab profiles only)" \
+    "$([ $r1 = 0 ] && [ "$n1" = 1 ] && [ "$n2" = 2 ] && echo 0 || echo 1)" "r1=$r1 n1=$n1 n2=$n2"
+fresh_colab
+
 if real=$(command -v colab 2>/dev/null) && [ -n "$real" ]; then
   ( _colab_common_paths; _colab_canary "$real" ) >/dev/null 2>&1; rc=$?
   chk "24q the installed colab CLI ($("$real" version 2>/dev/null | head -n 1)) still refuses to create a runtime from the ssh bridge" "$rc"
@@ -2475,7 +2556,18 @@ if real=$(command -v colab 2>/dev/null) && [ -n "$real" ]; then
 else
   echo "  skip 24q (no colab CLI installed)"
 fi
-unset RT_COLAB_SSH_DIR RT_COLAB_KEY RT_SSH_CONFIG RT_COLAB_POLL_WAIT CSTUB RT_COLAB_BIN
+unset RT_COLAB_SSH_DIR RT_COLAB_KEY RT_SSH_CONFIG RT_COLAB_POLL_WAIT CSTUB RT_COLAB_BIN RT_COLAB_KEEP
+
+# ── 25. an rt edited while one runs ──
+# Bash reads a script as it runs it. Back from main, an rt that ended with `fi` read on from where the
+# file had ended when it started, so a line added to rt meanwhile ran (shown 2026-11-24). A Colab keeper
+# runs for hours, while rt is edited.
+D25="$SCRATCH/edited"; mkdir -p "$D25"
+sed 's/^main() {$/main() { sleep 2/' "$RT" > "$D25/rt"
+bash "$D25/rt" help >/dev/null 2>&1 & p25=$!
+sleep 0.7; printf 'touch %s/injected\n' "$D25" >> "$D25/rt"; wait "$p25"
+chk "25a a line added to rt while it runs is never run by it" \
+    "$(grep -q '^main() { sleep 2$' "$D25/rt" && [ ! -e "$D25/injected" ] && echo 0 || echo 1)"
 
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi

@@ -75,9 +75,18 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   `_colab_heal_slot` for colab profiles (end the session through `colab exec`, retry every 5 s for
   90 s; the slot freed ~33 s after when measured). The CLI's main branch adds `colab ssh --force`
   for the same, after 0.8.0 (BACKLOG).
-- A runtime needs no connection to live (91 min with none, measured; a CLI maintainer says the
-  same in its discussion #219, against an earlier answer in issue #160), so release is the only
-  cost stop: there is deliberately no keep-awake/keep-alive machinery.
+- Colab takes back a runtime nothing connects to. Four CPU runtimes with an rt job were gone about
+  3 h after their last connection; a kernel cell left running and the VM calling its own kernel did
+  not count; two reached from the Mac every 30 min were still up at 4.5 h (2026-11-24; the CLI's
+  issue #160 and PR #144 say the same, and its discussion #219 saw a G4 go after 23 min). So `up`
+  starts a keeper, `rt colab _keep NAME`, detached by `_detach` (setsid, else perl's: macOS has no
+  setsid). Every RT_COLAB_KEEP_EVERY s (300) it runs the alias's ssh `true`, which keeps the
+  ControlMaster open or reopens it (heal path on a held slot), and it holds `caffeinate -i -w <its
+  pid>`. Its lease is the record: it stops once colab.meta is gone or names another endpoint, at the
+  deadline, or when a failed connection finds the runtime off the account (a failed listing does not
+  stop it). `_require_ssh` (every rt command on a colab profile) and `reconnect` start it again when
+  `_colab_keeper_running` (pid file plus the `ps` command line, since pids are reused) finds none. The
+  watchdog does not count an open idle connection as busy, so idle release is unchanged.
 - `colab sessions` exits 1 when it fails (no network, a sign-in that needs a person), and its
   traceback quotes the source line that prints "No active sessions found on server." So
   `_colab_account_list` reads the exit status before the text (24n3), and accepts an empty answer
@@ -120,7 +129,8 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   on that URL returns an Assignment if Colab made one, and then the same SessionState `colab new`
   writes goes into this runtime's record. Asked once after a refusal, every 30 s for 10 min after a
   timeout (RT_COLAB_ADOPT_WAIT/_POLL). These are CLI internals, so 24q2 checks them on the installed CLI.
-- Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q and 24q2).
+- Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q and 24q2;
+  the keeper is 24K1-24K9, its loop bounded by `_run_bounded`; RT_COLAB_KEEP=0 for the rest of the block).
 
 ## CC Integration: SKILL + slash command
 

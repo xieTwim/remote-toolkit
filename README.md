@@ -152,11 +152,15 @@ What `rt colab` adds over writing the ssh alias by hand:
   connection. A connection that vanished (sleep, a network drop) leaves the runtime holding the
   slot; rt's next command ends that session through the Colab kernel and reconnects, and
   `rt colab reconnect NAME` does the same on demand.
+- **Kept connected while it runs.** Colab takes back a runtime that nothing connects to: four CPU
+  runtimes running an rt job were gone about 3 h after their last connection (2026-11-24), and a G4
+  elsewhere after 23 minutes. rt leaves a keeper on this Mac that keeps the runtime's connection
+  open (an ssh `true` every 5 minutes) and holds off the Mac's idle sleep until the runtime goes;
+  a closed lid or a long network outage still ends it.
 - **The runtime releases itself.** A watchdog on the VM calls Colab's release endpoint at the
   deadline (`--hours`, default 4) or after `--idle-minutes` (default 20) with no rt job, no ssh
-  command and under half a core of CPU. That is the only thing that stops a forgotten runtime: one
-  with no connection at all kept running for 91 minutes when measured. `rt colab down NAME`
-  releases it at once and confirms it has left the account.
+  command and under half a core of CPU; an open connection alone does not count. `rt colab down
+  NAME` releases it at once and confirms it has left the account.
 - **Other runtimes on the account are left alone.** `rt colab ls` lists them as `not ours`.
 - **A request the CLI gave up on is not left billing.** When `colab new` times out, rt asks Colab
   for up to 10 minutes, by that request's own id, whether it made the runtime anyway, and if so

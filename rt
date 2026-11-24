@@ -684,13 +684,13 @@ _ssh_test() {
 # sent the reader to the sync session, which has nothing to do with it and which some profiles
 # never have. RT_SSH_RETRY_WAIT is the pause between the two attempts, in seconds.
 _require_ssh() {
-  _ssh_test && return 0
+  _ssh_test && { _colab_profile_kept; return 0; }
   sleep "${RT_SSH_RETRY_WAIT:-3}"
-  _ssh_test && return 0
+  _ssh_test && { _colab_profile_kept; return 0; }
   # A Colab runtime takes one ssh connection, and a client that vanished (sleep, a network drop)
   # leaves the runtime holding it, so every new connection is refused until that session ends.
   if [[ -f "${RT_HOME}/${RT_HOST_GROUP}/colab.meta" ]]; then
-    _colab_heal_slot "${RT_HOST_GROUP#colab-}" && _ssh_test && return 0
+    _colab_heal_slot "${RT_HOST_GROUP#colab-}" && _ssh_test && { _colab_profile_kept; return 0; }
     die "[$RT_PROFILE] Cannot reach Colab runtime '${RT_HOST_GROUP#colab-}' over ssh: $(tail -n 1 "${RT_HOME}/${RT_HOST_GROUP}/proxy.log" 2>/dev/null) 'rt colab ls' shows whether it still exists."
   fi
   die "[$RT_PROFILE] Cannot reach $REMOTE_HOST over ssh (two attempts, ${RT_SSH_RETRY_WAIT:-3}s apart). This is the ssh link, not the sync session. A host that answered a minute ago is usually back in a minute: retry. For a host never reached from here, 'ssh $REMOTE_HOST' shows the real error and 'rt -p $RT_PROFILE connect' sets the profile up."
@@ -2849,14 +2849,21 @@ _slurm_logs() {
 #     leaves the runtime holding the slot, and the next connection is refused until that session
 #     ends: `_colab_heal_slot` ends it through the kernel. (The CLI's main branch adds
 #     `colab ssh --force` for the same repair, after 0.8.0; its maintainers plan a backend fix.)
-#   * A runtime does NOT need a connection to live: with none at all, a detached process and a
-#     running kernel cell both kept going for 91 minutes, when the test stopped. A CLI maintainer
-#     wrote the same in discussion #219 (background code runs for hours, and any runtime can be
-#     removed at any time); a Colab team member's earlier answer in issue #160 expected a shutdown
-#     soon after the last connection closes. So nothing stops a forgotten runtime from billing
-#     except release. A watchdog on the VM releases it itself — POST
-#     http://$TBE_RUNTIME_ADDR/unassign, the endpoint behind google.colab.runtime.unassign();
-#     billing stopped within a second when measured — at its deadline or once it has been idle.
+#   * Colab takes a runtime back once nothing has connected to it for a while, whatever runs on
+#     it. Measured 2026-11-24 on standard CPU runtimes, each running an rt background job: the four
+#     left with no connection were gone about 3 h after their last one (a kernel cell left running,
+#     and the VM itself calling its kernel every 20 min, did not count), while the two that this Mac
+#     reached every 30 min, by a new ssh connection or by a statement run through the kernel, were
+#     still there at 4.5 h. The CLI's contributors describe the same: Colab "mostly depends on
+#     checking for live connections to the VM" (issue #160), and since the client keep-alive ping
+#     was retired the backend keeps runtimes "based on kernel activities and active connections"
+#     (PR #144). A G4 whose traffic went around Colab's proxy was gone after 23 min (discussion
+#     #219), so an accelerator may get far less. `up` therefore leaves a keeper on this Mac
+#     (`_colab_keep`) that keeps the runtime connected until it goes.
+#   * So a runtime bills for as long as it is kept connected, and release is what ends that: a
+#     watchdog on the VM releases it itself — POST http://$TBE_RUNTIME_ADDR/unassign, the endpoint
+#     behind google.colab.runtime.unassign(); billing stopped within a second when measured — at
+#     its deadline or once it has been idle.
 
 RT_COLAB_TESTED_VERSIONS="0.8.0"
 
@@ -3363,6 +3370,7 @@ _colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up
   _colab_install_watchdog "$deadline" "$idle" \
     || die "The watchdog did not start, so '$name' is being released: rt never leaves a runtime up without one."
   trap - EXIT
+  _colab_keep_start "$name"
   after=$(_colab_usage_summary "$bin" || echo "unknown")
   info "Runtime '$name' is up ($hw, endpoint $ep). Account now: $after"
   [[ -z "${2:-}" ]] || return 0   # a set member: the set prints the one summary
@@ -3370,6 +3378,8 @@ _colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up
   info "    rt -p $COLAB_GROUP/work exec 'nproc'"
   info "  It releases itself at $(_colab_fmt_time "$deadline") or after $idle idle minutes; 'rt colab down $name' releases it now."
   info "  Its disk goes with it: fetch results before that."
+  [[ "${RT_COLAB_KEEP:-1}" == 0 ]] \
+    || info "  Until then this Mac keeps it connected and stays awake: Colab takes back a runtime nothing connects to (about 3 h for a CPU one when measured, less with an accelerator). A closed lid or a long outage still ends it."
 }
 
 # The runtimes a command names: NAME [NAME ...], or --set SET for every member recorded here.
@@ -3537,11 +3547,11 @@ _colab_down_one() {   # <name>
 }
 
 _colab_ls() {
-  local bin list meta g ep hw dl state master ours=" " any=0 rest gone_names=""
+  local bin list meta g ep hw dl state master keeper ours=" " any=0 rest gone_names="" unkept=""
   _colab_common_paths
   bin=$(_colab_bin)
   list=$(_colab_account_list "$bin") || die "Could not list the account's runtimes: not signed in, or Colab is unreachable."
-  printf '%-22s %-28s %-16s %-9s %-7s %s\n' RUNTIME ENDPOINT HARDWARE ACCOUNT MASTER RELEASES-ITSELF-BY
+  printf '%-22s %-28s %-16s %-9s %-7s %-7s %s\n' RUNTIME ENDPOINT HARDWARE ACCOUNT MASTER KEEPER RELEASES-ITSELF-BY
   for meta in "$RT_HOME"/colab-*/colab.meta; do
     [[ -f "$meta" ]] || continue
     any=1
@@ -3553,12 +3563,16 @@ _colab_ls() {
     [[ -n "$ep" ]] && grep -qF "$ep" <<<"$list" && state=assigned
     master=down
     ssh -O check "$g" >/dev/null 2>&1 && master=up
-    printf '%-22s %-28s %-16s %-9s %-7s %s\n' "${g#colab-}" "${ep:-?}" "$hw" "$state" "$master" "$(_colab_fmt_time "$dl")"
+    keeper=off
+    _colab_keeper_running "${g#colab-}" && keeper=on
+    printf '%-22s %-28s %-16s %-9s %-7s %-7s %s\n' "${g#colab-}" "${ep:-?}" "$hw" "$state" "$master" "$keeper" "$(_colab_fmt_time "$dl")"
     [[ $state == gone ]] && gone_names+=" ${g#colab-}"
+    [[ $state == assigned && $keeper == off ]] && unkept+=" ${g#colab-}"
     ours+="$ep "
   done
   [[ $any == 1 ]] || printf '(no runtime created by rt on this machine)\n'
   [[ -z "$gone_names" ]] || printf 'gone:%s — released already (watchdog, Colab or the web UI); rt colab down NAME clears the record\n' "$gone_names"
+  [[ -z "$unkept" ]] || printf 'keeper off:%s — nothing on this Mac keeps it connected, and Colab takes back a runtime nothing connects to; rt colab reconnect NAME starts it again\n' "$unkept"
   while read -r ep rest; do
     [[ -n "$ep" && "$ours" != *" $ep "* ]] || continue
     printf 'not ours: %s (%s) — another machine on this account, the web UI, or a lost record; left alone\n' "$ep" "$rest"
@@ -3602,16 +3616,119 @@ _colab_heal_slot() {   # <name>
   return 1
 }
 
+# A process of rt's own on this Mac that must outlive the command, and the terminal or tool that ran
+# it: a session of its own, from setsid where there is one, else from perl (macOS has no setsid).
+_detach() {   # <log> <command ...>
+  local log="$1"; shift
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" </dev/null >>"$log" 2>&1 &
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "cannot run $ARGV[0]: $!\n"' "$@" </dev/null >>"$log" 2>&1 &
+  else
+    nohup "$@" </dev/null >>"$log" 2>&1 &
+  fi
+}
+
+# The keeper `up` leaves on this Mac (see the top of this section), as `rt colab _keep NAME`. Every
+# RT_COLAB_KEEP_EVERY seconds (300) it runs the ssh `true` that every rt call starts with: that reuses
+# the ControlMaster connection, which so never reaches its 15 idle minutes, or opens a new one when the
+# last has gone (this Mac slept, the network dropped), through the heal path if a vanished session
+# holds the slot. So the runtime has a live connection nearly all the time. A Mac that sleeps cannot
+# connect, so the keeper holds off idle sleep (caffeinate -i) while it runs; a closed lid still sleeps
+# it. An open connection with no command running is not busy to the watchdog, which still releases an
+# idle runtime. The record is the keeper's lease: it stops once colab.meta is gone or names another
+# endpoint, at the deadline, or once the account no longer lists the runtime. It reads the clock every
+# RT_COLAB_KEEP_TICK seconds (30) rather than sleeping a whole interval, because a sleep stops while
+# the Mac sleeps, and the first connection after a wake would then come up to an interval late.
+_colab_keep_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$COLAB_DIR/keeper.log" 2>/dev/null || true; }
+
+_colab_keep_awake() {   # <pid>: hold off this Mac's idle sleep while that process lives
+  [[ "${RT_COLAB_KEEP_AWAKE:-1}" != 0 ]] && command -v caffeinate >/dev/null 2>&1 || return 0
+  caffeinate -i -w "$1" </dev/null >/dev/null 2>&1 &
+}
+
+_colab_keeper_running() {   # <name>: 0 while its keeper lives (the pid file alone could name a reused pid)
+  local pid
+  pid=$(cat "${RT_HOME}/colab-$1/keeper.pid" 2>/dev/null) && [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(ps -ww -o command= -p "$pid" 2>/dev/null)" == *"colab _keep $1" ]]
+}
+
+_colab_keep_start() {   # <name>: start its keeper unless one is running (RT_COLAB_KEEP=0: never)
+  [[ "${RT_COLAB_KEEP:-1}" != 0 && -f "${RT_HOME}/colab-$1/colab.meta" ]] || return 0
+  _colab_keeper_running "$1" && return 0
+  _detach "${RT_HOME}/colab-$1/keeper.log" "$RT_SCRIPT_DIR/rt" colab _keep "$1"
+}
+
+# Every rt command that reaches a Colab runtime starts its keeper again if none is running (this Mac
+# restarted, or the process was killed), so the runtime is not left for Colab to take back.
+_colab_profile_kept() {
+  [[ -f "${RT_HOME}/${RT_HOST_GROUP:-}/colab.meta" ]] || return 0
+  ( _colab_keep_start "${RT_HOST_GROUP#colab-}" ) || true
+}
+
+_colab_keep() {   # <name>
+  local name="${1:-}" ep="" cur dl now due fails=0 bin list reason="" every tick
+  [[ -n "$name" ]] || die "Usage: rt colab _keep NAME (rt colab up starts it)"
+  _colab_name "$name"
+  _colab_paths "$name"
+  [[ -f "$COLAB_META" ]] && ep=$(COLAB_ENDPOINT=""; . "$COLAB_META"; printf '%s' "$COLAB_ENDPOINT")
+  [[ -n "$ep" ]] || return 0
+  _colab_keeper_running "$name" && return 0
+  bin=$(_colab_bin)
+  every="${RT_COLAB_KEEP_EVERY:-300}"; tick="${RT_COLAB_KEEP_TICK:-30}"
+  printf '%s\n' "$$" > "$COLAB_DIR/keeper.pid"
+  _colab_keep_awake "$$"
+  _colab_keep_log "keeping $ep connected, every ${every}s"
+  due=$(( $(date +%s) + every ))
+  while :; do
+    cur=""; dl=0
+    if [[ -f "$COLAB_META" ]]; then
+      cur=$(COLAB_ENDPOINT=""; . "$COLAB_META"; printf '%s' "$COLAB_ENDPOINT")
+      dl=$(COLAB_DEADLINE=0; . "$COLAB_META"; printf '%s' "$COLAB_DEADLINE")
+    fi
+    [[ "$cur" == "$ep" ]] || { reason="its record is gone or names another runtime"; break; }
+    # Two keepers started at once both write the pid file; the one not named there leaves.
+    [[ "$(cat "$COLAB_DIR/keeper.pid" 2>/dev/null)" == "$$" ]] || { reason="another keeper took over"; break; }
+    now=$(date +%s)
+    (( now < dl )) || { reason="its deadline has passed, and its watchdog releases it"; break; }
+    if (( now >= due )); then
+      ssh -O check "$COLAB_GROUP" >/dev/null 2>&1 || _colab_keep_log "no connection open: opening one"
+      if _colab_ssh -o ConnectTimeout=30 "$COLAB_GROUP" true </dev/null >/dev/null 2>&1 \
+         || _colab_heal_slot "$name" >>"$COLAB_DIR/keeper.log" 2>&1; then
+        (( fails == 0 )) || _colab_keep_log "connected again"
+        fails=0; due=$(( now + every ))
+      else
+        fails=$(( fails + 1 ))
+        if list=$(_colab_account_list "$bin" 2>/dev/null) && ! grep -qF "$ep" <<<"$list"; then
+          reason="it is no longer on the account"; break
+        fi
+        _colab_keep_log "could not connect ($fails in a row): $(tail -n 1 "$COLAB_PROXY_LOG" 2>/dev/null)"
+        due=$(( now + ${RT_COLAB_KEEP_RETRY:-60} ))
+      fi
+    fi
+    sleep "$tick"
+  done
+  _colab_keep_log "stopped: $reason"
+  [[ "$(cat "$COLAB_DIR/keeper.pid" 2>/dev/null)" != "$$" ]] || rm -f "$COLAB_DIR/keeper.pid"
+}
+
 _colab_reconnect() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "Usage: rt colab reconnect NAME"
   _colab_name "$name"
   _colab_paths "$name"
   [[ -d "$COLAB_DIR" ]] || die "No runtime '$name' recorded here ('rt colab ls' lists them)."
-  if ssh -O check "$COLAB_GROUP" >/dev/null 2>&1; then info "The connection to '$name' is up."; return 0; fi
-  _colab_heal_slot "$name" \
-    || die "Could not reconnect to '$name': $(tail -n 1 "$COLAB_PROXY_LOG" 2>/dev/null) 'rt colab ls' shows whether it still exists."
-  info "Reconnected to '$name'."
+  if ssh -O check "$COLAB_GROUP" >/dev/null 2>&1; then
+    info "The connection to '$name' is up."
+  else
+    _colab_heal_slot "$name" \
+      || die "Could not reconnect to '$name': $(tail -n 1 "$COLAB_PROXY_LOG" 2>/dev/null) 'rt colab ls' shows whether it still exists."
+    info "Reconnected to '$name'."
+  fi
+  if [[ "${RT_COLAB_KEEP:-1}" != 0 ]] && ! _colab_keeper_running "$name"; then
+    _colab_keep_start "$name"
+    info "Its keeper was not running (this Mac restarted?); started it again."
+  fi
 }
 
 _colab_extend() {
@@ -3642,6 +3759,7 @@ cmd_colab() {
     usage)      _colab_common_paths; bin=$(_colab_bin); "$bin" usage ;;
     reconnect)  _colab_reconnect "$@" ;;
     extend)     _colab_extend "$@" ;;
+    _keep)      _colab_keep "$@" ;;   # the keeper up starts; not for people
     ""|help)    _sub_help colab ;;
     *)          die "Unknown command: rt colab $sub. Use setup, up, down, exec, drive, ls, usage, reconnect or extend." ;;
   esac
@@ -3732,10 +3850,12 @@ COMMANDS:
                        Create a Colab runtime and make it profile colab-NAME/work
                        (REMOTE_DIR /content/work; no sync: use push and fetch).
                        One ssh connection per runtime, shared by every rt call.
-                       It keeps running with no connection at all, so nothing but
-                       release stops it billing: a watchdog on the VM releases it
-                       after H hours (default 4) or M idle minutes (default 20;
-                       10 with an accelerator).
+                       Colab takes back a runtime nothing connects to (about 3 h
+                       for a CPU one when measured, less with an accelerator), so
+                       a keeper on this Mac keeps it connected and holds off this
+                       Mac's idle sleep until it goes; a closed lid still ends it.
+                       A watchdog on the VM releases it after H hours (default 4)
+                       or M idle minutes (default 20; 10 with an accelerator).
                        --count N (1-10) makes a set: runtimes NAME-1 ... NAME-N,
                        each as above, created one after another. All or nothing:
                        if one cannot be created, those already up are released.
@@ -3753,9 +3873,11 @@ COMMANDS:
                        Release them, confirm each left the account, drop their profiles.
                        Drive's pending writes are pushed first; a runtime that does not
                        confirm it is kept, unless --no-flush.
-  colab ls             Runtimes made here, then any other on the account (untouched)
+  colab ls             Runtimes made here (with their connection and keeper), then
+                       any other on the account (untouched)
   colab usage          Compute-unit balance and the account's hourly rate
-  colab reconnect NAME Re-open the connection, freeing a slot a vanished one holds
+  colab reconnect NAME Re-open the connection, freeing a slot a vanished one holds,
+                       and start the keeper again if it is not running
   colab extend NAME --hours H
                        Move the self-release deadline to H hours from now
   help                 Show this help
@@ -3791,6 +3913,9 @@ ENVIRONMENT:
                        allocated after all (default: 600)
   RT_COLAB_CLI_LOG     the colab CLI's log, where its requests are found (default:
                        ~/.config/colab-cli/colab.log)
+  RT_COLAB_KEEP        0: no keeper, so nothing keeps a runtime connected (default: 1)
+  RT_COLAB_KEEP_EVERY  seconds between the keeper's connections (default: 300)
+  RT_COLAB_KEEP_AWAKE  0: the keeper lets this Mac sleep when idle (default: 1)
 
 CONFIG LAYOUT (in \$RT_HOME):
   <host>/host.conf        Host-level config (shared by all profiles in the group)
@@ -3906,4 +4031,7 @@ main() {
 # a live host, and this script had no tests at all before 2026-08-02.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   main "$@"
+  # Bash reads a script as it runs it: back from main it would read on from where this file ended
+  # when it started, so an rt edited meanwhile (a keeper runs for hours) would run whatever is now there.
+  exit $?
 fi
