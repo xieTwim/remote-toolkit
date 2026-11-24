@@ -158,6 +158,9 @@ What `rt colab` adds over writing the ssh alias by hand:
   with no connection at all kept running for 91 minutes when measured. `rt colab down NAME`
   releases it at once and confirms it has left the account.
 - **Other runtimes on the account are left alone.** `rt colab ls` lists them as `not ours`.
+- **A request the CLI gave up on is not left billing.** When `colab new` times out, rt asks Colab
+  for up to 10 minutes, by that request's own id, whether it made the runtime anyway, and if so
+  takes it over with its watchdog.
 - **Several runtimes as one set.** `rt colab up etl --count 5` makes etl-1 to etl-5, all or
   nothing; `rt colab exec etl --bg --name JOB 'COMMAND'` runs a command on each with `RT_SHARD`
   and `RT_SHARDS` set; `rt colab down --set etl` releases them all.
@@ -167,7 +170,7 @@ What `rt colab` adds over writing the ssh alias by hand:
   gives the VM the whole My Drive. rt pushes Drive's queued writes before every release.
 
 Measured with 0.8.0 (CU per hour): standard 2 vCPU, 12 GB, 0.08; `--high-mem` 8 vCPU, 50 GB, 0.26;
-`--gpu T4` 1.15; `--gpu L4` (12 vCPU, 52 GB) 1.94; `--tpu v5e1` (24 vCPU, 47 GB) 3.09. A100, G4,
+`--gpu T4` 1.15; `--gpu L4` (12 vCPU, 52 GB) 1.94; `--tpu v5e1` (24 vCPU, 47 GB; JAX works through rt) 3.09. A100, G4,
 H100 and v6e1 were refused through the CLI when tried (2026-11-24). Each runtime's disk (226-236 GB)
 is gone on release, so move results out with `rt fetch` first.
 

@@ -108,7 +108,19 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   `drive.flush_and_unmount()`, with CLOUDSDK_CONFIG read from a Colab process, which an ssh login
   lacks) is shared by the watchdog, which releases even when it fails, and `down`, which then keeps
   the runtime unless `--no-flush`. COLAB_DRIVE=1 in colab.meta marks a mount rt made.
-- Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q).
+- TPU: the bootstrap writes the TPU_*/PJRT_DEVICE/SLICE_BUILDER_WORKER_IPS settings from a Colab
+  process's environment (pid 1 on a TPU runtime) to /root/.rt_colab/env.sh and puts a line reading it
+  first in root's .bashrc, above its interactive-only guard: sshd's bash reads .bashrc for a remote
+  command, so every rt command and tmux job has them. Without them libtpu asks a metadata server
+  that does not answer and JAX fails.
+- Late allocations: `_colab_up_one` notes the CLI log's length before `colab new` and tees its
+  output. On failure `_colab_adopt` takes the first `GET .../tun/m/assign?nbh=` URL logged after
+  that mark (the request's notebook hash; the CLI's own retries reuse it), and runs `_colab_adopt_py`
+  on the CLI's interpreter (`_colab_cli_python`, from the script's #! line): `Client._issue_request`
+  on that URL returns an Assignment if Colab made one, and then the same SessionState `colab new`
+  writes goes into this runtime's record. Asked once after a refusal, every 30 s for 10 min after a
+  timeout (RT_COLAB_ADOPT_WAIT/_POLL). These are CLI internals, so 24q2 checks them on the installed CLI.
+- Tests: canary block 24 (stub CLI in `$CSTUB`, `_colab_ssh` stubbed; real CLI only in 24q and 24q2).
 
 ## CC Integration: SKILL + slash command
 

@@ -3081,6 +3081,24 @@ _colab_bootstrap_script() {   # <deadline-epoch> <idle-minutes>
   printf "cat > \"\$d/watchdog.sh\" <<'RT_COLAB_WATCHDOG'\n"
   _colab_watchdog_script
   printf 'RT_COLAB_WATCHDOG\n'
+  # A TPU runtime's settings (TPU_*, PJRT_DEVICE) are in Colab's own process environment, not in an
+  # ssh login, and without them JAX asks a metadata server that does not answer there (2026-11-24).
+  # They go to env.sh, which the first line of root's .bashrc reads, so every rt command and job
+  # gets them; on other runtimes the file stays empty.
+  cat <<'TPUENV'
+: > "$d/env.sh"
+for p in 1 $(pgrep -f 'colab-fileshim|jupyter-server|kernel_manager_proxy' || true); do
+  if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -q '^TPU_ACCELERATOR_TYPE='; then
+    tr '\0' '\n' < "/proc/$p/environ" | grep -E '^(TPU_[A-Z0-9_]*|PJRT_DEVICE|SLICE_BUILDER_WORKER_IPS)=' \
+      | while IFS= read -r kv; do printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"; done > "$d/env.sh" || true
+    break
+  fi
+done
+if ! grep -q 'rt_colab/env.sh' /root/.bashrc 2>/dev/null; then
+  { printf '[ -f /root/.rt_colab/env.sh ] && . /root/.rt_colab/env.sh\n'; cat /root/.bashrc 2>/dev/null || true; } > /root/.bashrc.rt
+  mv /root/.bashrc.rt /root/.bashrc
+fi
+TPUENV
   cat <<BOOT
 chmod 700 "\$d/watchdog.sh"
 printf '%s\n' $1 > "\$d/deadline"
@@ -3159,6 +3177,73 @@ _colab_setup() {
   fi
 }
 
+# When `colab new` gives up on a slow allocation, Colab may still make the runtime (google-colab-cli#263),
+# and it then bills with no record and no watchdog. Every assignment is tied to the notebook hash of
+# its request, which the CLI's log records in the request URL, and a GET of that URL returns the
+# assignment if there is one: the CLI's own reconcile (0.8.0 Client.assign) stops checking after its
+# last try. rt asks the same question, by that hash only, so a runtime someone else made on the
+# account is never taken; when the answer is an assignment it writes the session record `colab new`
+# would have written, and up carries on with its ssh and watchdog.
+_colab_cli_log() { printf '%s' "${RT_COLAB_CLI_LOG:-$HOME/.config/colab-cli/colab.log}"; }
+
+_colab_cli_python() {   # <colab-bin>: the interpreter the CLI runs on, from its script's #! line
+  local f="$1" l
+  while [[ -L "$f" ]]; do l=$(readlink "$f"); [[ "$l" == /* ]] && f="$l" || f="$(dirname "$f")/$l"; done
+  l=$(head -n 1 "$f" 2>/dev/null || true)
+  [[ "$l" == '#!'/* ]] || return 1
+  l="${l#\#!}"; l="${l%% *}"
+  [[ -x "$l" && "$l" != */env ]] || return 1
+  printf '%s' "$l"
+}
+
+_colab_adopt_py() {
+  cat <<'PY'
+import sys
+from typing import Union
+from colab_cli.common import state
+from colab_cli.client import Assignment, GetAssignmentResponse
+from colab_cli.state import SessionState
+url, cfg, name, variant, accelerator, shape = sys.argv[1:7]
+state.config_path = cfg
+res = state.client._issue_request(url, schema=Union[GetAssignmentResponse, Assignment])
+if not isinstance(res, Assignment):
+    print("RT_NO_ASSIGNMENT")
+    sys.exit(0)
+info = res.runtime_proxy_info
+state.store.add(SessionState(name=name, token=info.token, url=info.url, endpoint=res.endpoint,
+                             token_expires_at=info.expires_at(), variant=variant,
+                             accelerator=accelerator, machine_shape=shape))
+print("RT_ADOPTED " + res.endpoint)
+PY
+}
+
+_colab_adopt() {   # <colab-bin> <name> <cli-log-line-before-new>: 0 once this request's runtime is recorded
+  local url py variant accel shape="STANDARD" tries=1 i out wait="${RT_COLAB_ADOPT_WAIT:-600}" poll="${RT_COLAB_ADOPT_POLL:-30}"
+  url=$(tail -n +"$(( $3 + 1 ))" "$(_colab_cli_log)" 2>/dev/null \
+        | sed -n 's|.* - colab_cli\.client - DEBUG - Request: GET \(https://[^ ]*/tun/m/assign?nbh=[^ ]*\)$|\1|p' | head -n 1 || true)
+  (( poll > 0 )) || poll=1
+  [[ -n "$url" ]] || { warn "The colab CLI's log has no request for '$2', so rt cannot ask Colab whether it was allocated."; return 1; }
+  py=$(_colab_cli_python "$1") || { warn "The colab CLI's Python was not found, so rt cannot ask Colab whether '$2' was allocated."; return 1; }
+  variant=$(sed -n 's/.*[?&]variant=\([A-Z0-9_]*\).*/\1/p' <<<"$url")
+  accel=$(sed -n 's/.*[?&]accelerator=\([A-Z0-9_]*\).*/\1/p' <<<"$url")
+  [[ "$url" == *'&shape=hm'* ]] && shape=HIGH_RAM
+  # A refusal (503, 400, 412) settles it with one look; a timeout leaves the outcome open for minutes.
+  if grep -qiE 'timeout|timed out' "$COLAB_DIR/new.out" 2>/dev/null; then
+    tries=$(( wait / poll + 1 ))
+    info "The request for '$2' timed out; asking Colab for up to $(( wait / 60 )) min whether it allocated it anyway ..."
+  fi
+  for ((i = 1; i <= tries; i++)); do
+    out=$("$py" -I -c "$(_colab_adopt_py)" "$url" "$COLAB_JSON" "$2" "${variant:-DEFAULT}" "${accel:-NONE}" "$shape" 2>&1 || true)
+    case "$out" in
+      *RT_ADOPTED*)       return 0 ;;
+      *RT_NO_ASSIGNMENT*) ;;
+      *)                  warn "Asking Colab about '$2' failed: $(tail -n 1 <<<"$out")" ;;
+    esac
+    (( i == tries )) || sleep "$poll"
+  done
+  return 1
+}
+
 _colab_up() {
   local name="" hours=4 idle="" accel="" hm="" hw count="" drive="" k j rc had_e=0 failed=""
   local -a new_args=()
@@ -3219,7 +3304,7 @@ _colab_up() {
 }
 
 _colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up parsed (hw, hours, idle, new_args)
-  local name="$1" bin before after ep now deadline
+  local name="$1" bin before after ep now deadline mark
   _colab_paths "$name"
   [[ ! -e "$COLAB_DIR" ]] || die "Host group $COLAB_GROUP already exists. 'rt colab ls' shows it; 'rt colab down $name' releases it."
   bin=$(_colab_bin)
@@ -3231,9 +3316,14 @@ _colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up
 
   mkdir -p "$COLAB_DIR"; chmod 700 "$COLAB_DIR"
   info "Creating Colab runtime '$name' ($hw) ..."
-  if ! "$bin" --config "$COLAB_JSON" new -s "$name" ${new_args[@]+"${new_args[@]}"} </dev/null >&2; then
-    rm -rf "$COLAB_DIR"
-    die "'colab new' failed. After a slow allocation Colab can create the runtime anyway (google-colab-cli#263): check 'rt colab ls' in a few minutes. A new one marked not ours bills with no watchdog, and colab 0.8.0 cannot release a runtime it has no record of."
+  mark=$(wc -l 2>/dev/null < "$(_colab_cli_log)" | tr -d ' ' || true)
+  if ! "$bin" --config "$COLAB_JSON" new -s "$name" ${new_args[@]+"${new_args[@]}"} </dev/null 2>&1 | tee "$COLAB_DIR/new.out" >&2; then
+    if _colab_adopt "$bin" "$name" "${mark:-0}"; then
+      info "Colab did allocate '$name' after the CLI gave up; rt has taken it over."
+    else
+      rm -rf "$COLAB_DIR"
+      die "'colab new' failed, and Colab holds no runtime for this request."
+    fi
   fi
   ep=$(_colab_json_endpoint)
   if [[ -z "$ep" ]]; then
@@ -3697,6 +3787,10 @@ ENVIRONMENT:
   RT_COLAB_BIN         colab CLI (default: \`command -v colab\`)
   RT_COLAB_SSH_DIR     where rt colab writes ssh aliases (default: ~/.ssh/rt-colab.d)
   RT_COLAB_KEY         ssh key for Colab runtimes (default: ~/.ssh/rt_colab_ed25519)
+  RT_COLAB_ADOPT_WAIT  seconds rt colab up asks Colab whether a timed-out request was
+                       allocated after all (default: 600)
+  RT_COLAB_CLI_LOG     the colab CLI's log, where its requests are found (default:
+                       ~/.config/colab-cli/colab.log)
 
 CONFIG LAYOUT (in \$RT_HOME):
   <host>/host.conf        Host-level config (shared by all profiles in the group)

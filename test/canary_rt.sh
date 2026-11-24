@@ -2120,7 +2120,7 @@ chk "23c ... and the message is about the ssh link, not about connecting sync fi
 set +e; source "$RT" 2>/dev/null; set +e
 C="$SCRATCH/colab"; mkdir -p "$C/bin" "$C/home/.ssh"
 export RT_COLAB_SSH_DIR="$C/home/.ssh/rt-colab.d" RT_COLAB_KEY="$C/home/.ssh/key" \
-       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 RT_COLAB_FIRST_SSH_WAIT=0 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
+       RT_SSH_CONFIG="$C/home/.ssh/config" RT_COLAB_POLL_WAIT=0 RT_COLAB_FIRST_SSH_WAIT=0 RT_COLAB_CLI_LOG="$C/colab.log" RT_COLAB_ADOPT_WAIT=2 RT_COLAB_ADOPT_POLL=1 CSTUB="$C" RT_COLAB_BIN="$C/bin/colab"
 : > "$C/home/.ssh/key"; : > "$C/home/.ssh/key.pub"
 cat > "$C/bin/colab" <<'STUB'
 #!/usr/bin/env bash
@@ -2133,6 +2133,9 @@ case "$1" in
   ssh)      if [ -n "${CSTUB_UNSAFE:-}" ]; then echo "SSH-2.0-bridged"; exit 0; fi
             echo "[colab] session 'x' not found. Run \`colab sessions\` to list active sessions." >&2; exit 2 ;;
   new)      [ -n "${CSTUB_NEW_FAIL:-}" ] && exit 1
+            echo "2026-11-24 00:00:00,000 - colab_cli.client - DEBUG - Request: GET https://colab.research.google.com/tun/m/assign?nbh=hash-$3&variant=DEFAULT&accelerator=NONE" >> "$RT_COLAB_CLI_LOG"
+            [ -n "${CSTUB_NEW_TIMEOUT:-}" ] && { echo "ReadTimeout: HTTPSConnectionPool(host='colab.research.google.com', port=443): Read timed out." >&2; exit 1; }
+            [ -n "${CSTUB_NEW_REFUSE:-}" ] && { echo "ColabRequestError: Failed to issue request POST: Service Unavailable" >&2; exit 1; }
             [ -n "${CSTUB_NEW_FAIL_FOR:-}" ] && [ "$3" = "$CSTUB_NEW_FAIL_FOR" ] && exit 1
             ep="m-s-test-$3"; echo "$ep" >> "$CSTUB/backend"
             printf '{\n  "%s": {\n    "name": "%s",\n    "endpoint": "%s"\n  }\n}\n' "$3" "$3" "$ep" > "$cfg" ;;
@@ -2156,6 +2159,23 @@ case "$1" in
 esac
 STUB
 chmod +x "$C/bin/colab"
+# The CLI's own Python, asked by hash whether a request that failed was allocated after all.
+cat > "$C/bin/fakepy" <<'FAKEPY'
+#!/usr/bin/env bash
+shift 3   # -I -c <code>
+url=$1 cfg=$2 name=$3
+echo "$url" >> "$CSTUB/adopt_urls"
+n=$(( $(grep -c . "$CSTUB/adopt_urls") ))
+if [ -n "${CSTUB_ADOPT_AFTER:-}" ] && [ "$n" -ge "$CSTUB_ADOPT_AFTER" ]; then
+  ep="m-s-late-$name"; echo "$ep" >> "$CSTUB/backend"
+  printf '{\n  "%s": {\n    "name": "%s",\n    "endpoint": "%s"\n  }\n}\n' "$name" "$name" "$ep" > "$cfg"
+  echo "RT_ADOPTED $ep"
+else
+  echo RT_NO_ASSIGNMENT
+fi
+FAKEPY
+chmod +x "$C/bin/fakepy"
+_colab_cli_python() { printf '%s' "$C/bin/fakepy"; }
 # ssh to the runtime: the bootstrap's answer is the digest of the watchdog it carries, recomputed
 # from the base64 payload rt actually sent — so 24f fails if rt ships a different file than it hashes.
 _colab_ssh() {
@@ -2186,10 +2206,11 @@ _colab_ssh() {
 }
 ssh() { printf 'real-ssh %s\n' "$*" >> "$CSTUB/ssh_calls"; return 1; }   # -O check / -O exit
 fresh_colab() {
-  rm -rf "$RT_HOME"/colab-* "$RT_COLAB_SSH_DIR" "$RT_HOME/.rt/_colab" "$C/boot.sh" "$C/slot_freed" "$C/failed_once" "$C"/mounted-* "$C"/browser-* "$C/opened"
+  rm -rf "$RT_HOME"/colab-* "$RT_COLAB_SSH_DIR" "$RT_HOME/.rt/_colab" "$C/boot.sh" "$C/slot_freed" "$C/failed_once" "$C"/mounted-* "$C"/browser-* "$C/opened" "$C/adopt_urls"
+  : > "$C/colab.log"
   : > "$C/backend"; : > "$C/calls"; : > "$C/ssh_calls"
   printf 'Include %s/*.conf\nHost other\n  HostName example\n' "$RT_COLAB_SSH_DIR" > "$RT_SSH_CONFIG"
-  unset CSTUB_UNSAFE CSTUB_NEW_FAIL CSTUB_NEW_FAIL_FOR CSTUB_STOP_NOOP CSTUB_STOP_NOOP_FOR CSTUB_SESSIONS_GARBLED CSTUB_DRIVE_PENDING SSTUB_FAIL SSTUB_FAIL_FOR SSTUB_FAIL_ONCE SSTUB_FLUSH_FAIL SSTUB_BADWD SSTUB_HELD
+  unset CSTUB_UNSAFE CSTUB_NEW_FAIL CSTUB_NEW_FAIL_FOR CSTUB_STOP_NOOP CSTUB_STOP_NOOP_FOR CSTUB_SESSIONS_GARBLED CSTUB_DRIVE_PENDING CSTUB_NEW_TIMEOUT CSTUB_NEW_REFUSE CSTUB_ADOPT_AFTER SSTUB_FAIL SSTUB_FAIL_FOR SSTUB_FAIL_ONCE SSTUB_FLUSH_FAIL SSTUB_BADWD SSTUB_HELD
 }
 
 fresh_colab; _colab_common_paths
@@ -2417,11 +2438,40 @@ _colab_watchdog_script > "$C/wd2.sh"
 fl=$(sed -n '/^release() {/,/^}/{/drive_flush >>/=;}' "$C/wd2.sh"); un=$(sed -n '/^release() {/,/^}/{/unassign/=;}' "$C/wd2.sh")
 chk "24d8 the watchdog pushes Drive's pending writes before it calls unassign, and still releases if that fails" \
     "$(bash -n "$C/wd2.sh" && grep -q '^drive_flush() {' "$C/wd2.sh" && [ -n "$fl" ] && [ -n "$un" ] && [ "$fl" -lt "$un" ] && grep -q 'releasing anyway' "$C/wd2.sh" && echo 0 || echo 1)" "flush@$fl unassign@$un"
+# A request the CLI gave up on (2026-11-24): Colab can still allocate it (google-colab-cli#263), so rt
+# asks by that request's own hash, never by what else is on the account, and takes such a runtime over.
+fresh_colab; export CSTUB_NEW_TIMEOUT=1 CSTUB_ADOPT_AFTER=2
+echo "2026-11-23 00:00:00,000 - colab_cli.client - DEBUG - Request: GET https://colab.research.google.com/tun/m/assign?nbh=hash-old&variant=DEFAULT&accelerator=NONE" >> "$C/colab.log"
+( _colab_up t13 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24p2 a timed-out request that Colab allocated later is taken over: recorded, watched, asked about by its own hash" \
+    "$([ $rc = 0 ] && grep -qx 'COLAB_ENDPOINT=m-s-late-t13' "$RT_HOME/colab-t13/colab.meta" && [ -s "$C/boot.sh" ] && [ "$(grep -c . "$C/adopt_urls")" = 2 ] && ! grep -q 'hash-old' "$C/adopt_urls" && grep -q 'nbh=hash-t13&' "$C/adopt_urls" && echo 0 || echo 1)" \
+    "rc=$rc urls=$(tr '\n' ' ' < "$C/adopt_urls" 2>/dev/null) $(tail -n 2 "$C/err")"
+unset CSTUB_ADOPT_AFTER
+fresh_colab; export CSTUB_NEW_TIMEOUT=1
+( _colab_up t14 ) >/dev/null 2>"$C/err"; rc=$?
+chk "24p3 a timed-out request still unallocated after the window fails and leaves nothing; it was asked about the whole window" \
+    "$([ $rc != 0 ] && [ ! -e "$RT_HOME/colab-t14" ] && [ "$(grep -c . "$C/adopt_urls")" = 3 ] && echo 0 || echo 1)" \
+    "rc=$rc asks=$(grep -c . "$C/adopt_urls" 2>/dev/null) $(tail -n 1 "$C/err")"
+unset CSTUB_NEW_TIMEOUT
+fresh_colab; export CSTUB_NEW_REFUSE=1
+( _colab_up t15 ) >/dev/null 2>&1; rc=$?
+chk "24p4 a refused request (503) is asked about once, not for the whole window" \
+    "$([ $rc != 0 ] && [ "$(grep -c . "$C/adopt_urls")" = 1 ] && [ ! -e "$RT_HOME/colab-t15" ] && echo 0 || echo 1)" "rc=$rc asks=$(grep -c . "$C/adopt_urls" 2>/dev/null)"
+unset CSTUB_NEW_REFUSE
+_colab_bootstrap_script 1 20 > "$C/boot2.sh"
+tpu=$(grep -n "TPU_ACCELERATOR_TYPE=" "$C/boot2.sh" | head -n 1 | cut -d: -f1); start=$(grep -n 'setsid nohup bash' "$C/boot2.sh" | cut -d: -f1)
+chk "24f2 the bootstrap gives every rt command a TPU runtime's environment: env.sh from a Colab process, read first by root's .bashrc" \
+    "$(bash -n "$C/boot2.sh" && [ -n "$tpu" ] && [ "$tpu" -lt "$start" ] && grep -qF "/proc/\$p/environ" "$C/boot2.sh" && grep -qF "printf '[ -f /root/.rt_colab/env.sh ] && . /root/.rt_colab/env.sh\n'; cat /root/.bashrc" "$C/boot2.sh" && echo 0 || echo 1)" "tpu@$tpu start@$start"
 fresh_colab
 
 if real=$(command -v colab 2>/dev/null) && [ -n "$real" ]; then
   ( _colab_common_paths; _colab_canary "$real" ) >/dev/null 2>&1; rc=$?
   chk "24q the installed colab CLI ($("$real" version 2>/dev/null | head -n 1)) still refuses to create a runtime from the ssh bridge" "$rc"
+  py=$( unset -f _colab_cli_python; source "$RT" 2>/dev/null; set +e; _colab_cli_python "$real" ) || py=""
+  if [ -n "$py" ]; then
+    "$py" -I -c 'from colab_cli.common import state; from colab_cli.client import Client, Assignment, GetAssignmentResponse; from colab_cli.state import SessionState; assert hasattr(Client, "_issue_request") and hasattr(state, "config_path"); assert {"name", "token", "url", "endpoint", "token_expires_at", "variant", "accelerator", "machine_shape"} <= set(SessionState.model_fields)' >/dev/null 2>&1; rc=$?
+  else rc=1; fi
+  chk "24q2 the installed colab CLI still has what taking over a late allocation uses (its Python, Client._issue_request, SessionState)" "$rc"
 else
   echo "  skip 24q (no colab CLI installed)"
 fi
