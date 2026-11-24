@@ -2857,9 +2857,11 @@ _slurm_logs() {
 #     still there at 4.5 h. The CLI's contributors describe the same: Colab "mostly depends on
 #     checking for live connections to the VM" (issue #160), and since the client keep-alive ping
 #     was retired the backend keeps runtimes "based on kernel activities and active connections"
-#     (PR #144). A G4 whose traffic went around Colab's proxy was gone after 23 min (discussion
-#     #219), so an accelerator may get far less. `up` therefore leaves a keeper on this Mac
-#     (`_colab_keep`) that keeps the runtime connected until it goes.
+#     (PR #144). A GPU gets far less: on 2026-11-25 a T4 running a GPU job was gone 20-22 min after
+#     its last connection, while one its keeper kept connected ran on until released 51 min later
+#     (a G4 elsewhere, its traffic going around Colab's proxy, went after 23 min: discussion #219).
+#     `up` therefore leaves a keeper on this Mac (`_colab_keep`) that keeps the runtime connected
+#     until it goes.
 #   * So a runtime bills for as long as it is kept connected, and release is what ends that: a
 #     watchdog on the VM releases it itself — POST http://$TBE_RUNTIME_ADDR/unassign, the endpoint
 #     behind google.colab.runtime.unassign(); billing stopped within a second when measured — at
@@ -3379,7 +3381,7 @@ _colab_up_one() {   # <name> [<set> <index> <size>]; reads the options _colab_up
   info "  It releases itself at $(_colab_fmt_time "$deadline") or after $idle idle minutes; 'rt colab down $name' releases it now."
   info "  Its disk goes with it: fetch results before that."
   [[ "${RT_COLAB_KEEP:-1}" == 0 ]] \
-    || info "  Until then this Mac keeps it connected and stays awake: Colab takes back a runtime nothing connects to (about 3 h for a CPU one when measured, less with an accelerator). A closed lid or a long outage still ends it."
+    || info "  Until then this Mac keeps it connected and stays awake: Colab takes back a runtime nothing connects to (when measured: about 3 h for a CPU one, about 20 min for a T4). A closed lid or an outage that long still ends it."
 }
 
 # The runtimes a command names: NAME [NAME ...], or --set SET for every member recorded here.
@@ -3850,9 +3852,9 @@ COMMANDS:
                        Create a Colab runtime and make it profile colab-NAME/work
                        (REMOTE_DIR /content/work; no sync: use push and fetch).
                        One ssh connection per runtime, shared by every rt call.
-                       Colab takes back a runtime nothing connects to (about 3 h
-                       for a CPU one when measured, less with an accelerator), so
-                       a keeper on this Mac keeps it connected and holds off this
+                       Colab takes back a runtime nothing connects to (measured:
+                       about 3 h for a CPU one, about 20 min for a T4), so a
+                       keeper on this Mac keeps it connected and holds off this
                        Mac's idle sleep until it goes; a closed lid still ends it.
                        A watchdog on the VM releases it after H hours (default 4)
                        or M idle minutes (default 20; 10 with an accelerator).

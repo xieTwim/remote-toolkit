@@ -78,7 +78,9 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
 - Colab takes back a runtime nothing connects to. Four CPU runtimes with an rt job were gone about
   3 h after their last connection; a kernel cell left running and the VM calling its own kernel did
   not count; two reached from the Mac every 30 min were still up at 4.5 h (2026-11-24; the CLI's
-  issue #160 and PR #144 say the same, and its discussion #219 saw a G4 go after 23 min). So `up`
+  issue #160 and PR #144 say the same). A T4 running a GPU job went 20-22 min after its last
+  connection, while one with a keeper ran on (2026-11-25; its discussion #219 saw a G4 go after
+  23 min). So `up`
   starts a keeper, `rt colab _keep NAME`, detached by `_detach` (setsid, else perl's: macOS has no
   setsid). Every RT_COLAB_KEEP_EVERY s (300) it runs the alias's ssh `true`, which keeps the
   ControlMaster open or reopens it (heal path on a held slot), and it holds `caffeinate -i -w <its
