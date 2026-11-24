@@ -88,7 +88,9 @@ existing verb works on it through an ssh alias; `rt colab` only adds the lifecyc
   deadline, or when a failed connection finds the runtime off the account (a failed listing does not
   stop it). `_require_ssh` (every rt command on a colab profile) and `reconnect` start it again when
   `_colab_keeper_running` (pid file plus the `ps` command line, since pids are reused) finds none. The
-  watchdog does not count an open idle connection as busy, so idle release is unchanged.
+  watchdog does not count an open idle connection as busy, so idle release is unchanged. Real runs
+  (2026-11-24/25): a CPU runtime with a job ran 3 h 50 min on the connection opened at creation,
+  never reopened; with a 5-minute idle limit and no job, one was still released at 5 min.
 - `colab sessions` exits 1 when it fails (no network, a sign-in that needs a person), and its
   traceback quotes the source line that prints "No active sessions found on server." So
   `_colab_account_list` reads the exit status before the text (24n3), and accepts an empty answer

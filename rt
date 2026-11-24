@@ -2861,7 +2861,8 @@ _slurm_logs() {
 #     its last connection, while one its keeper kept connected ran on until released 51 min later
 #     (a G4 elsewhere, its traffic going around Colab's proxy, went after 23 min: discussion #219).
 #     `up` therefore leaves a keeper on this Mac (`_colab_keep`) that keeps the runtime connected
-#     until it goes.
+#     until it goes. With it, a CPU runtime running a job was still up at 3 h 50 min, on the
+#     connection it opened at creation (never reopened), when the test ended (2026-11-25).
 #   * So a runtime bills for as long as it is kept connected, and release is what ends that: a
 #     watchdog on the VM releases it itself — POST http://$TBE_RUNTIME_ADDR/unassign, the endpoint
 #     behind google.colab.runtime.unassign(); billing stopped within a second when measured — at

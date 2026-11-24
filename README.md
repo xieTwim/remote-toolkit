@@ -156,8 +156,8 @@ What `rt colab` adds over writing the ssh alias by hand:
   runtimes running an rt job were gone about 3 h after their last connection (2026-11-24), and a
   T4 running a GPU job after 20-22 minutes, while one kept connected ran on (2026-11-25). rt leaves
   a keeper on this Mac that keeps the runtime's connection open (an ssh `true` every 5 minutes)
-  and holds off the Mac's idle sleep until the runtime goes; a closed lid or a network outage of
-  that length still ends it.
+  and holds off the Mac's idle sleep until the runtime goes: a CPU runtime kept this way was still
+  up at 3 h 50 min. A closed lid or a network outage of that length still ends it.
 - **The runtime releases itself.** A watchdog on the VM calls Colab's release endpoint at the
   deadline (`--hours`, default 4) or after `--idle-minutes` (default 20) with no rt job, no ssh
   command and under half a core of CPU; an open connection alone does not count. `rt colab down
