@@ -598,6 +598,12 @@ load_config() {
     -p "$SSH_PORT"
   )
   if [[ -n "$SSH_KEY" ]]; then SSH_OPTS+=(-i "$SSH_KEY"); fi
+  # Inside a Codex sandbox with its network proxy on, the sandbox refuses every direct connection and
+  # ssh does not read ALL_PROXY: ssh goes through the proxy's SOCKS5 listener (macOS nc speaks SOCKS5).
+  local socks="${ALL_PROXY:-${all_proxy:-}}"
+  if [[ "${CODEX_NETWORK_PROXY_ACTIVE:-}" == 1 && "$socks" =~ ^socks5h?://127\.0\.0\.1:([0-9]+)$ ]]; then
+    SSH_OPTS+=(-o "ProxyCommand=/usr/bin/nc -X 5 -x 127.0.0.1:${BASH_REMATCH[1]} %h %p")
+  fi
 }
 
 # ── State helpers ──────────────────────────────────────────────────

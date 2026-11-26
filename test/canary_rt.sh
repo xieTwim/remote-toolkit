@@ -2569,6 +2569,18 @@ sleep 0.7; printf 'touch %s/injected\n' "$D25" >> "$D25/rt"; wait "$p25"
 chk "25a a line added to rt while it runs is never run by it" \
     "$(grep -q '^main() { sleep 2$' "$D25/rt" && [ ! -e "$D25/injected" ] && echo 0 || echo 1)"
 
+# ── 26. ssh inside a Codex sandbox whose network proxy is on ──
+# That sandbox refuses every direct connection and ssh ignores ALL_PROXY, so every rt command failed
+# "Cannot reach ... over ssh" there (2026-11-26). ssh goes through the proxy's SOCKS5 listener instead.
+RT_PROFILE="h/p"; _init_profile
+o26a=$(CODEX_NETWORK_PROXY_ACTIVE=1 ALL_PROXY=socks5h://127.0.0.1:4321; export CODEX_NETWORK_PROXY_ACTIVE ALL_PROXY
+       load_config >/dev/null 2>&1; printf '%s\n' "${SSH_OPTS[@]}")
+chk "26a inside the proxy, ssh goes through its SOCKS5 port" \
+    "$(grep -qx 'ProxyCommand=/usr/bin/nc -X 5 -x 127.0.0.1:4321 %h %p' <<<"$o26a" && echo 0 || echo 1)" "$o26a"
+o26b=$(unset CODEX_NETWORK_PROXY_ACTIVE; ALL_PROXY=socks5h://127.0.0.1:4321; export ALL_PROXY
+       load_config >/dev/null 2>&1; printf '%s\n' "${SSH_OPTS[@]}")
+chk "26b outside it, an ALL_PROXY alone changes nothing" "$(grep -q ProxyCommand <<<"$o26b" && echo 1 || echo 0)" "$o26b"
+
 echo "────────────────────────────────────────────"
 if [ "$FAIL" = 0 ]; then echo "rt canaries: ${PASS}/${PASS} pass"; exit 0; fi
 echo "rt canaries: ${PASS} pass, ${FAIL} FAIL"; exit 1
